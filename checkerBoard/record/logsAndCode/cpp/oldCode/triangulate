@@ -1,0 +1,26 @@
+
+
+     // for triangulation later
+        cv::Mat poseTmp;
+        cv::eigen2cv(rotationTrans_full,poseTmp);
+        cameraPoses.push_back(poseTmp);
+
+
+        // 4. Triangulate
+        
+	    std::vector<cv::Vec3d> pointsTriang;
+        if(i>0 && (i < logAtt_eigen.size()) ){
+        // eign to opencv
+       	    std::vector<cv::Vec2d> points1u;
+        	points1u.push_back(cv::Vec2d(Kps[i](0), Kps[i](1)));
+            std::vector<cv::Vec2d> points2u;     
+        	points2u.push_back(cv::Vec2d(Kps[i+1](0), Kps[i+1](1)));
+             triangulate(cameraPoses[i-1],cameraPoses[i],points1u,points2u,pointsTriang);
+            std::cout<<(pointsTriang[0])<<std::endl;
+
+        }
+
+        if(i>0 && (i < logAtt_eigen.size()) ){
+	        cv::viz::WSphere           point3Dm4(pointsTriang[0] , 2, 30, cv::viz::Color::yellow());
+	        visualizer.showWidget("Point method 4"+inum, point3Dm4);
+        }

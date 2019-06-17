@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/utils/triangulate.cpp
+triangulate.h
+/home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/utils/triangulate.h
+
+/home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/utils/triangulate.h
+opencv2/core.hpp
+-
+vector
+-
+

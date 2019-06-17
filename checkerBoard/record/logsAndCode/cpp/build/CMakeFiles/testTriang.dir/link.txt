@@ -1,0 +1,1 @@
+/usr/bin/c++    -rdynamic CMakeFiles/testTriang.dir/utils/triangulate.cpp.o  -o testTriang 
