@@ -16,7 +16,7 @@ br_list = []
 object_list = []
 
 # constants
-image_folder = 'logRun3'
+image_folder = 'logRun6'
 savedir = 'annotations'
 obj = 'fidget_spinner'
 

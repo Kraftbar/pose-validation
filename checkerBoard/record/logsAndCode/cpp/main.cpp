@@ -123,13 +123,19 @@ int main(int argc, char** argv )
     readCsv (file,r_log, t_log);
 
 
-    Eigen::Vector3f Kp1(431 , 131,1);
-    Eigen::Vector3f Kp2(435 , 226, 1);
-    Eigen::Vector3f Kp3(441 , 313,
+    Eigen::Vector3f Kp1(373 , 154,1);
+    Eigen::Vector3f Kp2(430 , 135,
+
+ 1);
+    Eigen::Vector3f Kp3(394 , 286,
+
     1);
-    Eigen::Vector3f Kp4(420 , 280,
+    Eigen::Vector3f Kp4(408 , 258,
+
+
     1);
-    Eigen::Vector3f Kp5(451 , 140,
+    Eigen::Vector3f Kp5(409 , 271,
+
     1);
 
 
@@ -264,8 +270,8 @@ for (int i = 0; i < imgList.size(); i++) {
 //        gridMap.addObs_b(Kps_buoy_wc);
 //        gridMap.addObs_c(Kps_cage_wc);
 //        displayKps(visualizer,i,Kps_buoy_wc);
+        displayKps(visualizer,i*10,Kps_cage_wc);
         Kps_buoy_wc.clear();
-//        displayKps(visualizer,i*10,Kps_cage_wc);
         Kps_cage_wc.clear();
             
         // ---- Testing -----
@@ -322,10 +328,10 @@ for (int i = 0; i < imgList.size(); i++) {
 
 
             visualizer.showWidget("Camera"+inum, cam);
-    if(i==p1 || i==p2){
+
        	    visualizer.showWidget("Line"+inum, line);
 	        visualizer.setWidgetPose("Line"       +inum, T_cv);
-    }
+
 //	        visualizer.showWidget("Point method 1"+inum, point3Dm1);
 //	        visualizer.showWidget("Point method 2"+inum, point3Dm2);
 //	        visualizer.showWidget("Point method 3"+inum, point3Dm3);
