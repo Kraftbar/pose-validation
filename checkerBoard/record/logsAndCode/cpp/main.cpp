@@ -79,13 +79,11 @@ int main(int argc, char** argv )
     // read images
     auto imgList=readImgs("../../*.png");
 
-    double boy_r  = 5;  // 60; // radius ~5 px
+    double boy_r  = 7;  // 60; // radius ~5 px
     double cage_r = 73; // 16571.46; // radius ~75 px
 
     auto KpImgs_b = cotour_filter(imgList,boy_r);
     auto KpImgs_c = cotour_filter(imgList,cage_r);
-    for (auto  cont:KpImgs_b )
-        std::cout<<cont.size()<<std::endl;
 
 
 
@@ -148,9 +146,9 @@ std::vector<Eigen::Vector3f> Kps_cage_wc;
 
 // ----- TESTING
 
-int cellsize_mm=25;
-int gridsize=20;
-Eigen::Vector3f pos_usv(-200,200, 0);
+int cellsize_mm=12;
+int gridsize=60;
+Eigen::Vector3f pos_usv(-220,330, 0);
 
 GridMap gridMap(cellsize_mm,gridsize,pos_usv,cage_r);
 
@@ -267,9 +265,10 @@ for (int i = 0; i < imgList.size(); i++) {
 
 
         // ---- Testing -----
-//        gridMap.addObs_b(Kps_buoy_wc);
-//        gridMap.addObs_c(Kps_cage_wc);
-//        displayKps(visualizer,i,Kps_buoy_wc);
+ 
+       gridMap.addObs_b(Kps_buoy_wc);
+       gridMap.addObs_c(Kps_cage_wc);
+        displayKps(visualizer,i,Kps_buoy_wc);
         displayKps(visualizer,i*10,Kps_cage_wc);
         Kps_buoy_wc.clear();
         Kps_cage_wc.clear();
@@ -293,7 +292,7 @@ for (int i = 0; i < imgList.size(); i++) {
 
             //3
             cv::Point3d                testpoint3(X3(0),X3(1),0);
-	        cv::viz::WSphere           point3Dm3(testpoint3 , 2, 30, cv::viz::Color::brown());
+	        cv::viz::WSphere           point3Dm3(testpoint3 , 0.001, 30, cv::viz::Color::brown());
 
 
 
@@ -329,8 +328,6 @@ for (int i = 0; i < imgList.size(); i++) {
 
             visualizer.showWidget("Camera"+inum, cam);
 
-       	    visualizer.showWidget("Line"+inum, line);
-	        visualizer.setWidgetPose("Line"       +inum, T_cv);
 
 //	        visualizer.showWidget("Point method 1"+inum, point3Dm1);
 //	        visualizer.showWidget("Point method 2"+inum, point3Dm2);
@@ -396,7 +393,7 @@ for (int i = 0; i < imgList.size(); i++) {
  
     if(debug=1){ 
         cv::viz::WCoordinateSystem  coordinate(30);
-        cv::viz::WGrid              a4(cv::Vec2i(1  , 1),cv::Vec2i(297  , 210),cv::viz::Color::gray());
+        cv::viz::WGrid              a4(cv::Vec2i(1  , 1),cv::Vec2i(297*1.2  , 210*1.2),cv::viz::Color::gray());
         cv::viz::WPlane             usv(cv::Size2d(40  , 20),cv::viz::Color::gray()  );
         cv::viz::WCircle            groundTruth( 30,0.7 ,cv::viz::Color::gray()     );
 
@@ -410,16 +407,16 @@ for (int i = 0; i < imgList.size(); i++) {
 
         visualizer.showWidget("Grid cells", gridCells);
         visualizer.showWidget("A4 Paper", a4);
-//        visualizer.showWidget("USV", usv);
+        visualizer.showWidget("USV", usv);
         visualizer.showWidget("Coordinate Widget", coordinate);
-        visualizer.showWidget("Ground truth buoy", groundTruth);
+
 
         // clean this 
         cv::Vec3f Rg(0, 0, M_PI/4);
         cv::Vec3f t_zero(0, 0,0);
-        cv::Vec3f Tg(-105+15, 135+5, 0);
+        cv::Vec3f Tg(-120,140, 0);
 
-        cv::Vec3f Tcircle(-30, 75, 0);
+
         cv::Mat   rot_mat;
         cv::Mat   rot_id = cv::Mat::eye(3,3,CV_32F);
 
@@ -427,15 +424,15 @@ for (int i = 0; i < imgList.size(); i++) {
 
         // https://docs.opencv.org/3.4/dd/d99/classcv_1_1Affine3.html
         cv::Affine3f affineA4(rot_mat,Tg);
-        cv::Affine3f affineCircle(t_zero,Tcircle);
+
         cv::Affine3f affineSUV(rot_mat,pos_usv_cv);
 
 
 
       visualizer.setWidgetPose("A4 Paper"   ,affineA4);
-  //      visualizer.setWidgetPose("USV"        ,affineSUV);
+        visualizer.setWidgetPose("USV"        ,affineSUV);
 
-        visualizer.setWidgetPose("Ground truth buoy"   ,affineCircle);
+
 
 
         gridMap.genPolyline();    

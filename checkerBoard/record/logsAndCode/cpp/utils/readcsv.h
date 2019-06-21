@@ -27,8 +27,8 @@ int  readCsv(const char *file,std::vector<Eigen::Vector3f> &logAtt_eigen,std::ve
                 continue;
             std::vector<std::string> strs;
             boost::split(strs,line,boost::is_any_of(","));
-            vecTmp(0)= -std::stod(strs[0]);
-            vecTmp(1)=-std::stod(strs[1]);
+            vecTmp(0)= std::stod(strs[0]);
+            vecTmp(1)=std::stod(strs[1]);
             vecTmp(2)=std::stod(strs[2]);
             logAtt_eigen.emplace_back(vecTmp);
             vecTmp(0)= std::stod(strs[3]);

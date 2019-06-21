@@ -17,6 +17,8 @@ math.h
 /home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/helpers/localMin.h
 ../helpers/dbscan.h
 /home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/helpers/dbscan.h
+../helpers/helper.h
+/home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/helpers/helper.h
 
 /home/nybo/Desktop/poseValidation/checkerBoard/record/logsAndCode/cpp/classes/Observations.h
 Eigen/Core

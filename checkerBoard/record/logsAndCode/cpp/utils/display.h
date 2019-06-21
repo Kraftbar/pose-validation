@@ -25,10 +25,18 @@ void displayKps (cv::viz::Viz3d visualizer,int i, std::vector<Eigen::Vector3f> K
 
 // find  a better way
 int BADGLOBAL=0;
-void paintGrid(float x, float y,cv::viz::Viz3d visualizer ,int cellSize){
-
+void paintGrid(float x, float y,cv::viz::Viz3d visualizer ,int cellSize, int color=0){
 
         cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::orange()     );
+
+
+    if(color==0)
+        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::red()     );
+    if(color==1)
+        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::black()     );
+    if(color==2)
+        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::yellow()     );
+
         std::string badInum      = std::to_string(BADGLOBAL);
  
         BADGLOBAL++;
@@ -49,4 +57,10 @@ void paintGrid(float x, float y,cv::viz::Viz3d visualizer ,int cellSize){
 
 
 
+void paintCellWithMap(float x, float y,cv::viz::Viz3d visualizer ,int cellSize){
+
+
+
+
+}
 

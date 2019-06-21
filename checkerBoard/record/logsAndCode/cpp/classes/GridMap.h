@@ -10,6 +10,7 @@
 // clean this?
 # include "../helpers/localMin.h"
 # include "../helpers/dbscan.h"
+# include "../helpers/helper.h"
  class GridMap 
 {
 
@@ -30,7 +31,9 @@
             _cage_r      = cage_r;
             _usv         = usv;
             _gridMap_occ = Eigen::MatrixXf::Zero(roundedgridSize,roundedgridSize);
-            _gridMap_obs = Eigen::MatrixXf::Zero(roundedgridSize,roundedgridSize);
+            _gridMap_obs_b = Eigen::MatrixXf::Zero(roundedgridSize,roundedgridSize);
+            _gridMap_obs_c = Eigen::MatrixXf::Zero(roundedgridSize,roundedgridSize);
+
 
         }
 
@@ -136,29 +139,104 @@
                     auto  X      = _X_n_b[j];
                     auto  ne_g = ne2rc(X(0),X(1)); 
 
-                     _gridMap_obs(ne_g[0],ne_g[1])=_gridMap_obs(ne_g[0],ne_g[1]) +1;
+                     _gridMap_obs_b(ne_g[0],ne_g[1])=_gridMap_obs_b(ne_g[0],ne_g[1]) +1;
                     // test visualise
                     auto  X_ned=rc2ne(ne_g[0],ne_g[1]);
-                    paintGrid(X_ned[0],X_ned[1],tempVis, _cellSize);
+//                    paintGrid(X_ned[0],X_ned[1],tempVis, _cellSize);
                     // test visualise
                 }
-                std::cout<<"Updated gridmap and cleared observations:"<<std::endl;
+                for(int j=0; j<_X_n_c.size(); j++){
+                    auto  X      = _X_n_c[j];
+                    auto  ne_g = ne2rc(X(0),X(1)); 
 
-                _X_n_b.clear();
+                     _gridMap_obs_c(ne_g[0],ne_g[1])=_gridMap_obs_c(ne_g[0],ne_g[1])+1;
+                    // test visualise
+                    auto  X_ned=rc2ne(ne_g[0],ne_g[1]);
+//                    paintGrid(X_ned[0],X_ned[1],tempVis, _cellSize);
+                    // test visualise
+                }
+                std::cout<<"Updated gridmap and did not clear observations:"<<std::endl;
+
             }
-/*    
-        std::cout<<_gridMap_obs<<std::endl;
+    // minmax 
+        std::cout<<_gridMap_obs_b<<std::endl;
         std::cout<<std::endl;
-        _gridMap_obs=imregionalmin(_gridMap_obs);
-        std::cout<<_gridMap_obs<<std::endl;
-        std::cout<<std::endl;
+        _gridMap_obs_b=imregionalmin(_gridMap_obs_b);
+        _gridMap_obs_c=imregionalmin(_gridMap_obs_c);
+        auto minmax=_gridMap_obs_b-_gridMap_obs_c;
+                std::cout<<minmax<<std::endl;
+
+
+    // minmax paint
+        for(int i = 0;i<minmax.rows(); i++){
+        for(int j = 0;j<minmax.cols(); j++){
+            auto nedMinMax=rc2ne(i,j);
+//            if(minmax(i,j)==1)  
+//                    paintGrid(nedMinMax[0],nedMinMax[1],tempVis, _cellSize,1);
+//            if(minmax(i,j)==-1)
+//                    paintGrid(nedMinMax[0],nedMinMax[1],tempVis, _cellSize,2);
+        }
+        }
+
+
+
+    // rays:
+        std::vector<std::vector<int>> polylines=
+        {   {-90,306 },
+//            {-66,186 },
+             {-106,226 },
+            {-198,186},
+            {-106,226 }
+         }   ;
+
+       int intersect=0;
+
+        for(auto polyline : polylines){
+        auto nedMinMax=rc2ne(polyline[0],polyline[1]);
+           paintGrid(polyline[0],polyline[1],tempVis, _cellSize,2);
+        }
+
+        for(int i = 0;i<minmax.rows(); i++){
+        for(int j = 0;j<minmax.cols(); j++){
+            auto nedMinMax=rc2ne(i,j);  
+
+            int lol1=geeks::doIntersect(polylines[0][0],polylines[0][1],
+                                      polylines[1][0],polylines[1][1],
+                                          nedMinMax[0],nedMinMax[1],
+                                            _usv(0),_usv(1));
+            int lol2=geeks::doIntersect(polylines[2][0],polylines[2][1],
+                                      polylines[3][0],polylines[3][1],
+                                          nedMinMax[0],nedMinMax[1],
+                                            _usv(0),_usv(1));
+            if(lol1 || lol2)  
+                    paintGrid(nedMinMax[0],nedMinMax[1],tempVis, _cellSize,1);
+/*
+            if(minmax(i,j)==-1)
+                    paintGrid(nedMinMax[0],nedMinMax[1],tempVis, _cellSize,2);
 */
 
-//        dbscan::DBCAN dbScan(13,1,_pontCloud_b);
-//        dbScan.run();
-//        auto lol=dbScan.getCluster();
-//         for(auto l : lol)
-//             std::cout<<l.size()<<std::endl; 
+
+        }
+        }
+
+        // Line(15,15,-75,75,visualizer);
+
+
+
+
+
+
+        std::cout<<std::endl;
+/*    
+*/
+
+/*    
+        dbscan::DBCAN dbScan(13,1,_pontCloud_b);
+        dbScan.run();
+        auto lol=dbScan.getCluster();
+         for(auto l : lol)
+             std::cout<<l.size()<<std::endl; 
+*/
        }
 
 
@@ -166,7 +244,7 @@
 
 
         void genPolyline(){
-        // obs
+/*    
 
           int check=0;
             for (auto cage : _pontCloud_c){
@@ -183,17 +261,22 @@
                     std::cout<<"Number of (polylinepoints): "<<cage.transpose()<<" "<<check<<std::endl;
                }
 
+*/
         }
 
 
     void traverseMap_genPolyPoints(int pos_usv){
-       if(polyPoints_c.size()<2){
+
+
+       if(polyPoints_c.size()<1){
         std::cout<<"To few mesuments \n";
         return;
         }
 
 
      }
+
+    
 
 
     private:    
@@ -204,7 +287,8 @@
         int                 _halfgridSize;
         cv::viz::Viz3d         visualizer;
         Eigen::MatrixXf      _gridMap_occ;
-        Eigen::MatrixXf      _gridMap_obs;
+        Eigen::MatrixXf      _gridMap_obs_b;
+        Eigen::MatrixXf      _gridMap_obs_c;
         Eigen::MatrixXf      _gridMap_obs_locmax;
         std::vector<Eigen::Vector3f> _X_n_b;  // temporary obs
         std::vector<Eigen::Vector3f> _X_n_c;  // temporary obs

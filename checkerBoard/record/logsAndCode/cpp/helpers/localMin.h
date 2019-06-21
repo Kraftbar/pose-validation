@@ -20,7 +20,6 @@ int inline neighborCleanup(float* in, uchar* out, int i, int x, int y, int x_lim
                 return 1;
         }
     }
-
     return 0;
 }
 

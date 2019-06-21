@@ -18,6 +18,8 @@ std::vector<std::vector<cv::Vec2d> >  cotour_filter(std::vector<cv::Mat> images,
         cv::Canny( image, image, 140, 140*2, 3 );
 
 
+
+
         // find contours
         std::vector<cv::Vec4i> hierarchy;
         std::vector<std::vector<cv::Point> > contours;
