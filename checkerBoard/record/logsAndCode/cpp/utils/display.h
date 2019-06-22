@@ -27,21 +27,27 @@ void displayKps (cv::viz::Viz3d visualizer,int i, std::vector<Eigen::Vector3f> K
 int BADGLOBAL=0;
 void paintGrid(float x, float y,cv::viz::Viz3d visualizer ,int cellSize, int color=0){
 
-        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::orange()     );
+        cv::viz::WPlane            notNull;
 
 
     if(color==0)
-        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::red()     );
-    if(color==1)
-        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::black()     );
-    if(color==2)
-        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::yellow()     );
+{        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::red()     );
+            notNull=gridCell;
+}    if(color==1)
+{        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::black()     );
+            notNull=gridCell;
+}    if(color==2){
+        cv::viz::WPlane            gridCell(cv::Size2d(cellSize, cellSize),cv::viz::Color::yellow()   );
+            notNull=gridCell;
+        }
 
+
+        
         std::string badInum      = std::to_string(BADGLOBAL);
  
         BADGLOBAL++;
 
-        visualizer.showWidget("Cel"+badInum ,gridCell);
+        visualizer.showWidget("Cel"+badInum ,notNull);
 
     
         cv::Vec3f Rg(0, 0, 0);

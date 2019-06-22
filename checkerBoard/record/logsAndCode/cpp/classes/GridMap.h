@@ -184,16 +184,17 @@
         std::vector<std::vector<int>> polylines=
         {   {-90,306 },
 //            {-66,186 },
-             {-106,226 },
+             {-106-8,226+8 },
             {-198,186},
-            {-106,226 }
+            {-106-8,226 +8}
          }   ;
 
        int intersect=0;
 
         for(auto polyline : polylines){
-        auto nedMinMax=rc2ne(polyline[0],polyline[1]);
-           paintGrid(polyline[0],polyline[1],tempVis, _cellSize,2);
+            auto nedMinMax=rc2ne(polyline[0],polyline[1]);
+            
+  paintGrid(polyline[0],polyline[1],tempVis, _cellSize,2);
         }
 
         for(int i = 0;i<minmax.rows(); i++){
