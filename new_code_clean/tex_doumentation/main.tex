@@ -1,0 +1,55 @@
+%% Fromatting
+\documentclass[a4paper,12pt]{article}	  
+\usepackage[margin=3cm]{geometry} 	   % Choose your margin here. 
+\usepackage{parskip}                   % automatically breaks line 
+\setlength{\parindent}{0cm}				% Start paragraph without indent. Optional
+
+
+\usepackage{amsmath} % \usepackage is a command that allows you to add functionality to your LaTeX code
+
+\title{Simple Sample} % Sets article title
+\author{My Name} % Sets authors name
+\date{\today} % Sets date for date compiled
+
+\begin{document}
+\maketitle
+\newcommand\shortlorem{Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.}
+
+
+\addcontentsline{toc}{section}{Introduction - Description of the repo}
+\section*{Intro}
+
+This is a repo for small scale testing. To test code that could be used for VO in a real time setting.
+To write transferable code.
+\bftext{Sensor}
+The real system is imagened hardware wise  as a RPAS with the following sensors:
+\begin{itemize}
+  \item GPS
+  \item Axelerometer
+  \item Gyroscope
+  \item Camera
+\end{itemize}
+The test setup is 
+\begin{itemize}
+  \item Aruco markers replacing \{ GPS, Axelerometer, Gyroscope \}
+  \item Camera
+\end{itemize}
+\bftext{Environment}
+
+
+
+
+\tableofcontents
+
+
+\section{The code folders}
+This is the first section (numbered).
+
+
+\shortlorem
+
+\section{Second section}
+The second numbered section.
+
+\shortlorem
+\end{document}

@@ -1,0 +1,6 @@
+#!/bin/bash
+if [[ $(grep -r "#include.*eigen" *.{cpp,h} | grep eigen) ]]; then
+    echo "Strings are equal."
+else
+    echo "Strings are not equal."
+fi
