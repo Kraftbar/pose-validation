@@ -1,3 +1,0 @@
-/home/nybo/Documents/poseValidation/new_code_clean/testing_repo/take photos/bin/CMakeFiles/rebuild_cache.dir
-/home/nybo/Documents/poseValidation/new_code_clean/testing_repo/take photos/bin/CMakeFiles/edit_cache.dir
-/home/nybo/Documents/poseValidation/new_code_clean/testing_repo/take photos/bin/CMakeFiles/DisplayImage.dir
