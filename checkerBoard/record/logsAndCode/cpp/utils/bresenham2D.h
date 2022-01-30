@@ -1,3 +1,6 @@
+// taken, inspired from
+// https://gist.github.com/yamamushi/5823518
+
 void SetPixel(int x,int y,int  color){};
 
 // swap
