@@ -1,5 +1,6 @@
 #pragma once
 
+// file not used in main
 
 //  output is a binary image
 //  1: not a min region

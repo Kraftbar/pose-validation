@@ -1,5 +1,8 @@
 #pragma once
-	
+
+// file not used in main
+
+
 fitLine(){
     double sx = 0.0, sy = 0.0, stt = 0.0, sts = 0.0;
 	int n = x.size();
