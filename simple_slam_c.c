@@ -237,7 +237,6 @@ static void track_corners_pure_lk(const unsigned char* p_g, const unsigned char*
       }
       dx=l_dx/sc; dy=l_dy/sc;
     }
-    // Forward-Backward Consistency Check
     float back_dx = -dx, back_dy = -dy;
     for(int it=0; it<5; it++){
       float G[4]={0}, b[2]={0}; for(int y=-3; y<=3; y++)for(int x=-3; x<=3; x++){
@@ -280,6 +279,43 @@ static int verify_loop(KFDB* db, int lidx, const unsigned char* cgray, int w, in
   free(matches.data); free(cpts.data); return 0;
 }
 
+static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double cy) {
+  if (db->size < 3) return;
+  for (int iter = 0; iter < 5; iter++) {
+    for (int k = db->size - 3; k < db->size; k++) {
+      refine_pose_lm(map, &db->data[k].corners, fx, fy, cx, cy, &db->data[k].pose);
+    }
+    // Shared Map Point Refinement
+    for (int i = 0; i < map->size; i++) {
+      if (map->data[i].obs < 2) continue;
+      double H[9] = {0}, b[3] = {0};
+      for (int k = db->size - 3; k < db->size; k++) {
+        KFEntry* kf = &db->data[k]; double R[9], t[3]; pose_get_rotation(&kf->pose, R); pose_get_translation(&kf->pose, t);
+        for (int j = 0; j < kf->corners.size; j++) {
+          if (kf->corners.data[j].pt_idx != i) continue;
+          MapPoint p = map->data[i];
+          double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
+          if (cp[2] < 0.1) continue;
+          double inv_z = 1.0 / cp[2], inv_z2 = inv_z * inv_z;
+          double u = fx * cp[0] * inv_z + cx, v = fy * cp[1] * inv_z + cy;
+          double du = kf->corners.data[j].x - u, dv = kf->corners.data[j].y - v;
+          double J[2][3] = { { fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2, fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2, fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2 },
+                             { fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2, fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2, fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2 } };
+          for (int r = 0; r < 3; r++) { b[r] += J[0][r] * du + J[1][r] * dv; for (int c = 0; c < 3; c++) H[r*3+c] += J[0][r]*J[0][c] + J[1][r]*J[1][c]; }
+        }
+      }
+      for (int r = 0; r < 3; r++) H[r*3+r] += 1e-4;
+      double det = H[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*H[7]-H[4]*H[6]);
+      if (fabs(det) > 1e-9) {
+        double dx = (b[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(b[1]*H[8]-H[5]*b[2]) + H[2]*(b[1]*H[7]-H[4]*b[2])) / det;
+        double dy = (H[0]*(b[1]*H[8]-H[5]*b[2]) - b[0]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*b[2]-b[1]*H[6])) / det;
+        double dz = (H[0]*(H[4]*b[2]-b[1]*H[7]) - H[1]*(H[3]*b[2]-b[1]*H[6]) + b[0]*(H[3]*H[7]-H[4]*H[6])) / det;
+        map->data[i].x += dx; map->data[i].y += dy; map->data[i].z += dz;
+      }
+    }
+  }
+}
+
 static void ensure_parent_dir(const char* p){ char b[512], *s; snprintf(b,512,"%s",p); s=strrchr(b,'/'); if(s){*s='\0'; char c[640]; snprintf(c,640,"mkdir -p \"%s\"",b); (void)!system(c);} }
 static void write_metrics_json(FILE* f, const Config* cfg, const FrameStatVec* s, int pts, int tri, double dur){
   int kf=0; double av=0; for(int i=0;i<s->size;i++){if(s->data[i].is_keyframe)kf++; if(i>0)av+=s->data[i].inliers;} if(s->size>1)av/=(s->size-1);
@@ -313,6 +349,7 @@ int main(int argc, char** argv) {
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }
         KFEntry e; memcpy(e.thumb,thumb,256); e.frame_id=frame_id; e.pose=pose; e.corners.size=tracked.size; e.corners.data=malloc(tracked.size*sizeof(Corner)); memcpy(e.corners.data,tracked.data,tracked.size*sizeof(Corner)); e.gray=malloc(w*h); memcpy(e.gray,cgray,w*h); kfdb_push(&kf_db,e);
+        local_ba(&kf_db, &map, fx, fy, cx, cy); // Refine map and recent keyframes
         if(added>0||frame_id==1) lkf_pose=pose;
       }
       curr.corners=tracked;
