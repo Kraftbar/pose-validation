@@ -1,2 +1,25 @@
+# Build artifacts
+build-native/
+simple_slam_pure_c
+simple_slam_c
+simple_slam_opt
+
+# Python
+__pycache__/
+*.pyc
+
+# Data & Results
+runs/
+*.npz
+*.mp4
+aruco_poses.csv
+runs_summary.csv
+
+# System
+.DS_Store
 **/CMakeCacheFiles/
 **/build_latex/
+**/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
