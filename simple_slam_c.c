@@ -76,12 +76,51 @@ static int decompose_and_choose_pose(const double E[9], const CornerVec* p_pts, 
   if(bi>=0){ *out_rel=cands[bi]; return 1; } return 0;
 }
 
-static int estimate_essential_from_indices(const CornerVec* p_pts, const CornerVec* c_pts, const MatchVec* matches, const int* idxs, int n, double fx, double fy, double cx, double cy, double E[9]) {
-  double AtA[81]={0}, W[9], V[81]; if(n<8)return 0;
-  for(int i=0; i<n; i++){ double x1[3], x2[3], A[9]; Match m=matches->data[idxs[i]]; normalize_point(fx,fy,cx,cy,p_pts->data[m.query_idx],x1); normalize_point(fx,fy,cx,cy,c_pts->data[m.train_idx],x2);
-    A[0]=x2[0]*x1[0]; A[1]=x2[0]*x1[1]; A[2]=x2[0]; A[3]=x2[1]*x1[0]; A[4]=x2[1]*x1[1]; A[5]=x2[1]; A[6]=x1[0]; A[7]=x1[1]; A[8]=1.0;
-    for(int r=0; r<9; r++) for(int c=0; c<9; c++) AtA[r*9+c]+=A[r]*A[c]; }
-  jacobi_9x9(AtA,W,V); int bi=0; double mw=W[0]; for(int k=1; k<9; k++) if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0; k<9; k++) E[k]=V[k*9+bi]; return 1;
+// Hartley-normalized 8-point DLT on K-normalized homogeneous points.
+// n1,n2 are stride-3 arrays; idxs selects n rows. Returns 1 on success.
+static int fit_E_hartley(const double* n1, const double* n2, const int* idxs, int n, double E[9]) {
+  if (n < 8) return 0;
+  double mx1 = 0, my1 = 0, mx2 = 0, my2 = 0;
+  for (int i = 0; i < n; i++) {
+    const double* a = &n1[idxs[i]*3]; const double* b = &n2[idxs[i]*3];
+    mx1 += a[0]; my1 += a[1]; mx2 += b[0]; my2 += b[1];
+  }
+  mx1 /= n; my1 /= n; mx2 /= n; my2 /= n;
+  double d1 = 0, d2 = 0;
+  for (int i = 0; i < n; i++) {
+    const double* a = &n1[idxs[i]*3]; const double* b = &n2[idxs[i]*3];
+    double ax = a[0] - mx1, ay = a[1] - my1;
+    double bx = b[0] - mx2, by = b[1] - my2;
+    d1 += sqrt(ax*ax + ay*ay); d2 += sqrt(bx*bx + by*by);
+  }
+  d1 /= n; d2 /= n;
+  double s1 = (d1 > 1e-12) ? sqrt(2.0) / d1 : 1.0;
+  double s2 = (d2 > 1e-12) ? sqrt(2.0) / d2 : 1.0;
+  double AtA[81] = {0};
+  for (int i = 0; i < n; i++) {
+    const double* a = &n1[idxs[i]*3]; const double* b = &n2[idxs[i]*3];
+    double x1 = s1 * (a[0] - mx1), y1 = s1 * (a[1] - my1);
+    double x2 = s2 * (b[0] - mx2), y2 = s2 * (b[1] - my2);
+    double A[9] = { x2*x1, x2*y1, x2, y2*x1, y2*y1, y2, x1, y1, 1.0 };
+    for (int r = 0; r < 9; r++) for (int c = 0; c < 9; c++) AtA[r*9+c] += A[r]*A[c];
+  }
+  double W[9], V[81];
+  jacobi_9x9(AtA, W, V);
+  int bi = 0; double mw = W[0];
+  for (int k = 1; k < 9; k++) if (W[k] < mw) { mw = W[k]; bi = k; }
+  double En[9]; for (int k = 0; k < 9; k++) En[k] = V[k*9 + bi];
+  // Denormalize: E = T2^T * En * T1 where T1,T2 are Hartley transforms.
+  double tmp[9] = {
+    s2*En[0], s2*En[1], s2*En[2],
+    s2*En[3], s2*En[4], s2*En[5],
+    -s2*mx2*En[0] - s2*my2*En[3] + En[6],
+    -s2*mx2*En[1] - s2*my2*En[4] + En[7],
+    -s2*mx2*En[2] - s2*my2*En[5] + En[8],
+  };
+  E[0] = s1*tmp[0]; E[1] = s1*tmp[1]; E[2] = -s1*mx1*tmp[0] - s1*my1*tmp[1] + tmp[2];
+  E[3] = s1*tmp[3]; E[4] = s1*tmp[4]; E[5] = -s1*mx1*tmp[3] - s1*my1*tmp[4] + tmp[5];
+  E[6] = s1*tmp[6]; E[7] = s1*tmp[7]; E[8] = -s1*mx1*tmp[6] - s1*my1*tmp[7] + tmp[8];
+  return 1;
 }
 
 static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const MatchVec* matches, double fx, double fy, double cx, double cy, Pose* out_rel, unsigned char** out_mask, int* out_inliers) {
@@ -91,10 +130,9 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
   unsigned char* bmask=calloc(matches->size,1);
   unsigned char* used=malloc((size_t)matches->size);
   for(int i=0; i<iters; i++){
-    int smp[8]; memset(used,0,(size_t)matches->size); double cand_E[9], AtA[81]={0}, W[9], V[81];
+    int smp[8]; memset(used,0,(size_t)matches->size); double cand_E[9];
     for(int j=0;j<8;j++){ int idx; do{idx=rand()%matches->size;}while(used[idx]); used[idx]=1; smp[j]=idx; }
-    for(int k=0;k<8;k++){ double *x1=&n1[smp[k]*3], *x2=&n2[smp[k]*3], A[9]={x2[0]*x1[0],x2[0]*x1[1],x2[0],x2[1]*x1[0],x2[1]*x1[1],x2[1],x1[0],x1[1],1.0}; for(int r=0;r<9;r++)for(int c=0;c<9;c++)AtA[r*9+c]+=A[r]*A[c]; }
-    jacobi_9x9(AtA,W,V); int bi=0; double mw=W[0]; for(int k=1;k<9;k++)if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0;k<9;k++) cand_E[k]=V[k*9+bi];
+    fit_E_hartley(n1, n2, smp, 8, cand_E);
     enforce_essential_constraints(cand_E); int inl=0; double Et[9]; mat3_transpose(cand_E,Et);
     for(int j=0;j<matches->size;j++){ double *x1=&n1[j*3], *x2=&n2[j*3], Ex1[3]={cand_E[0]*x1[0]+cand_E[1]*x1[1]+cand_E[2], cand_E[3]*x1[0]+cand_E[4]*x1[1]+cand_E[5], cand_E[6]*x1[0]+cand_E[7]*x1[1]+cand_E[8]}, Etx2[3]={Et[0]*x2[0]+Et[1]*x2[1]+Et[2], Et[3]*x2[0]+Et[4]*x2[1]+Et[5], Et[6]*x2[0]+Et[7]*x2[1]+Et[8]}, num=x2[0]*Ex1[0]+x2[1]*Ex1[1]+Ex1[2], den=Ex1[0]*Ex1[0]+Ex1[1]*Ex1[1]+Etx2[0]*Etx2[0]+Etx2[1]*Etx2[1]+1e-12; if(num*num/den<th)inl++; }
     if(inl>best_inl){best_inl=inl; memcpy(best_E,cand_E,9*sizeof(double)); if(inl > matches->size*0.95) break; }
@@ -102,7 +140,8 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
   if(best_inl>=8){
     double Et[9]; mat3_transpose(best_E,Et); int* iidx=malloc(matches->size*sizeof(int)); int k=0;
     for(int j=0;j<matches->size;j++){ double *x1=&n1[j*3],*x2=&n2[j*3],Ex1[3]={best_E[0]*x1[0]+best_E[1]*x1[1]+best_E[2],best_E[3]*x1[0]+best_E[4]*x1[1]+best_E[5],best_E[6]*x1[0]+best_E[7]*x1[1]+best_E[8]}, Etx2[3]={Et[0]*x2[0]+Et[1]*x2[1]+Et[2],Et[3]*x2[0]+Et[4]*x2[1]+Et[5],Et[6]*x2[0]+Et[7]*x2[1]+Et[8]}, num=x2[0]*Ex1[0]+x2[1]*Ex1[1]+Ex1[2], den=Ex1[0]*Ex1[0]+Ex1[1]*Ex1[1]+Etx2[0]*Etx2[0]+Etx2[1]*Etx2[1]+1e-12; if(num*num/den<th){bmask[j]=1; iidx[k++]=j;} }
-    estimate_essential_from_indices(p_pts,c_pts,matches,iidx,k,fx,fy,cx,cy,best_E); enforce_essential_constraints(best_E); free(iidx);
+    if(k >= 8) { fit_E_hartley(n1, n2, iidx, k, best_E); enforce_essential_constraints(best_E); }
+    free(iidx);
   }
   free(n1); free(n2); free(used);
   if(best_inl>=8 && decompose_and_choose_pose(best_E,p_pts,c_pts,matches,bmask,fx,fy,cx,cy,out_rel)){ *out_mask=bmask; *out_inliers=best_inl; return 1; }
@@ -355,7 +394,7 @@ int main(int argc, char** argv) {
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
-    if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,1000); mkf=1; pose_identity(&pose); }
+    if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,2000); mkf=1; pose_identity(&pose); }
     else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
@@ -365,7 +404,7 @@ int main(int argc, char** argv) {
         if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3]; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
           if(triangulate_point(&prev.pose,&pose,prev.corners.data[matches.data[j].query_idx],tracked.data[matches.data[j].train_idx],fx,fy,cx,cy,X)){
             tracked.data[matches.data[j].train_idx].pt_idx=map.size; map_push(&map,(MapPoint){X[0],X[1],X[2],1}); pts++; added++; tri++; } } else { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
-        if(tracked.size<600) extract_corners_pure(cblur,w,h,&tracked,1000);
+        if(tracked.size<1200) extract_corners_pure(cblur,w,h,&tracked,2000);
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }
         KFEntry e; memcpy(e.thumb,thumb,256); e.frame_id=frame_id; e.pose=pose; e.corners.size=tracked.size; e.corners.data=malloc(tracked.size*sizeof(Corner)); memcpy(e.corners.data,tracked.data,tracked.size*sizeof(Corner)); e.gray=malloc(w*h); memcpy(e.gray,cgray,w*h); kfdb_push(&kf_db,e);
