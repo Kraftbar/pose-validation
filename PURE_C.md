@@ -31,6 +31,15 @@ This implementation (`simple_slam_c.c`) is a 100% library-free monocular SLAM sy
 | **Freiburg Room** | Wide Area | **1.7892 m** | ⚠️ Moderate |
 | **Freiburg Desk** | Fast Rotation / Close-up | **1.5947 m** | ✅ Stable |
 
+## Frozen Baseline
+
+Current frozen universal `simple_slam_c.c` build, using the stronger PnP selection
+and accepted LM pose refinement, is kept as the stable Pure C baseline.
+
+| Sequence | Window | ATE RMSE | Notes |
+| :--- | :--- | :--- | :--- |
+| **Freiburg XYZ** | **5s** | **0.1461 m** | Best verified stable all-around build in this repo. |
+
 ## Comparison with State-of-the-Art (SOTA)
 
 Typical monocular ATE RMSE results for the Freiburg sequences:
@@ -47,6 +56,7 @@ While SOTA systems achieve centimeter precision, they typically require >50,000 
 | Version | Feature / Tweak | Performance / Accuracy Gain |
 | :--- | :--- | :--- |
 | **V12** | **Local Bundle Adjustment** | **XYZ RMSE dropped to 0.24m** (62% gain). |
+| **Frozen** | **Stronger PnP + accepted LM pose refinement** | **XYZ 5s RMSE improved to 0.1461m**. |
 | **V11** | **Forward-Backward Tracking**| **Desk RMSE dropped to 1.59m** (53% gain). |
 | **V9/V10**| **Robust LM + Loop Closure**| Stabilized trajectory; enabled global consistency. |
 | **V7** | **PnP + Global Map** | Anchored trajectory to landmarks; prevented drift. |

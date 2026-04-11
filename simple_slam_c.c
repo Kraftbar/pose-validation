@@ -23,7 +23,7 @@ typedef struct { Match* data; int size, cap; } MatchVec;
 typedef struct { FrameStat* data; int size, cap; } FrameStatVec;
 typedef struct { double m[16]; } Pose;
 typedef struct { CornerVec corners; Pose pose; unsigned char* gray; } FrameLite;
-typedef struct { double x, y, z; int obs; } MapPoint;
+typedef struct { double x, y, z, err_sum; int obs, active; } MapPoint;
 typedef struct { MapPoint* data; int size, cap; } Map;
 
 static void* xrealloc(void* ptr, size_t size) { void* out = realloc(ptr, size); if(!out){ fprintf(stderr, "out of memory\n"); exit(1); } return out; }
@@ -44,6 +44,59 @@ static void pose_compose_relative(const Pose* rel, const Pose* prev, Pose* out) 
 static void camera_center_from_pose(const Pose* pose, double c[3]) { double R[9], Rt[9], t[3], tmp[3]; pose_get_rotation(pose,R); pose_get_translation(pose,t); mat3_transpose(R,Rt); mat3_vec_mul(Rt,t,tmp); c[0]=-tmp[0]; c[1]=-tmp[1]; c[2]=-tmp[2]; }
 static double rotation_degrees_between(const Pose* a, const Pose* b) { double Ra[9], Rb[9], Rat[9], R[9]; pose_get_rotation(a,Ra); pose_get_rotation(b,Rb); mat3_transpose(Ra,Rat); mat3_mul(Rb,Rat,R); double tr=R[0]+R[4]+R[8], cos_th=(tr-1.0)*0.5; if(cos_th>1)cos_th=1; if(cos_th<-1)cos_th=-1; return acos(cos_th)*180.0/M_PI; }
 static void normalize_point(double fx, double fy, double cx, double cy, Corner p, double out[3]) { out[0]=((double)p.x-cx)/fx; out[1]=((double)p.y-cy)/fy; out[2]=1.0; }
+static int triangulate_point(const Pose* p1, const Pose* p2, Corner pt1, Corner pt2, double fx, double fy, double cx, double cy, double X[3]);
+static uint32_t fast_rand_u32(void) { static uint32_t s = 0x9E3779B9u; s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+static int map_point_is_active(const Map* map, int idx) { return idx >= 0 && idx < map->size && map->data[idx].active; }
+
+static int project_map_point(const Pose* pose, const MapPoint* p, double fx, double fy, double cx, double cy, double* u, double* v, double* z) {
+  double R[9], t[3], cp[3];
+  pose_get_rotation(pose, R); pose_get_translation(pose, t);
+  cp[0] = R[0]*p->x + R[1]*p->y + R[2]*p->z + t[0];
+  cp[1] = R[3]*p->x + R[4]*p->y + R[5]*p->z + t[1];
+  cp[2] = R[6]*p->x + R[7]*p->y + R[8]*p->z + t[2];
+  if(!isfinite(cp[0]) || !isfinite(cp[1]) || !isfinite(cp[2]) || cp[2] <= 1e-6) return 0;
+  *z = cp[2]; *u = fx * cp[0] / cp[2] + cx; *v = fy * cp[1] / cp[2] + cy; return 1;
+}
+
+static double reproj_error_sq(const Pose* pose, const MapPoint* p, Corner obs, double fx, double fy, double cx, double cy) {
+  double u, v, z, dx, dy;
+  if(!project_map_point(pose, p, fx, fy, cx, cy, &u, &v, &z)) return DBL_MAX;
+  dx = u - obs.x; dy = v - obs.y; return dx*dx + dy*dy;
+}
+
+static int triangulate_map_point_checked(const Pose* p1, const Pose* p2, Corner pt1, Corner pt2, double fx, double fy, double cx, double cy, double X[3], double* avg_err) {
+  if(!triangulate_point(p1, p2, pt1, pt2, fx, fy, cx, cy, X)) return 0;
+  if(avg_err) *avg_err = 0.0;
+  return 1;
+}
+
+static void sanitize_corners_with_map(CornerVec* corners, const Map* map) {
+  for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1 && !map_point_is_active(map, corners->data[i].pt_idx)) corners->data[i].pt_idx = -1;
+}
+
+static void observe_tracked_map_points(Map* map, CornerVec* corners, const Pose* pose, double fx, double fy, double cx, double cy) {
+  for(int i=0; i<corners->size; i++) {
+    int idx = corners->data[i].pt_idx;
+    double err2;
+    if(!map_point_is_active(map, idx)) { corners->data[i].pt_idx = -1; continue; }
+    err2 = reproj_error_sq(pose, &map->data[idx], corners->data[i], fx, fy, cx, cy);
+    if(isfinite(err2) && err2 < 25.0) { map->data[idx].obs++; map->data[idx].err_sum += sqrt(err2); }
+  }
+}
+
+static double pose_reprojection_cost(const Map* map, const CornerVec* corners, const Pose* pose, double fx, double fy, double cx, double cy) {
+  double cost = 0.0;
+  int used = 0;
+  for(int i=0; i<corners->size; i++) {
+    double err2;
+    if(!map_point_is_active(map, corners->data[i].pt_idx)) continue;
+    err2 = reproj_error_sq(pose, &map->data[corners->data[i].pt_idx], corners->data[i], fx, fy, cx, cy);
+    if(!isfinite(err2) || err2 == DBL_MAX) continue;
+    cost += (err2 > 25.0) ? 25.0 : err2;
+    used++;
+  }
+  return (used >= 6) ? cost : DBL_MAX;
+}
 
 static int triangulate_point(const Pose* p1, const Pose* p2, Corner pt1, Corner pt2, double fx, double fy, double cx, double cy, double X[3]) {
   double K[9]={fx,0,cx, 0,fy,cy, 0,0,1}, R1[9], R2[9], t1[3], t2[3], Rt1[12], Rt2[12], P1[12], P2[12], A[16], VT[4];
@@ -99,7 +152,8 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
     if(inl>best_inl){best_inl=inl; memcpy(best_E,cand_E,9*sizeof(double)); if(inl > matches->size*0.95) break; }
   }
   if(best_inl>=8){
-    double Et[9]; mat3_transpose(best_E,Et); int* iidx=malloc(matches->size*sizeof(int)); int k=0;
+    double Et[9]; int* iidx=malloc(matches->size*sizeof(int)); int k=0;
+    mat3_transpose(best_E,Et);
     for(int j=0;j<matches->size;j++){ double *x1=&n1[j*3],*x2=&n2[j*3],Ex1[3]={best_E[0]*x1[0]+best_E[1]*x1[1]+best_E[2],best_E[3]*x1[0]+best_E[4]*x1[1]+best_E[5],best_E[6]*x1[0]+best_E[7]*x1[1]+best_E[8]}, Etx2[3]={Et[0]*x2[0]+Et[1]*x2[1]+Et[2],Et[3]*x2[0]+Et[4]*x2[1]+Et[5],Et[6]*x2[0]+Et[7]*x2[1]+Et[8]}, num=x2[0]*Ex1[0]+x2[1]*Ex1[1]+Ex1[2], den=Ex1[0]*Ex1[0]+Ex1[1]*Ex1[1]+Etx2[0]*Etx2[0]+Etx2[1]*Etx2[1]+1e-12; if(num*num/den<th){bmask[j]=1; iidx[k++]=j;} }
     estimate_essential_from_indices(p_pts,c_pts,matches,iidx,k,fx,fy,cx,cy,best_E); enforce_essential_constraints(best_E); free(iidx);
   }
@@ -109,21 +163,24 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
 }
 
 static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx, double fy, double cx, double cy, Pose* out_pose, int* out_inl) {
-  int n=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) n++;
+  int n=0; for(int i=0; i<corners->size; i++) if(map_point_is_active(map, corners->data[i].pt_idx) && map->data[corners->data[i].pt_idx].obs >= 1) n++;
   if(n < 12) return 0;
-  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) ids[k++] = i;
-  double best_P[12]; int best_inl = 0; srand(0);
+  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(map_point_is_active(map, corners->data[i].pt_idx) && map->data[corners->data[i].pt_idx].obs >= 1) ids[k++] = i;
+  double best_P[12], best_err = DBL_MAX; int best_inl = 0;
   for(int it=0; it<150; it++){
-    double AtA[144]={0}, W[12], V[144], P[12];
+    double AtA[144]={0}, W[12], V[144], P[12]; int sample[6];
     for(int i=0; i<6; i++){
-      int idx = ids[rand()%n]; MapPoint p = map->data[corners->data[idx].pt_idx];
+      int idx, dup;
+      do { dup = 0; idx = ids[fast_rand_u32() % (uint32_t)n]; for(int j=0; j<i; j++) if(sample[j] == idx) { dup = 1; break; } } while(dup);
+      sample[i] = idx;
+      MapPoint p = map->data[corners->data[idx].pt_idx];
       double u = (corners->data[idx].x - cx)/fx, v = (corners->data[idx].y - cy)/fy;
       double r1[12]={p.x,p.y,p.z,1, 0,0,0,0, -u*p.x,-u*p.y,-u*p.z,-u}, r2[12]={0,0,0,0, p.x,p.y,p.z,1, -v*p.x,-v*p.y,-v*p.z,-v};
       for(int r=0; r<12; r++) for(int c=0; c<12; c++) AtA[r*12+c] += r1[r]*r1[c] + r2[r]*r2[c];
     }
     jacobi_12x12(AtA, W, V); int bi=0; double mw=W[0]; for(int j=1;j<12;j++) if(W[j]<mw){mw=W[j]; bi=j;}
     for(int j=0; j<12; j++) P[j] = V[j*12+bi];
-    int inl=0; double R[9]={P[0],P[1],P[2], P[4],P[5],P[6], P[8],P[9],P[10]}, t[3]={P[3],P[7],P[11]};
+    int inl=0; double err_sum=0, R[9]={P[0],P[1],P[2], P[4],P[5],P[6], P[8],P[9],P[10]}, t[3]={P[3],P[7],P[11]};
     double sc = 1.0 / sqrt(R[6]*R[6] + R[7]*R[7] + R[8]*R[8]); if(P[11]*sc < 0) sc = -sc;
     for(int j=0; j<9; j++) R[j]*=sc; for(int j=0; j<3; j++) t[j]*=sc;
     for(int j=0; j<n; j++){
@@ -132,9 +189,9 @@ static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx
       if(cz_p < 0.1) continue;
       double u = fx*cx_p/cz_p + cx, v = fy*cy_p/cz_p + cy;
       double dx = u - corners->data[ids[j]].x, dy = v - corners->data[ids[j]].y;
-      if(dx*dx + dy*dy < 4.0) inl++;
+      if(dx*dx + dy*dy < 4.0) { inl++; err_sum += sqrt(dx*dx + dy*dy); }
     }
-    if(inl > best_inl){ best_inl = inl; memcpy(best_P, P, 12*sizeof(double)); }
+    if(inl > best_inl || (inl == best_inl && inl > 0 && err_sum < best_err)){ best_inl = inl; best_err = err_sum; memcpy(best_P, P, 12*sizeof(double)); }
     if(inl > n * 0.8) break;
   }
   if(best_inl >= 12){
@@ -152,10 +209,12 @@ static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx
 static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, double fy, double cx, double cy, Pose* pose) {
   double R[9], t[3]; pose_get_rotation(pose, R); pose_get_translation(pose, t);
   double lambda = 1e-3;
+  double best_cost = pose_reprojection_cost(map, corners, pose, fx, fy, cx, cy);
   for (int iter = 0; iter < 10; iter++) {
     double H[36] = {0}, b[6] = {0};
+    int used = 0;
     for (int i = 0; i < corners->size; i++) {
-      if (corners->data[i].pt_idx == -1) continue;
+      if (!map_point_is_active(map, corners->data[i].pt_idx)) continue;
       MapPoint p = map->data[corners->data[i].pt_idx];
       double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
       if (cp[2] < 0.1) continue;
@@ -168,19 +227,33 @@ static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, 
         { fx*inv_z, 0, -fx*cp[0]*inv_z2, -fx*cp[0]*cp[1]*inv_z2, fx*(1+cp[0]*cp[0]*inv_z2), -fx*cp[1]*inv_z },
         { 0, fy*inv_z, -fy*cp[1]*inv_z2, -fy*(1+cp[1]*cp[1]*inv_z2), fy*cp[0]*cp[1]*inv_z2, fy*cp[0]*inv_z }
       };
+      used++;
       for (int r = 0; r < 6; r++) {
         b[r] += weight * (J[0][r] * du + J[1][r] * dv);
         for (int c = 0; c < 6; c++) H[r*6+c] += weight * (J[0][r]*J[0][c] + J[1][r]*J[1][c]);
       }
     }
+    if (used < 6) break;
     for(int i=0; i<6; i++) H[i*6+i] += lambda * H[i*6+i] + 1e-6;
     double dx[6]; if (!solve_6x6(H, b, dx)) break;
-    t[0] += dx[0]; t[1] += dx[1]; t[2] += dx[2];
-    double dr[9] = { 1, -dx[5], dx[4], dx[5], 1, -dx[3], -dx[4], dx[3], 1 }, Rn[9];
-    mat3_mul(dr, R, Rn);
-    double W[3], U[9], V[9], VT[9]; svd_3x3(Rn, W, U, V);
-    for(int i=0;i<3;i++)for(int j=0;j<3;j++)VT[i*3+j]=V[j*3+i]; mat3_mul(U, VT, R);
-    if (dx[0]*dx[0] + dx[1]*dx[1] + dx[2]*dx[2] < 1e-8) break;
+    {
+      double cand_t[3] = { t[0] + dx[0], t[1] + dx[1], t[2] + dx[2] };
+      double dr[9] = { 1, -dx[5], dx[4], dx[5], 1, -dx[3], -dx[4], dx[3], 1 }, Rn[9], cand_R[9], W[3], U[9], V[9], VT[9];
+      Pose cand_pose;
+      mat3_mul(dr, R, Rn);
+      svd_3x3(Rn, W, U, V);
+      for(int i=0;i<3;i++)for(int j=0;j<3;j++)VT[i*3+j]=V[j*3+i]; mat3_mul(U, VT, cand_R);
+      pose_from_rt(cand_R, cand_t, &cand_pose);
+      {
+        double cand_cost = pose_reprojection_cost(map, corners, &cand_pose, fx, fy, cx, cy);
+        if(cand_cost < best_cost) {
+          memcpy(R, cand_R, sizeof(cand_R)); memcpy(t, cand_t, sizeof(cand_t)); best_cost = cand_cost; lambda = fmax(1e-5, lambda * 0.5);
+          if (dx[0]*dx[0] + dx[1]*dx[1] + dx[2]*dx[2] < 1e-8) break;
+        } else {
+          lambda = fmin(1e3, lambda * 4.0);
+        }
+      }
+    }
   }
   pose_from_rt(R, t, pose);
 }
@@ -285,14 +358,13 @@ static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double
     for (int k = db->size - 3; k < db->size; k++) {
       refine_pose_lm(map, &db->data[k].corners, fx, fy, cx, cy, &db->data[k].pose);
     }
-    // Shared Map Point Refinement
     for (int i = 0; i < map->size; i++) {
-      if (map->data[i].obs < 2) continue;
+      if (!map->data[i].active || map->data[i].obs < 2) continue;
       double H[9] = {0}, b[3] = {0};
       for (int k = db->size - 3; k < db->size; k++) {
         KFEntry* kf = &db->data[k]; double R[9], t[3]; pose_get_rotation(&kf->pose, R); pose_get_translation(&kf->pose, t);
         for (int j = 0; j < kf->corners.size; j++) {
-          if (kf->corners.data[j].pt_idx != i) continue;
+          if (kf->corners.data[j].pt_idx != i || !map->data[i].active) continue;
           MapPoint p = map->data[i];
           double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
           if (cp[2] < 0.1) continue;
@@ -305,12 +377,13 @@ static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double
         }
       }
       for (int r = 0; r < 3; r++) H[r*3+r] += 1e-4;
-      double det = H[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*H[7]-H[4]*H[6]);
-      if (fabs(det) > 1e-9) {
-        double dx = (b[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(b[1]*H[8]-H[5]*b[2]) + H[2]*(b[1]*H[7]-H[4]*b[2])) / det;
-        double dy = (H[0]*(b[1]*H[8]-H[5]*b[2]) - b[0]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*b[2]-b[1]*H[6])) / det;
-        double dz = (H[0]*(H[4]*b[2]-b[1]*H[7]) - H[1]*(H[3]*b[2]-b[1]*H[6]) + b[0]*(H[3]*H[7]-H[4]*H[6])) / det;
-        map->data[i].x += dx; map->data[i].y += dy; map->data[i].z += dz;
+      {
+        double det = H[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*H[7]-H[4]*H[6]);
+        if (fabs(det) > 1e-9) {
+          map->data[i].x += (b[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(b[1]*H[8]-H[5]*b[2]) + H[2]*(b[1]*H[7]-H[4]*b[2])) / det;
+          map->data[i].y += (H[0]*(b[1]*H[8]-H[5]*b[2]) - b[0]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*b[2]-b[1]*H[6])) / det;
+          map->data[i].z += (H[0]*(H[4]*b[2]-b[1]*H[7]) - H[1]*(H[3]*b[2]-b[1]*H[6]) + b[0]*(H[3]*H[7]-H[4]*H[6])) / det;
+        }
       }
     }
   }
@@ -333,19 +406,21 @@ int main(int argc, char** argv) {
   FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
+  const int target_corners=1100;
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
-    if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,1000); mkf=1; pose_identity(&pose); }
-    else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
+    if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,target_corners); mkf=1; pose_identity(&pose); }
+    else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches); sanitize_corners_with_map(&tracked,&map);
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else pose=prev.pose;
+      observe_tracked_map_points(&map, &tracked, &pose, fx, fy, cx, cy);
       if(inl<40 || rotation_degrees_between(&lkf_pose,&pose)>cfg.kf_max_rot_deg || frame_id%10==0) mkf=1;
       if(mkf){
-        if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3]; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
-          if(triangulate_point(&prev.pose,&pose,prev.corners.data[matches.data[j].query_idx],tracked.data[matches.data[j].train_idx],fx,fy,cx,cy,X)){
-            tracked.data[matches.data[j].train_idx].pt_idx=map.size; map_push(&map,(MapPoint){X[0],X[1],X[2],1}); pts++; added++; tri++; } } else { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
-        if(tracked.size<600) extract_corners_pure(cblur,w,h,&tracked,1000);
+        if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3], avg_err=0; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
+          if(triangulate_map_point_checked(&prev.pose,&pose,prev.corners.data[matches.data[j].query_idx],tracked.data[matches.data[j].train_idx],fx,fy,cx,cy,X,&avg_err)){
+            tracked.data[matches.data[j].train_idx].pt_idx=map.size; map_push(&map,(MapPoint){X[0],X[1],X[2],avg_err*2.0,2,1}); pts++; added++; tri++; } } else if(map_point_is_active(&map, tracked.data[matches.data[j].train_idx].pt_idx)) { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
+        if(tracked.size<600) extract_corners_pure(cblur,w,h,&tracked,target_corners);
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }
         KFEntry e; memcpy(e.thumb,thumb,256); e.frame_id=frame_id; e.pose=pose; e.corners.size=tracked.size; e.corners.data=malloc(tracked.size*sizeof(Corner)); memcpy(e.corners.data,tracked.data,tracked.size*sizeof(Corner)); e.gray=malloc(w*h); memcpy(e.gray,cgray,w*h); kfdb_push(&kf_db,e);

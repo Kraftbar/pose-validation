@@ -20,6 +20,9 @@ the canonical 30-second results.
 
 Older Freiburg experiment runs are archived under `runs/archive/benchmark/`.
 
+Frozen Pure C baseline note: the current stable universal `simple_slam_c.c` build
+has a verified `test_freiburgxyz525` 5-second ATE RMSE of **0.1461 m**.
+
 ---
 
 ## Results
