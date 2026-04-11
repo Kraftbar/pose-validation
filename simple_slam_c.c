@@ -245,6 +245,13 @@ static void blur_3x3(const unsigned char* src, int w, int h, unsigned char* dst)
   }
 }
 
+// Shi-Tomasi detector with per-cell bucket selection for spatial uniformity.
+// Splits the image into BUCKET_GRID_X x BUCKET_GRID_Y cells and picks the
+// strongest (max/num_cells) local maxima in each cell.
+#define BUCKET_GRID_X 10
+#define BUCKET_GRID_Y 8
+#define CORNER_SCORE_THRESH 0.1f
+
 static void extract_corners_pure(const unsigned char* g, int w, int h, CornerVec* c, int max) {
   float* s = calloc((size_t)w * h, sizeof(float));
   #pragma omp parallel for collapse(2)
@@ -258,27 +265,55 @@ static void extract_corners_pure(const unsigned char* g, int w, int h, CornerVec
     float det = Ixx*Iyy - Ixy*Ixy, tr = Ixx + Iyy;
     s[y*w + x] = 0.5f * (tr - sqrtf(tr*tr - 4.0f*det + 1e-6f));
   }
-  for (int y = 5; y < h - 5 && c->size < max; y++) {
-    for (int x = 5; x < w - 5 && c->size < max; x++) {
-      float val = s[y*w + x];
-      if (val < 0.1f) continue;
-      int ok = 1;
-      for (int i = -3; i <= 3 && ok; i++)
-        for (int j = -3; j <= 3 && ok; j++)
-          if (s[(y+i)*w + x+j] > val) ok = 0;
-      if (ok) corner_vec_push(c, (Corner){(float)x, (float)y, -1});
+
+  const int per_cell = (max / (BUCKET_GRID_X * BUCKET_GRID_Y)) + 1;
+  const int cell_w = w / BUCKET_GRID_X;
+  const int cell_h = h / BUCKET_GRID_Y;
+  // Per-cell selection: keep a descending-score top-K list, then push them.
+  float*  top_s = malloc((size_t)per_cell * sizeof(float));
+  int*    top_x = malloc((size_t)per_cell * sizeof(int));
+  int*    top_y = malloc((size_t)per_cell * sizeof(int));
+  for (int gy = 0; gy < BUCKET_GRID_Y && c->size < max; gy++) {
+    for (int gx = 0; gx < BUCKET_GRID_X && c->size < max; gx++) {
+      int y0 = gy * cell_h, y1 = (gy + 1) * cell_h;
+      int x0 = gx * cell_w, x1 = (gx + 1) * cell_w;
+      if (y0 < 5) y0 = 5; if (y1 > h - 5) y1 = h - 5;
+      if (x0 < 5) x0 = 5; if (x1 > w - 5) x1 = w - 5;
+      int nt = 0;
+      for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
+        float val = s[y*w + x];
+        if (val < CORNER_SCORE_THRESH) continue;
+        int ok = 1;
+        for (int i = -3; i <= 3 && ok; i++)
+          for (int j = -3; j <= 3 && ok; j++)
+            if (s[(y+i)*w + x+j] > val) ok = 0;
+        if (!ok) continue;
+        // Insert into descending top-K list.
+        if (nt < per_cell) {
+          int p = nt;
+          while (p > 0 && top_s[p-1] < val) { top_s[p] = top_s[p-1]; top_x[p] = top_x[p-1]; top_y[p] = top_y[p-1]; p--; }
+          top_s[p] = val; top_x[p] = x; top_y[p] = y; nt++;
+        } else if (val > top_s[per_cell - 1]) {
+          int p = per_cell - 1;
+          while (p > 0 && top_s[p-1] < val) { top_s[p] = top_s[p-1]; top_x[p] = top_x[p-1]; top_y[p] = top_y[p-1]; p--; }
+          top_s[p] = val; top_x[p] = x; top_y[p] = y;
+        }
+      }
+      for (int i = 0; i < nt && c->size < max; i++) {
+        corner_vec_push(c, (Corner){(float)top_x[i], (float)top_y[i], -1});
+      }
     }
   }
-  free(s);
+  free(top_s); free(top_x); free(top_y); free(s);
 }
 
-static void track_corners_pure_lk(const unsigned char* p_g, const unsigned char* c_g, int w, int h, const CornerVec* p_pts, CornerVec* c_pts, MatchVec* m) {
+static void track_corners_pure_lk(const unsigned char* p_g, const unsigned char* c_g, int w, int h, const CornerVec* p_pts, CornerVec* c_pts, MatchVec* m, float init_dx, float init_dy) {
   unsigned char *p_g1=malloc((w/2)*(h/2)), *c_g1=malloc((w/2)*(h/2)), *p_g2=malloc((w/4)*(h/4)), *c_g2=malloc((w/4)*(h/4)), *p_g3=malloc((w/8)*(h/8)), *c_g3=malloc((w/8)*(h/8));
   downsample2x(p_g,w,h,p_g1); downsample2x(c_g,w,h,c_g1); downsample2x(p_g1,w/2,h/2,p_g2); downsample2x(c_g1,w/2,h/2,c_g2); downsample2x(p_g2,w/4,h/4,p_g3); downsample2x(c_g2,w/4,h/4,c_g3);
   Corner* res=malloc(p_pts->size*sizeof(Corner)); int* ok=calloc(p_pts->size,sizeof(int));
   #pragma omp parallel for
   for(int i=0; i<p_pts->size; i++){
-    Corner p=p_pts->data[i]; float dx=0, dy=0;
+    Corner p=p_pts->data[i]; float dx=init_dx, dy=init_dy;
     for(int level=3; level>=0; level--){
       const unsigned char *pg, *cg; int lw, lh; float sc;
       if(level==3){ pg=p_g3; cg=c_g3; lw=w/8; lh=h/8; sc=0.125f; } else if(level==2){ pg=p_g2; cg=c_g2; lw=w/4; lh=h/4; sc=0.25f; } else if(level==1){ pg=p_g1; cg=c_g1; lw=w/2; lh=h/2; sc=0.5f; } else { pg=p_g; cg=c_g; lw=w; lh=h; sc=1.0f; }
@@ -392,10 +427,22 @@ int main(int argc, char** argv) {
   FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
+  float flow_dx = 0.0f, flow_dy = 0.0f;  // constant-velocity prior for LK
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
     if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,2000); mkf=1; pose_identity(&pose); }
-    else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
+    else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches,flow_dx,flow_dy);
+      // Update constant-velocity prior from this frame's mean tracked flow.
+      if (matches.size > 0) {
+        double sum_dx = 0, sum_dy = 0;
+        for (int j = 0; j < matches.size; j++) {
+          Corner a = prev.corners.data[matches.data[j].query_idx];
+          Corner b = tracked.data[matches.data[j].train_idx];
+          sum_dx += b.x - a.x; sum_dy += b.y - a.y;
+        }
+        flow_dx = (float)(sum_dx / matches.size);
+        flow_dy = (float)(sum_dy / matches.size);
+      }
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else pose=prev.pose;
