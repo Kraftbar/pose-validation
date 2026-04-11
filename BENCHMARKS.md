@@ -22,6 +22,38 @@ Older Freiburg experiment runs are archived under `runs/archive/benchmark/`.
 
 ---
 
+## Pure C Status
+
+Recent work in `simple_slam_c.c` has focused on front-end stability and bounded runtime behavior rather than publishing a fresh headline ATE number yet.
+
+- **Hartley-normalized E estimation:** Replaces the older unnormalized 8-point fit in the pure C front-end.
+- **Bucketed corners + motion-seeded LK:** Improves feature spread and makes LK less brittle on consecutive frames.
+- **Adaptive keyframes:** Uses low inlier count, track-ratio decay, rotation since the last KF, and frame age.
+- **Map-point culling + compaction:** Removes weak/stale landmarks and honors `--max_points` as a live-map cap.
+- **O(window) local BA:** Keeps recent-keyframe optimization from degrading as the historical map grows.
+
+If you want fresh pure C numbers, re-run the benchmark suite with the current binary rather than relying on older archived measurements.
+
+```bash
+# Full Freiburg XYZ benchmark for the current pure C runtime
+python3 benchmark.py \
+  --impl c \
+  --video test_freiburgxyz525 \
+  --seconds 30 \
+  --timeout 120 \
+  --out_dir runs/pure_c_iter \
+  --force
+
+# Direct short sanity run
+./build-native/simple_slam_c \
+  --video_path test_freiburgxyz525.mp4 \
+  --seconds 5 \
+  --timeout 30 \
+  --metrics_out runs/pure_c_iter/dbg.json
+```
+
+---
+
 ## Results
 
 ### test_freiburgxyz525.mp4 — 640×480, 798 frames @ 25 fps, 31.9s
@@ -75,6 +107,15 @@ Settings: `--seconds 30 --ba_min_gap_sec 0.5` (BA enabled), all other params def
 ## How to reproduce
 
 ```bash
+# Pure C benchmark
+python3 benchmark.py \
+  --impl c \
+  --video test_freiburgxyz525 \
+  --seconds 30 \
+  --timeout 120 \
+  --out_dir runs/pure_c_iter \
+  --force
+
 # Full sequence, BA disabled (fast, ~78s)
 python simple_slam.py \
   --video_path test_freiburgxyz525.mp4 \

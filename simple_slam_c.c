@@ -1,4 +1,5 @@
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,7 +24,7 @@ typedef struct { Match* data; int size, cap; } MatchVec;
 typedef struct { FrameStat* data; int size, cap; } FrameStatVec;
 typedef struct { double m[16]; } Pose;
 typedef struct { CornerVec corners; Pose pose; unsigned char* gray; } FrameLite;
-typedef struct { double x, y, z; int obs; } MapPoint;
+typedef struct { double x, y, z; int obs, born_frame, last_seen_frame; } MapPoint;
 typedef struct { MapPoint* data; int size, cap; } Map;
 
 static void* xrealloc(void* ptr, size_t size) { void* out = realloc(ptr, size); if(!out){ fprintf(stderr, "out of memory\n"); exit(1); } return out; }
@@ -31,6 +32,20 @@ static void corner_vec_push(CornerVec* vec, Corner v) { if(vec->size == vec->cap
 static void match_vec_push(MatchVec* vec, Match v) { if(vec->size == vec->cap){ vec->cap = vec->cap ? vec->cap * 2 : 256; vec->data = (Match*)xrealloc(vec->data, (size_t)vec->cap * sizeof(Match)); } vec->data[vec->size++] = v; }
 static void frame_stat_vec_push(FrameStatVec* vec, FrameStat v) { if(vec->size == vec->cap){ vec->cap = vec->cap ? vec->cap * 2 : 256; vec->data = (FrameStat*)xrealloc(vec->data, (size_t)vec->cap * sizeof(FrameStat)); } vec->data[vec->size++] = v; }
 static void map_push(Map* m, MapPoint p) { if(m->size == m->cap){ m->cap = m->cap ? m->cap * 2 : 1024; m->data = (MapPoint*)xrealloc(m->data, (size_t)m->cap * sizeof(MapPoint)); } m->data[m->size++] = p; }
+
+static int map_point_is_valid(const Map* map, int idx) {
+  if (idx < 0 || idx >= map->size) return 0;
+  const MapPoint* p = &map->data[idx];
+  return p->obs > 0 && isfinite(p->x) && isfinite(p->y) && isfinite(p->z);
+}
+
+static void remap_corner_point_ids(CornerVec* corners, const int* remap, int old_size) {
+  for (int i = 0; i < corners->size; i++) {
+    int idx = corners->data[i].pt_idx;
+    if (idx < 0 || idx >= old_size || remap[idx] < 0) corners->data[i].pt_idx = -1;
+    else corners->data[i].pt_idx = remap[idx];
+  }
+}
 
 static void pose_identity(Pose* p) { memset(p->m, 0, sizeof(p->m)); for(int i=0; i<4; i++) p->m[i*4+i]=1.0; }
 static void pose_from_rt(const double R[9], const double t[3], Pose* p) { pose_identity(p); for(int r=0; r<3; r++){ for(int c=0; c<3; c++) p->m[r*4+c]=R[r*3+c]; p->m[r*4+3]=t[r]; } }
@@ -149,9 +164,9 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
 }
 
 static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx, double fy, double cx, double cy, Pose* out_pose, int* out_inl) {
-  int n=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) n++;
+  int n=0; for(int i=0; i<corners->size; i++) if(map_point_is_valid(map, corners->data[i].pt_idx)) n++;
   if(n < 12) return 0;
-  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) ids[k++] = i;
+  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(map_point_is_valid(map, corners->data[i].pt_idx)) ids[k++] = i;
   double best_P[12]; int best_inl = 0;
   for(int it=0; it<150; it++){
     double AtA[144]={0}, W[12], V[144], P[12];
@@ -195,7 +210,7 @@ static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, 
   for (int iter = 0; iter < 10; iter++) {
     double H[36] = {0}, b[6] = {0};
     for (int i = 0; i < corners->size; i++) {
-      if (corners->data[i].pt_idx == -1) continue;
+      if (!map_point_is_valid(map, corners->data[i].pt_idx)) continue;
       MapPoint p = map->data[corners->data[i].pt_idx];
       double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
       if (cp[2] < 0.1) continue;
@@ -352,7 +367,91 @@ typedef struct { unsigned char thumb[256]; int frame_id; Pose pose; CornerVec co
 typedef struct { KFEntry* data; int size, cap; } KFDB;
 static void kfdb_push(KFDB* db, KFEntry e) { if(db->size == db->cap){ db->cap = db->cap ? db->cap * 2 : 64; db->data = xrealloc(db->data, db->cap * sizeof(KFEntry)); } db->data[db->size++] = e; }
 static void gen_thumbnail(const unsigned char* g, int w, int h, unsigned char* out) { for(int y=0; y<16; y++) for(int x=0; x<16; x++) out[y*16+x] = g[(y*h/16)*w + (x*w/16)]; }
-static int find_loop_candidate(KFDB* db, const unsigned char* thumb, int current_id) { int bi=-1; uint32_t bs=0xFFFFFFFF; for(int i=0; i<db->size-50; i++) { uint32_t s=0; for(int j=0; j<256; j++) s+=abs(thumb[j]-db->data[i].thumb[j]); if(s<bs){bs=s;bi=i;} } return (bs<3500)?bi:-1; }
+static int find_loop_candidate(KFDB* db, const unsigned char* thumb, int current_id) { (void)current_id; int bi=-1; uint32_t bs=0xFFFFFFFF; for(int i=0; i<db->size-50; i++) { uint32_t s=0; for(int j=0; j<256; j++) s+=abs(thumb[j]-db->data[i].thumb[j]); if(s<bs){bs=s;bi=i;} } return (bs<3500)?bi:-1; }
+
+static void kfdb_push_copy(KFDB* db, int frame_id, const Pose* pose, const CornerVec* corners, const unsigned char* gray, int w, int h, const unsigned char* thumb) {
+  KFEntry e;
+  memcpy(e.thumb, thumb, 256);
+  e.frame_id = frame_id;
+  e.pose = *pose;
+  e.corners.size = corners->size;
+  e.corners.cap = corners->size;
+  e.corners.data = malloc((size_t)corners->size * sizeof(Corner));
+  memcpy(e.corners.data, corners->data, (size_t)corners->size * sizeof(Corner));
+  e.gray = malloc((size_t)w * h);
+  memcpy(e.gray, gray, (size_t)w * h);
+  kfdb_push(db, e);
+}
+
+static void kfdb_free(KFDB* db) {
+  for (int i = 0; i < db->size; i++) {
+    free(db->data[i].corners.data);
+    free(db->data[i].gray);
+  }
+  free(db->data);
+}
+
+#define MIN_POINT_OBS_AFTER_GRACE 2
+#define POINT_GRACE_FRAMES 3
+#define POINT_STALE_FRAMES 12
+
+static int cull_and_compact_map(Map* map, KFDB* db, CornerVec* active_corners, int frame_id, int max_points) {
+  for (int i = 0; i < map->size; i++) {
+    MapPoint* p = &map->data[i];
+    int age = frame_id - p->born_frame;
+    int stale = frame_id - p->last_seen_frame;
+    if (!map_point_is_valid(map, i)) {
+      p->obs = 0;
+      continue;
+    }
+    if (fabs(p->x) > 1e4 || fabs(p->y) > 1e4 || fabs(p->z) > 1e4) {
+      p->obs = 0;
+      continue;
+    }
+    if (p->obs < MIN_POINT_OBS_AFTER_GRACE && age >= POINT_GRACE_FRAMES) {
+      p->obs = 0;
+      continue;
+    }
+    if (p->obs < 3 && stale >= POINT_STALE_FRAMES) p->obs = 0;
+  }
+
+  if (max_points > 0) {
+    int live = 0;
+    for (int i = 0; i < map->size; i++) if (map_point_is_valid(map, i)) live++;
+    while (live > max_points) {
+      int worst = -1;
+      int worst_obs = INT_MAX;
+      int oldest_seen = INT_MAX;
+      for (int i = 0; i < map->size; i++) {
+        if (!map_point_is_valid(map, i)) continue;
+        MapPoint* p = &map->data[i];
+        if (p->obs < worst_obs || (p->obs == worst_obs && p->last_seen_frame < oldest_seen)) {
+          worst = i;
+          worst_obs = p->obs;
+          oldest_seen = p->last_seen_frame;
+        }
+      }
+      if (worst < 0) break;
+      map->data[worst].obs = 0;
+      live--;
+    }
+  }
+
+  int old_size = map->size;
+  int new_size = 0;
+  int* remap = malloc((size_t)old_size * sizeof(int));
+  for (int i = 0; i < old_size; i++) {
+    if (map_point_is_valid(map, i)) {
+      if (new_size != i) map->data[new_size] = map->data[i];
+      remap[i] = new_size++;
+    } else remap[i] = -1;
+  }
+  for (int i = 0; i < db->size; i++) remap_corner_point_ids(&db->data[i].corners, remap, old_size);
+  if (active_corners) remap_corner_point_ids(active_corners, remap, old_size);
+  free(remap);
+  map->size = new_size;
+  return old_size - new_size;
+}
 
 static int verify_loop(KFDB* db, int lidx, const unsigned char* cgray, int w, int h, double fx, double fy, double cx, double cy, Pose* out_pose) {
   KFEntry* kf = &db->data[lidx]; MatchVec matches = {0}; CornerVec cpts = {0};
@@ -367,8 +466,9 @@ static int verify_loop(KFDB* db, int lidx, const unsigned char* cgray, int w, in
     }
     if (best_ncc > 0.95) { match_vec_push(&matches, (Match){i, cpts.size, 0}); corner_vec_push(&cpts, (Corner){(float)best_x, (float)best_y, -1}); }
   }
-  Pose rel; unsigned char* mask; int inl; int ok = estimate_pose_E(&kf->corners, &cpts, &matches, fx, fy, cx, cy, &rel, &mask, &inl);
+  Pose rel; unsigned char* mask = NULL; int inl; int ok = estimate_pose_E(&kf->corners, &cpts, &matches, fx, fy, cx, cy, &rel, &mask, &inl);
   if(ok && inl > 20) { pose_compose_relative(&rel, &kf->pose, out_pose); free(mask); free(matches.data); free(cpts.data); return 1; }
+  free(mask);
   free(matches.data); free(cpts.data); return 0;
 }
 
@@ -398,7 +498,7 @@ static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double
       double R[9], t[3]; pose_get_rotation(&kf->pose, R); pose_get_translation(&kf->pose, t);
       for (int j = 0; j < kf->corners.size; j++) {
         int pi = kf->corners.data[j].pt_idx;
-        if (pi < 0 || map->data[pi].obs < 2) continue;
+        if (!map_point_is_valid(map, pi) || map->data[pi].obs < 2) continue;
         MapPoint p = map->data[pi];
         double cp[3] = {
           R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0],
@@ -444,20 +544,43 @@ static void write_metrics_json(FILE* f, const Config* cfg, const FrameStatVec* s
 }
 
 static double now_seconds(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9; }
-static Config parse_args(int argc, char** argv){ Config c={"test_kitti984.mp4",5.0,30.0,NULL,20,5.0,15000}; for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"--video_path")&&i+1<argc)c.video_path=argv[++i]; else if(!strcmp(argv[i],"--seconds")&&i+1<argc)c.seconds=atof(argv[++i]); else if(!strcmp(argv[i],"--timeout")&&i+1<argc)c.timeout=atof(argv[++i]); else if(!strcmp(argv[i],"--metrics_out")&&i+1<argc)c.metrics_out=argv[++i]; else if(argv[i][0]!='-')c.video_path=argv[i]; } return c; }
+static Config parse_args(int argc, char** argv) {
+  Config c = {"test_kitti984.mp4", 5.0, 30.0, NULL, 20, 5.0, 15000};
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--video_path") && i + 1 < argc) c.video_path = argv[++i];
+    else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) c.seconds = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) c.timeout = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--metrics_out") && i + 1 < argc) c.metrics_out = argv[++i];
+    else if (!strcmp(argv[i], "--kf_min_inliers") && i + 1 < argc) c.kf_min_inliers = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--kf_max_rot_deg") && i + 1 < argc) c.kf_max_rot_deg = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--max_points") && i + 1 < argc) c.max_points = atoi(argv[++i]);
+    else if (argv[i][0] != '-') c.video_path = argv[i];
+  }
+  return c;
+}
 
 int main(int argc, char** argv) {
   Config cfg=parse_args(argc,argv); FFmpegCap* cap=ffmpeg_open(cfg.video_path); if(!cap){fprintf(stderr,"Failed pipe.\n");return 1;}
   srand(1);
   int w=640,h=480; unsigned char *raw=malloc(w*h*3),*pgray=calloc(w*h,1),*cgray=calloc(w*h,1),*cblur=calloc(w*h,1);
   FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
-  KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
+  KFDB kf_db = {0}; Map map = {0}; int frame_id=0,tri=0,last_kf_feature_count=0; double start=now_seconds();
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
   float flow_dx = 0.0f, flow_dy = 0.0f;  // constant-velocity prior for LK
   int last_kf_frame = -100;              // enforce minimum KF spacing
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
-    if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,2000); mkf=1; pose_identity(&pose); }
+    if(frame_id==0){
+      extract_corners_pure(cblur,w,h,&curr.corners,2000);
+      mkf=1;
+      pose_identity(&pose);
+      unsigned char thumb[256];
+      gen_thumbnail(cgray,w,h,thumb);
+      kfdb_push_copy(&kf_db, frame_id, &pose, &curr.corners, cgray, w, h, thumb);
+      lkf_pose = pose;
+      last_kf_frame = frame_id;
+      last_kf_feature_count = curr.corners.size;
+    }
     else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches,flow_dx,flow_dy);
       // Update constant-velocity prior from this frame's mean tracked flow.
       if (matches.size > 0) {
@@ -470,6 +593,7 @@ int main(int argc, char** argv) {
         flow_dx = (float)(sum_dx / matches.size);
         flow_dy = (float)(sum_dy / matches.size);
       }
+      for (int j = 0; j < tracked.size; j++) if (!map_point_is_valid(&map, tracked.data[j].pt_idx)) tracked.data[j].pt_idx = -1;
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else pose=prev.pose;
@@ -483,8 +607,9 @@ int main(int argc, char** argv) {
       // so back-to-back KFs never happen -- consecutive KFs have zero baseline
       // and produce garbage triangulation.
       int frames_since_kf = frame_id - last_kf_frame;
-      int track_low = (tracked.size < 400);
-      int pose_weak = (inl < 15);
+      int track_ratio_low = last_kf_feature_count > 0 && tracked.size * 10 < last_kf_feature_count * 6;
+      int track_low = track_ratio_low || (tracked.size < 400);
+      int pose_weak = (inl < cfg.kf_min_inliers);
       int too_old = (frames_since_kf >= 8);
       int rot_big = rotation_degrees_between(&lkf_pose, &pose) > cfg.kf_max_rot_deg;
       if (frames_since_kf >= 3 && (track_low || pose_weak || rot_big || too_old)) mkf = 1;
@@ -495,31 +620,38 @@ int main(int argc, char** argv) {
         // any new points and the map froze a few dozen points in.
         for (int j = 0; j < matches.size; j++) {
           int ti = matches.data[j].train_idx;
-          if (tracked.data[ti].pt_idx != -1) { map.data[tracked.data[ti].pt_idx].obs++; continue; }
+          if (map_point_is_valid(&map, tracked.data[ti].pt_idx)) {
+            map.data[tracked.data[ti].pt_idx].obs++;
+            map.data[tracked.data[ti].pt_idx].last_seen_frame = frame_id;
+            continue;
+          }
+          tracked.data[ti].pt_idx = -1;
           if (mask && !mask[j]) continue;  // if we do have an E-mask, honor it
           double X[3];
           if (triangulate_point(&prev.pose, &pose,
                                 prev.corners.data[matches.data[j].query_idx],
                                 tracked.data[ti], fx, fy, cx, cy, X)) {
             tracked.data[ti].pt_idx = map.size;
-            map_push(&map, (MapPoint){X[0], X[1], X[2], 1});
-            pts++; added++; tri++;
+            map_push(&map, (MapPoint){X[0], X[1], X[2], 1, frame_id, frame_id});
+            added++; tri++;
           }
         }
         if(tracked.size<1200) extract_corners_pure(cblur,w,h,&tracked,2000);
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }
-        KFEntry e; memcpy(e.thumb,thumb,256); e.frame_id=frame_id; e.pose=pose; e.corners.size=tracked.size; e.corners.data=malloc(tracked.size*sizeof(Corner)); memcpy(e.corners.data,tracked.data,tracked.size*sizeof(Corner)); e.gray=malloc(w*h); memcpy(e.gray,cgray,w*h); kfdb_push(&kf_db,e);
+        kfdb_push_copy(&kf_db, frame_id, &pose, &tracked, cgray, w, h, thumb);
+        cull_and_compact_map(&map, &kf_db, &tracked, frame_id, cfg.max_points);
         local_ba(&kf_db, &map, fx, fy, cx, cy); // Refine map and recent keyframes
         lkf_pose = pose;              // anchor rotation reference to every KF
         last_kf_frame = frame_id;
+        last_kf_feature_count = tracked.size;
       }
       curr.corners=tracked;
     }
-    curr.pose=pose; double c[3]; camera_center_from_pose(&pose,c); frame_stat_vec_push(&stats,(FrameStat){frame_id,inl,mkf,added,pts,{c[0],c[1],c[2]}});
-    if((frame_id+1)%10==0)printf("Frames=%d Pts=%d KF=%d Map=%d\n",frame_id+1,pts,kf_db.size,map.size);
+    curr.pose=pose; double c[3]; camera_center_from_pose(&pose,c); frame_stat_vec_push(&stats,(FrameStat){frame_id,inl,mkf,added,map.size,{c[0],c[1],c[2]}});
+    if((frame_id+1)%10==0)printf("Frames=%d Pts=%d KF=%d Map=%d\n",frame_id+1,map.size,kf_db.size,map.size);
     memcpy(pgray,cblur,w*h); free(prev.corners.data); prev=curr; memset(&curr,0,sizeof(curr)); free(matches.data); free(mask); frame_id++;
   }
-  const char* out=cfg.metrics_out?cfg.metrics_out:"runs/pure_c_metrics.json"; ensure_parent_dir(out); FILE* f=fopen(out,"wb"); if(f){write_metrics_json(f,&cfg,&stats,pts,tri,now_seconds()-start);fclose(f);}
-  ffmpeg_close(cap); free(raw); free(pgray); free(cgray); free(cblur); free(prev.corners.data); free(stats.data); free(map.data); return 0;
+  const char* out=cfg.metrics_out?cfg.metrics_out:"runs/pure_c_metrics.json"; ensure_parent_dir(out); FILE* f=fopen(out,"wb"); if(f){write_metrics_json(f,&cfg,&stats,map.size,tri,now_seconds()-start);fclose(f);}
+  ffmpeg_close(cap); free(raw); free(pgray); free(cgray); free(cblur); free(prev.corners.data); free(stats.data); free(map.data); kfdb_free(&kf_db); return 0;
 }
