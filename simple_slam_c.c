@@ -88,10 +88,11 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
   const double th=1e-4; const int iters=150; double best_E[9]={0}; int best_inl=0; if(matches->size<8)return 0;
   double *n1=malloc(matches->size*3*sizeof(double)), *n2=malloc(matches->size*3*sizeof(double));
   for(int i=0;i<matches->size;i++){ normalize_point(fx,fy,cx,cy,p_pts->data[matches->data[i].query_idx],&n1[i*3]); normalize_point(fx,fy,cx,cy,c_pts->data[matches->data[i].train_idx],&n2[i*3]); }
-  unsigned char* bmask=calloc(matches->size,1); srand(0);
+  unsigned char* bmask=calloc(matches->size,1);
+  unsigned char* used=malloc((size_t)matches->size);
   for(int i=0; i<iters; i++){
-    int smp[8]; unsigned char used[4096]={0}; double cand_E[9], AtA[81]={0}, W[9], V[81];
-    for(int j=0;j<8;j++){ int idx; do{idx=rand()%matches->size;}while(used[idx%4096]); used[idx%4096]=1; smp[j]=idx; }
+    int smp[8]; memset(used,0,(size_t)matches->size); double cand_E[9], AtA[81]={0}, W[9], V[81];
+    for(int j=0;j<8;j++){ int idx; do{idx=rand()%matches->size;}while(used[idx]); used[idx]=1; smp[j]=idx; }
     for(int k=0;k<8;k++){ double *x1=&n1[smp[k]*3], *x2=&n2[smp[k]*3], A[9]={x2[0]*x1[0],x2[0]*x1[1],x2[0],x2[1]*x1[0],x2[1]*x1[1],x2[1],x1[0],x1[1],1.0}; for(int r=0;r<9;r++)for(int c=0;c<9;c++)AtA[r*9+c]+=A[r]*A[c]; }
     jacobi_9x9(AtA,W,V); int bi=0; double mw=W[0]; for(int k=1;k<9;k++)if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0;k<9;k++) cand_E[k]=V[k*9+bi];
     enforce_essential_constraints(cand_E); int inl=0; double Et[9]; mat3_transpose(cand_E,Et);
@@ -103,7 +104,7 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
     for(int j=0;j<matches->size;j++){ double *x1=&n1[j*3],*x2=&n2[j*3],Ex1[3]={best_E[0]*x1[0]+best_E[1]*x1[1]+best_E[2],best_E[3]*x1[0]+best_E[4]*x1[1]+best_E[5],best_E[6]*x1[0]+best_E[7]*x1[1]+best_E[8]}, Etx2[3]={Et[0]*x2[0]+Et[1]*x2[1]+Et[2],Et[3]*x2[0]+Et[4]*x2[1]+Et[5],Et[6]*x2[0]+Et[7]*x2[1]+Et[8]}, num=x2[0]*Ex1[0]+x2[1]*Ex1[1]+Ex1[2], den=Ex1[0]*Ex1[0]+Ex1[1]*Ex1[1]+Etx2[0]*Etx2[0]+Etx2[1]*Etx2[1]+1e-12; if(num*num/den<th){bmask[j]=1; iidx[k++]=j;} }
     estimate_essential_from_indices(p_pts,c_pts,matches,iidx,k,fx,fy,cx,cy,best_E); enforce_essential_constraints(best_E); free(iidx);
   }
-  free(n1); free(n2);
+  free(n1); free(n2); free(used);
   if(best_inl>=8 && decompose_and_choose_pose(best_E,p_pts,c_pts,matches,bmask,fx,fy,cx,cy,out_rel)){ *out_mask=bmask; *out_inliers=best_inl; return 1; }
   free(bmask); return 0;
 }
@@ -112,7 +113,7 @@ static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx
   int n=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) n++;
   if(n < 12) return 0;
   int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) ids[k++] = i;
-  double best_P[12]; int best_inl = 0; srand(0);
+  double best_P[12]; int best_inl = 0;
   for(int it=0; it<150; it++){
     double AtA[144]={0}, W[12], V[144], P[12];
     for(int i=0; i<6; i++){
@@ -206,11 +207,29 @@ static void blur_3x3(const unsigned char* src, int w, int h, unsigned char* dst)
 }
 
 static void extract_corners_pure(const unsigned char* g, int w, int h, CornerVec* c, int max) {
-  float* s=calloc((size_t)w*h, sizeof(float));
+  float* s = calloc((size_t)w * h, sizeof(float));
   #pragma omp parallel for collapse(2)
-  for(int y=2;y<h-2;y++)for(int x=2;x<w-2;x++){ float Ixx=0,Iyy=0,Ixy=0; for(int i=-1;i<=1;i++)for(int j=-1;j<=1;j++){ float gx=(float)g[(y+i)*w+x+j+1]-g[(y+i)*w+x+j-1], gy=(float)g[(y+i+1)*w+x+j]-g[(y+i-1)*w+x+j]; Ixx+=gx*gx; Iyy+=gy*gy; Ixy+=gx*gy; }
-    float det=Ixx*Iyy-Ixy*Ixy, tr=Ixx+Iyy; s[y*w+x]=0.5f*(tr-sqrtf(tr*tr-4.0f*det+1e-6f)); }
-  for(int y=5;y<h-5;y++)for(int x=5;x<w-5;x++){ float val=s[y*w+x]; if(val<0.1f)continue; int ok=1; for(int i=-3;i<=3;i++)for(int j=-3;j<=3;j++) if(s[(y+i)*w+x+j]>val){ok=0;break;} if(ok){corner_vec_push(c,(Corner){(float)x,(float)y,-1}); if(c->size>=max)break;} }
+  for (int y = 2; y < h - 2; y++) for (int x = 2; x < w - 2; x++) {
+    float Ixx = 0, Iyy = 0, Ixy = 0;
+    for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) {
+      float gx = (float)g[(y+i)*w + x+j+1] - g[(y+i)*w + x+j-1];
+      float gy = (float)g[(y+i+1)*w + x+j] - g[(y+i-1)*w + x+j];
+      Ixx += gx*gx; Iyy += gy*gy; Ixy += gx*gy;
+    }
+    float det = Ixx*Iyy - Ixy*Ixy, tr = Ixx + Iyy;
+    s[y*w + x] = 0.5f * (tr - sqrtf(tr*tr - 4.0f*det + 1e-6f));
+  }
+  for (int y = 5; y < h - 5 && c->size < max; y++) {
+    for (int x = 5; x < w - 5 && c->size < max; x++) {
+      float val = s[y*w + x];
+      if (val < 0.1f) continue;
+      int ok = 1;
+      for (int i = -3; i <= 3 && ok; i++)
+        for (int j = -3; j <= 3 && ok; j++)
+          if (s[(y+i)*w + x+j] > val) ok = 0;
+      if (ok) corner_vec_push(c, (Corner){(float)x, (float)y, -1});
+    }
+  }
   free(s);
 }
 
@@ -329,6 +348,7 @@ static Config parse_args(int argc, char** argv){ Config c={"test_kitti984.mp4",5
 
 int main(int argc, char** argv) {
   Config cfg=parse_args(argc,argv); FFmpegCap* cap=ffmpeg_open(cfg.video_path); if(!cap){fprintf(stderr,"Failed pipe.\n");return 1;}
+  srand(1);
   int w=640,h=480; unsigned char *raw=malloc(w*h*3),*pgray=calloc(w*h,1),*cgray=calloc(w*h,1),*cblur=calloc(w*h,1);
   FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
