@@ -372,41 +372,67 @@ static int verify_loop(KFDB* db, int lidx, const unsigned char* cgray, int w, in
   free(matches.data); free(cpts.data); return 0;
 }
 
+// Alternating local BA over the last BA_WINDOW keyframes: refine each KF's
+// pose, then refine each observed map point with its pooled 3x3 normal
+// equations. Complexity is O(window * n_corners) per iteration, not
+// O(map_size * window * n_corners) — the original implementation walked
+// the entire map per point which became quadratic as the map grew.
+#define BA_WINDOW 3
+#define BA_ITERS  5
+
 static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double cy) {
-  if (db->size < 3) return;
-  for (int iter = 0; iter < 5; iter++) {
-    for (int k = db->size - 3; k < db->size; k++) {
+  if (db->size < BA_WINDOW) return;
+  int k0 = db->size - BA_WINDOW;
+  double* Hs = calloc((size_t)map->size * 9, sizeof(double));
+  double* bs = calloc((size_t)map->size * 3, sizeof(double));
+  unsigned char* touched = calloc((size_t)map->size, 1);
+  for (int iter = 0; iter < BA_ITERS; iter++) {
+    for (int k = k0; k < db->size; k++) {
       refine_pose_lm(map, &db->data[k].corners, fx, fy, cx, cy, &db->data[k].pose);
     }
-    // Shared Map Point Refinement
-    for (int i = 0; i < map->size; i++) {
-      if (map->data[i].obs < 2) continue;
-      double H[9] = {0}, b[3] = {0};
-      for (int k = db->size - 3; k < db->size; k++) {
-        KFEntry* kf = &db->data[k]; double R[9], t[3]; pose_get_rotation(&kf->pose, R); pose_get_translation(&kf->pose, t);
-        for (int j = 0; j < kf->corners.size; j++) {
-          if (kf->corners.data[j].pt_idx != i) continue;
-          MapPoint p = map->data[i];
-          double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
-          if (cp[2] < 0.1) continue;
-          double inv_z = 1.0 / cp[2], inv_z2 = inv_z * inv_z;
-          double u = fx * cp[0] * inv_z + cx, v = fy * cp[1] * inv_z + cy;
-          double du = kf->corners.data[j].x - u, dv = kf->corners.data[j].y - v;
-          double J[2][3] = { { fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2, fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2, fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2 },
-                             { fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2, fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2, fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2 } };
-          for (int r = 0; r < 3; r++) { b[r] += J[0][r] * du + J[1][r] * dv; for (int c = 0; c < 3; c++) H[r*3+c] += J[0][r]*J[0][c] + J[1][r]*J[1][c]; }
+    memset(Hs, 0, (size_t)map->size * 9 * sizeof(double));
+    memset(bs, 0, (size_t)map->size * 3 * sizeof(double));
+    memset(touched, 0, (size_t)map->size);
+    for (int k = k0; k < db->size; k++) {
+      KFEntry* kf = &db->data[k];
+      double R[9], t[3]; pose_get_rotation(&kf->pose, R); pose_get_translation(&kf->pose, t);
+      for (int j = 0; j < kf->corners.size; j++) {
+        int pi = kf->corners.data[j].pt_idx;
+        if (pi < 0 || map->data[pi].obs < 2) continue;
+        MapPoint p = map->data[pi];
+        double cp[3] = {
+          R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0],
+          R[3]*p.x + R[4]*p.y + R[5]*p.z + t[1],
+          R[6]*p.x + R[7]*p.y + R[8]*p.z + t[2] };
+        if (cp[2] < 0.1) continue;
+        double inv_z = 1.0 / cp[2], inv_z2 = inv_z * inv_z;
+        double u = fx * cp[0] * inv_z + cx, v = fy * cp[1] * inv_z + cy;
+        double du = kf->corners.data[j].x - u, dv = kf->corners.data[j].y - v;
+        double J[2][3] = {
+          { fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2, fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2, fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2 },
+          { fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2, fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2, fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2 } };
+        double* Hp = &Hs[pi*9];
+        double* bp = &bs[pi*3];
+        for (int r = 0; r < 3; r++) {
+          bp[r] += J[0][r] * du + J[1][r] * dv;
+          for (int c = 0; c < 3; c++) Hp[r*3+c] += J[0][r]*J[0][c] + J[1][r]*J[1][c];
         }
-      }
-      for (int r = 0; r < 3; r++) H[r*3+r] += 1e-4;
-      double det = H[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*H[7]-H[4]*H[6]);
-      if (fabs(det) > 1e-9) {
-        double dx = (b[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(b[1]*H[8]-H[5]*b[2]) + H[2]*(b[1]*H[7]-H[4]*b[2])) / det;
-        double dy = (H[0]*(b[1]*H[8]-H[5]*b[2]) - b[0]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*b[2]-b[1]*H[6])) / det;
-        double dz = (H[0]*(H[4]*b[2]-b[1]*H[7]) - H[1]*(H[3]*b[2]-b[1]*H[6]) + b[0]*(H[3]*H[7]-H[4]*H[6])) / det;
-        map->data[i].x += dx; map->data[i].y += dy; map->data[i].z += dz;
+        touched[pi] = 1;
       }
     }
+    for (int i = 0; i < map->size; i++) {
+      if (!touched[i]) continue;
+      double* H = &Hs[i*9]; double* b = &bs[i*3];
+      H[0] += 1e-4; H[4] += 1e-4; H[8] += 1e-4;
+      double det = H[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*H[7]-H[4]*H[6]);
+      if (fabs(det) < 1e-9) continue;
+      double dx = (b[0]*(H[4]*H[8]-H[5]*H[7]) - H[1]*(b[1]*H[8]-H[5]*b[2]) + H[2]*(b[1]*H[7]-H[4]*b[2])) / det;
+      double dy = (H[0]*(b[1]*H[8]-H[5]*b[2]) - b[0]*(H[3]*H[8]-H[5]*H[6]) + H[2]*(H[3]*b[2]-b[1]*H[6])) / det;
+      double dz = (H[0]*(H[4]*b[2]-b[1]*H[7]) - H[1]*(H[3]*b[2]-b[1]*H[6]) + b[0]*(H[3]*H[7]-H[4]*H[6])) / det;
+      map->data[i].x += dx; map->data[i].y += dy; map->data[i].z += dz;
+    }
   }
+  free(Hs); free(bs); free(touched);
 }
 
 static void ensure_parent_dir(const char* p){ char b[512], *s; snprintf(b,512,"%s",p); s=strrchr(b,'/'); if(s){*s='\0'; char c[640]; snprintf(c,640,"mkdir -p \"%s\"",b); (void)!system(c);} }
@@ -428,6 +454,7 @@ int main(int argc, char** argv) {
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
   float flow_dx = 0.0f, flow_dy = 0.0f;  // constant-velocity prior for LK
+  int last_kf_frame = -100;              // enforce minimum KF spacing
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
     if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,2000); mkf=1; pose_identity(&pose); }
@@ -446,17 +473,46 @@ int main(int argc, char** argv) {
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else pose=prev.pose;
-      if(inl<40 || rotation_degrees_between(&lkf_pose,&pose)>cfg.kf_max_rot_deg || frame_id%10==0) mkf=1;
+      // Adaptive keyframe policy: track ratio drops below 60% of the feature
+      // count at the last KF, camera rotated more than kf_max_rot_deg since
+      // the last KF, or pose estimation collapsed. The fixed frame%10 force
+      // is gone.
+      // KF triggers: pose collapsed, tracking thinned below an absolute
+      // floor, big rotation since the last KF, or enough frames passed that
+      // we must insert a new baseline. We also enforce a minimum KF spacing
+      // so back-to-back KFs never happen -- consecutive KFs have zero baseline
+      // and produce garbage triangulation.
+      int frames_since_kf = frame_id - last_kf_frame;
+      int track_low = (tracked.size < 400);
+      int pose_weak = (inl < 15);
+      int too_old = (frames_since_kf >= 8);
+      int rot_big = rotation_degrees_between(&lkf_pose, &pose) > cfg.kf_max_rot_deg;
+      if (frames_since_kf >= 3 && (track_low || pose_weak || rot_big || too_old)) mkf = 1;
       if(mkf){
-        if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3]; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
-          if(triangulate_point(&prev.pose,&pose,prev.corners.data[matches.data[j].query_idx],tracked.data[matches.data[j].train_idx],fx,fy,cx,cy,X)){
-            tracked.data[matches.data[j].train_idx].pt_idx=map.size; map_push(&map,(MapPoint){X[0],X[1],X[2],1}); pts++; added++; tri++; } } else { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
+        // Grow the map at every KF: bump obs counts on already-triangulated
+        // points and triangulate any still-unassigned matches. Previously this
+        // was gated on the E-estimation mask, so PnP-stable frames never added
+        // any new points and the map froze a few dozen points in.
+        for (int j = 0; j < matches.size; j++) {
+          int ti = matches.data[j].train_idx;
+          if (tracked.data[ti].pt_idx != -1) { map.data[tracked.data[ti].pt_idx].obs++; continue; }
+          if (mask && !mask[j]) continue;  // if we do have an E-mask, honor it
+          double X[3];
+          if (triangulate_point(&prev.pose, &pose,
+                                prev.corners.data[matches.data[j].query_idx],
+                                tracked.data[ti], fx, fy, cx, cy, X)) {
+            tracked.data[ti].pt_idx = map.size;
+            map_push(&map, (MapPoint){X[0], X[1], X[2], 1});
+            pts++; added++; tri++;
+          }
+        }
         if(tracked.size<1200) extract_corners_pure(cblur,w,h,&tracked,2000);
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }
         KFEntry e; memcpy(e.thumb,thumb,256); e.frame_id=frame_id; e.pose=pose; e.corners.size=tracked.size; e.corners.data=malloc(tracked.size*sizeof(Corner)); memcpy(e.corners.data,tracked.data,tracked.size*sizeof(Corner)); e.gray=malloc(w*h); memcpy(e.gray,cgray,w*h); kfdb_push(&kf_db,e);
         local_ba(&kf_db, &map, fx, fy, cx, cy); // Refine map and recent keyframes
-        if(added>0||frame_id==1) lkf_pose=pose;
+        lkf_pose = pose;              // anchor rotation reference to every KF
+        last_kf_frame = frame_id;
       }
       curr.corners=tracked;
     }
