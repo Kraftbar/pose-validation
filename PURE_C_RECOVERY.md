@@ -92,6 +92,25 @@ Two low-risk re-application attempts were tried from the restored baseline:
 
 These trials should be treated as exploratory, not promoted improvements.
 
+7. **Loosen PnP reprojection gate (4 px² → 9 px²)**
+   - Single-line change in `estimate_pose_PnP`: inlier threshold `dx*dx+dy*dy < 4.0` → `< 9.0`
+   - Motivation: diagnostic instrumentation showed PnP almost never cleared the 12-inlier gate (avg 7.2 inliers per RANSAC best); system ran almost entirely on scale-free E pose, and the frame-411 xyz map-growth plateau triggered when a composed E baseline broke cheirality globally.
+   - Clean all-GT A/B (no instrumentation):
+     - `test_freiburgxyz525`: baseline `6803 / 0.1782` → trial `7204 / 0.1771`
+     - `test_freiburgrpy525`:  baseline `23 / 0.0997` → trial `23 / 0.0997`
+     - `test_freiburgroom525`: baseline `1753 / 1.8691` → trial `778 / 1.8692`
+     - `test_freiburgdesk525`: baseline `3622 / 0.7574` → trial `507 / 0.7509`
+   - Conclusion: ATE-neutral everywhere (all deltas within noise), but map density collapses on room (−56%) and desk (−86%). The tight 4 px² gate was apparently protecting map density on those sequences. Not promoted.
+
+## Instrumentation note
+
+The `simple_slam_c.c` source intentionally contains no diagnostic hooks. Earlier in
+this recovery process, a global `g_diag` struct plus env-gated CSV logging were
+added temporarily and then removed, because the extra writes (even inert) shifted
+`pure_c` results (e.g. `test_freiburgxyz525` pts `6803 → 5706`) enough to make
+A/B comparisons unreliable. If diagnostics are needed again, keep them on a scratch
+branch and never judge a candidate change against instrumented numbers.
+
 3. **Minimal search-by-projection prototype**
    - Added a tiny map-point appearance template (`5x5` grayscale patch)
    - Projected active map points using the previous pose estimate

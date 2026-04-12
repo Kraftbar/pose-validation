@@ -32,6 +32,11 @@ Use these first when summarizing benchmark state:
 - `runs/benchmark/summary_all.json`
 - `BENCHMARKS.md`
 
+## Promotion Rule
+- ATE RMSE is the primary accuracy metric. If a candidate change is ATE-neutral across all GT sequences (all deltas within ~0.01 m), do **not** promote it, even if it fixes a diagnosed sub-pathology (e.g. a map-growth plateau) or improves point/keyframe counts. Map density is a diagnostic, not a goal.
+- Watch for silent regressions on sequences other than the one you diagnosed. A neutral ATE with a large map-density drop on another GT sequence is a signal the change trades one failure mode for another.
+- Record rejected trials in `PURE_C_RECOVERY.md` with numbers, so future agents don't retry the same change.
+
 ## Benchmark Discipline
 - If you change SLAM behavior, tracking logic, optimization, pose estimation, or benchmark plumbing, run a benchmark before finishing.
 - Start with the smallest useful benchmark first (for example a single GT dataset or a short `--seconds` run), then scale up if needed.
