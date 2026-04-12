@@ -3,15 +3,18 @@
 Metric: **ATE** (Absolute Trajectory Error) after Umeyama similarity alignment
 (monocular has no metric scale, so scale is corrected before computing error).
 
-Ground truth source: `test_freiburgxyz525.npz` — 798 world-to-camera poses (4×4),
-one per video frame, starting at identity.
+Ground truth sources currently tracked by the benchmark suite:
+`test_freiburgxyz525.npz`, `external/twitchslam/videos/test_freiburgdesk525.npz`,
+`external/twitchslam/videos/test_freiburgroom525.npz`, and
+`external/twitchslam/videos/test_freiburgrpy525.npz`.
 
 No GT available for kitti984, countryroad, or drone — those use heuristic score only
 (points + 0.2×frames + 0.05×avg_inliers).
 
 Canonical benchmark outputs live in `runs/benchmark/`:
 `test_countryroad.json`, `test_drone.json`, `test_freiburgxyz525.json`,
-`test_kitti984.json`, `summary.json`, `comparison_orbslam2.json`, and
+`test_kitti984.json`, `summary.json`, `comparison_orbslam2.json`,
+`gt_tracking.json`, `gt_tracking.csv`, `gt_tracking.md`, and
 `orbslam2_trajectory.txt`.
 
 Runs with non-default `--seconds` use suffixed filenames such as
@@ -22,6 +25,69 @@ Older Freiburg experiment runs are archived under `runs/archive/benchmark/`.
 
 Frozen Pure C baseline note: the current stable universal `simple_slam_c.c` build
 has a verified `test_freiburgxyz525` 5-second ATE RMSE of **0.1461 m**.
+
+## Current GT Tracking (30s)
+
+Latest full GT-backed run was generated with:
+
+```bash
+python3 benchmark_native.py --all_gt --force
+```
+
+The generated tracking artifacts are:
+`runs/benchmark/gt_tracking.json`, `runs/benchmark/gt_tracking.csv`, and
+`runs/benchmark/gt_tracking.md`.
+
+This section tracks the full **4 GT datasets × 5 implementations = 20 measured runs**.
+
+Approx implementation size reference:
+
+| Impl | Approx LOC | Counting rule |
+|------|------------|---------------|
+| `python` | ~618 | `simple_slam.py` |
+| `cpp` | ~797 | `simple_slam_opt.cpp` |
+| `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
+| `pure_c` | ~438 | standalone `simple_slam_c.c` only |
+| `pure_c_brief` | ~363 | promoted historical snapshot in `simple_slam_c_brief.c` |
+
+| Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
+|----------|-----------|---------------|-----------|--------------------|-------|
+| `test_freiburgdesk525` | `python` | **0.6778 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.8414 m | BRIEF snapshot is the runner-up here |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0980 m | BRIEF snapshot edges out Python |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_brief` | 0.1760 m | BRIEF snapshot beats both current pure C and Python |
+
+Full 4×5 ATE matrix for the current 30-second run:
+
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` |
+|----------|----------|-------|-----|----------|---------------|
+| `test_freiburgdesk525` | **0.6778** | 0.7194 | 0.7563 | 0.7574 | 0.7412 |
+| `test_freiburgroom525` | 1.8660 | **1.5452** | 1.8691 | 1.8691 | 1.8414 |
+| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0980 |
+| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1760 |
+
+Cross-dataset tradeoff summary (mean over the 4 GT datasets):
+
+| Impl | Approx LOC | Mean ATE RMSE | Mean Runtime (s) | Mean Speedup vs Python | GT Wins | GT Runner-up |
+|------|------------|---------------|------------------|------------------------|---------|--------------|
+| `python` | ~618 | 0.7051 | 16.982 | 1.00x | 1 | 0 |
+| `cpp` | ~797 | **0.6338** | **8.209** | **2.07x** | **3** | 1 |
+| `c` | ~438 core (+274 shim) | 0.7260 | 31.744 | 0.56x | 0 | 0 |
+| `pure_c` | ~438 | 0.7261 | 28.235 | 0.83x | 0 | 0 |
+| `pure_c_brief` | ~363 | 0.7141 | 39.179 | 0.44x | 0 | **3** |
+
+Promoted historical pure C snapshot comparison:
+
+| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~363 LOC) | Δ current - `brief` |
+|----------|-----------------------------|--------------------------|-------------------|
+| `test_freiburgdesk525` | 0.7574 | **0.7412** | +0.0162 |
+| `test_freiburgroom525` | 1.8691 | **1.8414** | +0.0277 |
+| `test_freiburgrpy525` | 0.0997 | **0.0980** | +0.0017 |
+| `test_freiburgxyz525` | 0.1782 | **0.1760** | +0.0022 |
+
+`pure_c_brief` is copied into the active repo as `simple_slam_c_brief.c`.
+It matches the pure C source from `6f7fda6` and `2b688ed`, which were identical
+for this file. Historical helper artifacts remain in `runs/benchmark_history/`.
 
 ---
 
@@ -97,6 +163,9 @@ python benchmark_twitchslam.py \
   --video_path test_freiburgxyz525.mp4 \
   --seconds 30 --timeout 1200 \
   --out_json runs/benchmark_twitchslam/test_freiburgxyz525_30s.json
+
+# Benchmark all GT-backed datasets and refresh the tracking tables
+python3 benchmark_native.py --all_gt --force
 ```
 
 ---

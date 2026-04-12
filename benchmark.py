@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -21,7 +22,7 @@ import numpy as np
 
 
 DEFAULT_BENCHMARK_SECONDS = 30.0
-IMPLEMENTATIONS = ('python', 'cpp', 'c')
+IMPLEMENTATIONS = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief')
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,13 @@ def load_gt_centers(npz_path: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Run SLAM
 # ---------------------------------------------------------------------------
+def needs_rebuild(target: Path, sources: list[Path]) -> bool:
+    if not target.exists():
+        return True
+    target_mtime = target.stat().st_mtime
+    return any(source.exists() and source.stat().st_mtime > target_mtime for source in sources)
+
+
 def ensure_native_binary(root: Path, impl: str) -> Path:
     binary_name = {
         'cpp': 'simple_slam_opt',
@@ -92,7 +100,18 @@ def ensure_native_binary(root: Path, impl: str) -> Path:
         raise ValueError(f'Unsupported native implementation: {impl}')
 
     binary_path = root / 'build-native' / binary_name
-    if binary_path.exists():
+    sources = [root / 'CMakeLists.txt']
+    if impl == 'cpp':
+        sources.append(root / 'simple_slam_opt.cpp')
+    else:
+        sources.extend([
+            root / 'simple_slam_c.c',
+            root / 'simple_slam_c_shim.cpp',
+            root / 'simple_slam_c_shim.h',
+            root / 'pure_c_math.h',
+        ])
+
+    if not needs_rebuild(binary_path, sources):
         return binary_path
 
     print(f'  building native target `{binary_name}` ...')
@@ -123,6 +142,33 @@ def ensure_native_binary(root: Path, impl: str) -> Path:
     return binary_path
 
 
+def ensure_pure_c_binary(root: Path, source_name: str = 'simple_slam_c.c', binary_name: str = 'simple_slam_pure_c') -> Path:
+    root = root.resolve()
+    compiler = shutil.which('gcc')
+    if not compiler:
+        raise RuntimeError('gcc not found; cannot build `simple_slam_pure_c`')
+
+    binary_path = root / binary_name
+    sources = [root / source_name, root / 'pure_c_math.h']
+    if not needs_rebuild(binary_path, sources):
+        return binary_path
+
+    build = subprocess.run(
+        [compiler, '-O3', '-march=native', '-fopenmp', source_name, '-o', str(binary_path), '-lm'],
+        capture_output=True, text=True, check=False, cwd=root,
+    )
+    if build.returncode != 0:
+        if build.stdout.strip():
+            print(build.stdout.strip())
+        if build.stderr.strip():
+            print(build.stderr.strip(), file=sys.stderr)
+        raise RuntimeError('Failed to build native target `simple_slam_pure_c`')
+
+    if not binary_path.exists():
+        raise RuntimeError(f'Native binary missing after build: {binary_path}')
+    return binary_path
+
+
 def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeout: float,
                        extra_args: list, out_json: Path) -> list[str]:
     if impl == 'python':
@@ -136,6 +182,24 @@ def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeo
         ] + extra_args
     if impl in {'cpp', 'c'}:
         binary = ensure_native_binary(root, impl)
+        return [
+            str(binary),
+            '--video_path', str(video),
+            '--seconds', str(seconds),
+            '--timeout', str(timeout),
+            '--metrics_out', str(out_json),
+        ] + extra_args
+    if impl == 'pure_c':
+        binary = ensure_pure_c_binary(root, source_name='simple_slam_c.c', binary_name='simple_slam_pure_c')
+        return [
+            str(binary),
+            '--video_path', str(video),
+            '--seconds', str(seconds),
+            '--timeout', str(timeout),
+            '--metrics_out', str(out_json),
+        ] + extra_args
+    if impl == 'pure_c_brief':
+        binary = ensure_pure_c_binary(root, source_name='simple_slam_c_brief.c', binary_name='simple_slam_pure_c_brief')
         return [
             str(binary),
             '--video_path', str(video),
@@ -229,6 +293,33 @@ def select_videos(root: Path, requested: list[str] | None) -> list[Path]:
     return selected
 
 
+def select_gt_videos(root: Path, requested: list[str] | None) -> list[Path]:
+    candidates: dict[str, Path] = {}
+    search_dirs = [root, root / 'external' / 'twitchslam' / 'videos']
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for video in sorted(directory.glob('test_*.mp4')):
+            if not video.with_suffix('.npz').exists():
+                continue
+            candidates.setdefault(video.stem, video)
+
+    if not requested:
+        return [candidates[stem] for stem in sorted(candidates)]
+
+    selected = []
+    requested_set = set(requested)
+    for stem in sorted(candidates):
+        video = candidates[stem]
+        if video.name in requested_set or video.stem in requested_set:
+            selected.append(video)
+
+    missing = [name for name in requested if name not in {v.name for v in selected} and name not in {v.stem for v in selected}]
+    if missing:
+        raise ValueError(f'Unknown GT-backed video(s): {", ".join(missing)}')
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -239,9 +330,11 @@ def main():
     parser.add_argument('--timeout', type=float, default=120.0, help='Hard timeout per run (seconds)')
     parser.add_argument('--out_dir', type=str, default='runs/benchmark', help='Directory for output JSONs')
     parser.add_argument('--impl', type=str, default='python',
-                        help='Implementation: python, cpp, c, comma-separated list, or all')
+                        help='Implementation: python, cpp, c, pure_c, pure_c_brief, comma-separated list, or all')
     parser.add_argument('--video', action='append', default=None,
                         help='Video stem or filename to benchmark; may be repeated')
+    parser.add_argument('--all_gt', action='store_true',
+                        help='Benchmark all videos in the repo that have adjacent ground-truth .npz files')
     parser.add_argument('--force', action='store_true', help='Re-run even if output already exists')
     args = parser.parse_args()
 
@@ -250,9 +343,10 @@ def main():
     impls = parse_impls(args.impl)
 
     # Discover test videos
-    videos = select_videos(root, args.video)
+    videos = select_gt_videos(root, args.video) if args.all_gt else select_videos(root, args.video)
     if not videos:
-        print('No test_*.mp4 found in current directory.')
+        message = 'No GT-backed test_*.mp4 found.' if args.all_gt else 'No test_*.mp4 found in current directory.'
+        print(message)
         return
 
     results = []
@@ -262,7 +356,7 @@ def main():
 
     for video in videos:
         stem = video.stem
-        gt_npz = root / f'{stem}.npz'
+        gt_npz = video.with_suffix('.npz')
 
         print(f"[{stem}]")
         for impl in impls:

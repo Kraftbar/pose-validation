@@ -26,7 +26,7 @@ from typing import Iterable
 
 
 DEFAULT_BENCHMARK_SECONDS = 30.0
-IMPLEMENTATION_ORDER = ('python', 'cpp', 'c')
+IMPLEMENTATION_ORDER = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief')
 
 
 def seconds_tag(seconds: float) -> str:
@@ -55,6 +55,8 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         '--out_dir',
         args.out_dir,
     ]
+    if args.all_gt:
+        cmd.append('--all_gt')
     for video in args.video or []:
         cmd.extend(['--video', video])
     if args.force:
@@ -230,11 +232,136 @@ def comparison_csv_path(out_dir: Path, seconds: float) -> Path:
     return out_dir / f'native_comparison_{seconds_tag(seconds)}.csv'
 
 
+def gt_tracking_json_path(out_dir: Path, seconds: float) -> Path:
+    if float(seconds) == DEFAULT_BENCHMARK_SECONDS:
+        return out_dir / 'gt_tracking.json'
+    return out_dir / f'gt_tracking_{seconds_tag(seconds)}.json'
+
+
+def gt_tracking_csv_path(out_dir: Path, seconds: float) -> Path:
+    if float(seconds) == DEFAULT_BENCHMARK_SECONDS:
+        return out_dir / 'gt_tracking.csv'
+    return out_dir / f'gt_tracking_{seconds_tag(seconds)}.csv'
+
+
+def gt_tracking_md_path(out_dir: Path, seconds: float) -> Path:
+    if float(seconds) == DEFAULT_BENCHMARK_SECONDS:
+        return out_dir / 'gt_tracking.md'
+    return out_dir / f'gt_tracking_{seconds_tag(seconds)}.md'
+
+
+def compute_gt_tracking_rows(summary_rows: list[dict]) -> list[dict]:
+    grouped = group_by_video(row for row in summary_rows if 'ate_rmse' in row)
+    tracking_rows: list[dict] = []
+
+    for video in sorted(grouped):
+        per_impl = grouped[video]
+        python_row = per_impl.get('python')
+        python_duration = float(python_row.get('duration_sec', 0.0)) if python_row else None
+        best_ate = min(float(row['ate_rmse']) for row in per_impl.values())
+
+        for impl in IMPLEMENTATION_ORDER:
+            row = per_impl.get(impl)
+            if not row:
+                continue
+            duration = float(row.get('duration_sec', 0.0))
+            speedup_vs_python = None
+            if python_duration and duration > 0:
+                speedup_vs_python = python_duration / duration
+
+            tracking_rows.append({
+                'video': video,
+                'impl': impl,
+                'frames': int(row.get('frames', 0)),
+                'points': int(row.get('points', 0)),
+                'duration_sec': duration,
+                'speedup_vs_python': speedup_vs_python,
+                'ate_rmse': float(row['ate_rmse']),
+                'ate_median': float(row['ate_median']),
+                'ate_max': float(row['ate_max']),
+                'ate_n': int(row['ate_n']),
+                'delta_vs_best_ate': float(row['ate_rmse']) - best_ate,
+            })
+
+    tracking_rows.sort(key=lambda row: (row['video'], row['ate_rmse'], IMPLEMENTATION_ORDER.index(row['impl'])))
+    return tracking_rows
+
+
+def write_gt_tracking_json(path: Path, rows: list[dict], source_summary: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'source_summary': str(source_summary),
+        'rows': rows,
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def write_gt_tracking_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', newline='') as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                'video',
+                'impl',
+                'frames',
+                'points',
+                'duration_sec',
+                'speedup_vs_python',
+                'ate_rmse',
+                'delta_vs_best_ate',
+                'ate_median',
+                'ate_max',
+                'ate_n',
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                'video': row['video'],
+                'impl': row['impl'],
+                'frames': row['frames'],
+                'points': row['points'],
+                'duration_sec': f"{row['duration_sec']:.3f}",
+                'speedup_vs_python': '' if row['speedup_vs_python'] is None else f"{row['speedup_vs_python']:.2f}",
+                'ate_rmse': f"{row['ate_rmse']:.4f}",
+                'delta_vs_best_ate': f"{row['delta_vs_best_ate']:.4f}",
+                'ate_median': f"{row['ate_median']:.4f}",
+                'ate_max': f"{row['ate_max']:.4f}",
+                'ate_n': row['ate_n'],
+            })
+
+
+def write_gt_tracking_markdown(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row['video'], []).append(row)
+
+    lines = ['# GT Tracking', '']
+    for video in sorted(grouped):
+        lines.append(f'## {video}')
+        lines.append('')
+        lines.append('| Impl | Frames | Runtime (s) | Speedup vs Python | ATE RMSE | Δ vs Best | ATE Median | ATE Max | ATE N |')
+        lines.append('|------|--------|-------------|-------------------|----------|-----------|------------|---------|-------|')
+        for row in grouped[video]:
+            speedup = 'n/a' if row['speedup_vs_python'] is None else f"{row['speedup_vs_python']:.2f}x"
+            lines.append(
+                f"| {row['impl']} | {row['frames']} | {row['duration_sec']:.3f} | {speedup} | "
+                f"{row['ate_rmse']:.4f} | {row['delta_vs_best_ate']:.4f} | {row['ate_median']:.4f} | {row['ate_max']:.4f} | {row['ate_n']} |"
+            )
+        lines.append('')
+
+    path.write_text('\n'.join(lines))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--seconds', type=float, default=DEFAULT_BENCHMARK_SECONDS)
     parser.add_argument('--timeout', type=float, default=120.0)
     parser.add_argument('--out_dir', default='runs/benchmark')
+    parser.add_argument('--all_gt', action='store_true',
+                        help='Benchmark all videos in the repo that have adjacent ground-truth .npz files')
     parser.add_argument('--video', action='append', default=None,
                         help='Video stem or filename to benchmark; may be repeated')
     parser.add_argument('--force', action='store_true')
@@ -254,13 +381,23 @@ def main() -> None:
     summary_rows = load_summary(source_summary)
     comparison_rows = compute_comparison_rows(summary_rows)
     print_comparison_table(comparison_rows)
+    gt_tracking_rows = compute_gt_tracking_rows(summary_rows)
 
     comparison_path = comparison_json_path(out_dir, args.seconds)
     comparison_csv = Path(args.csv_out) if args.csv_out else comparison_csv_path(out_dir, args.seconds)
     write_comparison_json(comparison_path, comparison_rows, source_summary)
     write_comparison_csv(comparison_csv, comparison_rows)
+    gt_tracking_json = gt_tracking_json_path(out_dir, args.seconds)
+    gt_tracking_csv = gt_tracking_csv_path(out_dir, args.seconds)
+    gt_tracking_md = gt_tracking_md_path(out_dir, args.seconds)
+    write_gt_tracking_json(gt_tracking_json, gt_tracking_rows, source_summary)
+    write_gt_tracking_csv(gt_tracking_csv, gt_tracking_rows)
+    write_gt_tracking_markdown(gt_tracking_md, gt_tracking_rows)
     print(f"\nSaved comparison → {comparison_path}")
     print(f"Saved CSV → {comparison_csv}")
+    print(f"Saved GT tracking → {gt_tracking_json}")
+    print(f"Saved GT CSV → {gt_tracking_csv}")
+    print(f"Saved GT markdown → {gt_tracking_md}")
 
 
 if __name__ == '__main__':

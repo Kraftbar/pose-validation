@@ -3,6 +3,7 @@ build-native/
 simple_slam_pure_c
 simple_slam_c
 simple_slam_opt
+simple_slam_pure_c_brief
 
 # Python
 __pycache__/
@@ -23,3 +24,6 @@ runs_summary.csv
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+
+# Local vendored repos
+external/
