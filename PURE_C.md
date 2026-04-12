@@ -40,6 +40,19 @@ and accepted LM pose refinement, is kept as the stable Pure C baseline.
 | :--- | :--- | :--- | :--- |
 | **Freiburg XYZ** | **5s** | **0.1461 m** | Best verified stable all-around build in this repo. |
 
+## Recent Exploration
+
+Recent post-baseline `pure_c` experiments were evaluated but not promoted into the
+active source, because they either regressed outright or only produced marginal
+single-sequence changes without a convincing all-GT win.
+
+The recovery log and exploratory trial summary live in `PURE_C_RECOVERY.md`.
+That note records:
+
+- ideas that looked promising,
+- trials that were measured and rejected,
+- and the reasoning for keeping `simple_slam_c.c` on the restored healthy baseline.
+
 ## Comparison with State-of-the-Art (SOTA)
 
 Typical monocular ATE RMSE results for the Freiburg sequences:

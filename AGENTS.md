@@ -48,6 +48,12 @@ Use these first when summarizing benchmark state:
 - If you promote an old experiment into the active repo, give it a stable in-tree name (like `simple_slam_c_brief.c`) and add it to the benchmark tables.
 - When changing benchmark-visible behavior, keep naming/versioning clear enough that a later agent can tell which results are canonical and which are exploratory.
 
+## Design Philosophy
+- **Pure C Focus:** The primary goal is a library-free C implementation. All architectural improvements should eventually be ported or implemented directly in `simple_slam_c.c`.
+- **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries. Avoid over-engineering while pushing for industry-standard accuracy.
+- **LOC is High Priority:** Small code size (LOC) is a first-class metric alongside ATE RMSE and runtime. Strive for the most "concise yet correct" implementation.
+- **Benchmark Driven:** Accuracy (ATE RMSE) remains the primary goal. Improvements must be empirically verified against GT datasets.
+
 ## Important Notes
 - `pure_c_brief` is the promoted BRIEF-relocalization snapshot kept in-tree.
 - The old BRIEF branch was deleted after promotion.
