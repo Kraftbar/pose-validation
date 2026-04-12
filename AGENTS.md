@@ -38,10 +38,9 @@ Use these first when summarizing benchmark state:
 - Record rejected trials in `PURE_C_RECOVERY.md` with numbers, so future agents don't retry the same change.
 
 ## Benchmark Discipline
-- If you change SLAM behavior, tracking logic, optimization, pose estimation, or benchmark plumbing, run a benchmark before finishing.
-- Start with the smallest useful benchmark first (for example a single GT dataset or a short `--seconds` run), then scale up if needed.
-- For meaningful algorithm changes, refresh the all-GT benchmark with: `python3 benchmark_native.py --all_gt --force`
-- Do not describe benchmark improvements in docs unless the saved outputs have been regenerated.
+- **Hard rule:** any change to SLAM algorithm code (`simple_slam_c.c`, `pure_c_math.h`, `simple_slam_c_brief.c`, `simple_slam_opt.cpp`, `simple_slam.py`, `simple_slam_c_shim.cpp/.h`) or to benchmark plumbing must be validated with **all GT-backed datasets** before reporting results or committing. Run `python3 benchmark_native.py --all_gt --force`. This covers every `test_*.mp4` that has an adjacent `.npz` GT file (currently the four Freiburg sequences; new GT datasets added later are picked up automatically).
+- A single-GT run (e.g. `benchmark.py --video test_freiburgxyz525 --seconds 30`) is allowed only for diagnosis and iteration while shaping a hypothesis. Do not use a single-GT result as the basis for a promotion decision or for claiming an improvement.
+- Do not describe benchmark improvements in docs unless the saved outputs from `--all_gt` have been regenerated on a clean (non-instrumented) build.
 
 ## Experiment Versioning
 - Do not overwrite canonical benchmark summaries for one-off experiments unless the experiment is intended to become the new baseline.
