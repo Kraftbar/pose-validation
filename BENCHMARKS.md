@@ -42,58 +42,48 @@ This section tracks the full **4 GT datasets × 5 implementations = 20 measured 
 
 Approx implementation size reference:
 
-```
-Impl            Approx LOC              Counting rule
---------------  ----------------------  -------------------------------------------------------
-python          ~618                    simple_slam.py
-cpp             ~797                    simple_slam_opt.cpp
-c               ~438 core (+274 shim)   simple_slam_c.c + simple_slam_c_shim.cpp/.h (OpenCV bridge)
-pure_c          ~438                    standalone simple_slam_c.c only
-pure_c_brief   ~398                    standalone simple_slam_c_brief.c, now with BRIEF-reloc
-```
+| Impl | Approx LOC | Counting rule |
+|------|------------|---------------|
+| `python` | ~618 | `simple_slam.py` |
+| `cpp` | ~797 | `simple_slam_opt.cpp` |
+| `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
+| `pure_c` | ~438 | standalone `simple_slam_c.c` only |
+| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c`, now with BRIEF-reloc |
 
-```
-Sequence                 Best Impl  Best ATE   Runner-up       Runner-up ATE  Notes
------------------------  ---------  ---------  --------------  -------------  --------------------------------------------------------
-test_freiburgdesk525     python     0.6772 m   cpp             0.7194 m       Only GT set where Python currently leads
-test_freiburgroom525     cpp        1.5452 m   pure_c_brief   1.7934 m       BRIEF reloc closed gap from 0.296 m to 0.248 m
-test_freiburgrpy525      cpp        0.0977 m   pure_c_brief   0.0979 m       BRIEF snapshot still edges out Python
-test_freiburgxyz525      cpp        0.1729 m   pure_c          0.1782 m       BRIEF-reloc lost brief its xyz runner-up by 0.0006 m
-```
+| Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
+|----------|-----------|---------------|-----------|--------------------|-------|
+| `test_freiburgdesk525` | `python` | **0.6772 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.7934 m | BRIEF relocalization closed the gap from 0.296 m to 0.248 m |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0979 m | BRIEF snapshot still edges out Python |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c` | 0.1782 m | BRIEF-reloc lost brief its xyz runner-up by 0.0006 m |
 
-Full 4×5 ATE matrix for the current 30-second run (best per row in brackets):
+Full 4×5 ATE matrix for the current 30-second run:
 
-```
-Sequence                 python      cpp         c         pure_c    pure_c_brief
------------------------  ----------  ----------  --------  --------  -------------
-test_freiburgdesk525     [0.6772]    0.7194      0.7563    0.7574    0.7410
-test_freiburgroom525     1.8659      [1.5452]    1.8691    1.8691    1.7934
-test_freiburgrpy525      0.0982      [0.0977]    0.0997    0.0997    0.0979
-test_freiburgxyz525      0.1785      [0.1729]    0.1789    0.1782    0.1788
-```
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` |
+|----------|----------|-------|-----|----------|---------------|
+| `test_freiburgdesk525` | **0.6772** | 0.7194 | 0.7563 | 0.7574 | 0.7410 |
+| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8691 | 1.8691 | 1.7934 |
+| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0979 |
+| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1788 |
 
 Cross-dataset tradeoff summary (mean over the 4 GT datasets):
 
-```
-Impl            Approx LOC              Mean ATE    GT Wins  GT Runner-up
---------------  ----------------------  ----------  -------  ------------
-python          ~618                    0.7050      1        0
-cpp             ~797                    [0.6338]    [3]      1
-c               ~438 core (+274 shim)   0.7260      0        0
-pure_c          ~438                    0.7261      0        1
-pure_c_brief   ~398                    [0.7028]    0        [2]
-```
+| Impl | Approx LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
+|------|------------|---------------|---------|--------------|
+| `python` | ~618 | 0.7050 | 1 | 0 |
+| `cpp` | ~797 | **0.6338** | **3** | 1 |
+| `c` | ~438 core (+274 shim) | 0.7260 | 0 | 0 |
+| `pure_c` | ~438 | 0.7261 | 0 | 1 |
+| `pure_c_brief` | ~398 | **0.7028** | 0 | **2** |
 
 Promoted historical pure C snapshot comparison:
 
-```
-Sequence                 pure_c current (~438)  pure_c_brief (~398)  Delta (current - brief)
------------------------  ---------------------  --------------------  ------------------------
-test_freiburgdesk525     0.7574                 [0.7410]              +0.0164
-test_freiburgroom525     1.8691                 [1.7934]              +0.0757
-test_freiburgrpy525      0.0997                 [0.0979]              +0.0018
-test_freiburgxyz525      [0.1782]               0.1788                -0.0006
-```
+| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~398 LOC) | Δ current - `brief` |
+|----------|-----------------------------|--------------------------|-------------------|
+| `test_freiburgdesk525` | 0.7574 | **0.7410** | +0.0164 |
+| `test_freiburgroom525` | 1.8691 | **1.7934** | +0.0757 |
+| `test_freiburgrpy525` | 0.0997 | **0.0979** | +0.0018 |
+| `test_freiburgxyz525` | **0.1782** | 0.1788 | -0.0006 |
 
 `pure_c_brief` lives in the active repo as `simple_slam_c_brief.c`.
 The original promoted snapshot (~363 LOC) matched the pure C source from `6f7fda6` and `2b688ed`.
@@ -114,27 +104,23 @@ in `runs/benchmark_history/`.
 
 #### simple_slam.py
 
-```
-Version  ATE RMSE   ATE Median  ATE Max    KF%   Points       Runtime  Notes
--------  ---------  ----------  ---------  ----  -----------  -------  -----------------------------------------------------
-v1.21    0.1773 m   0.1495 m    0.3289 m   100%  15000 (cap)  ~47s     KF trans threshold bug
-v1.22    0.1778 m   0.1521 m    0.3391 m    52%  11779        ~78s     Trans threshold removed, res cap added
-v1.23    0.1786 m   0.1536 m    0.3337 m    52%  12096        ~29s     BA gap bug fixed; large videos now run at speed
-v1.24    0.1789 m   0.1546 m    0.3312 m    93%   2577        ~20s     Local Windowed BA + Sparsity + Sub-pixel refinement
-```
+| Version | ATE RMSE | ATE Median | ATE Max | KF% | Points | Runtime | Notes |
+|---------|----------|------------|---------|-----|--------|---------|-------|
+| v1.21   | 0.1773 m | 0.1495 m   | 0.3289 m | 100% | 15000 (cap) | ~47s | KF trans threshold bug |
+| v1.22   | 0.1778 m | 0.1521 m   | 0.3391 m |  52% | 11779       | ~78s | Trans threshold removed, res cap added |
+| v1.23   | 0.1786 m | 0.1536 m   | 0.3337 m |  52% | 12096       | ~29s | BA gap bug fixed; large videos now run at speed |
+| v1.24   | 0.1789 m | 0.1546 m   | 0.3312 m |  93% | 2577        | ~20s | Local Windowed BA + Sparsity + Sub-pixel refinement |
 
 Settings: `--seconds 30 --ba_min_gap_sec 0.5` (BA enabled), all other params default.
 
 #### ORB-SLAM2 (reference)
 
-```
-System                            ATE RMSE   ATE Median  ATE Max    Poses  Notes
---------------------------------  ---------  ----------  ---------  -----  ------------------------------------------------------------
-ORB-SLAM2 monocular (measured)    0.0752 m   0.0643 m    0.1953 m   575    Built from source, no display, per-frame trajectory
-ORB-SLAM2 monocular (published)   0.0090 m   —           —          798    Mur-Artal 2015, Table 1; loop closure + BA
-simple_slam v1.24                 0.1789 m   0.1546 m    0.3312 m   750    No loop closure, Local Windowed BA
-geohot/twitchslam (compat mode)   0.1763 m   0.1496 m    0.3259 m   750    Headless, no-op optimizer fallback; Python compatibility shim
-```
+| System | ATE RMSE | ATE Median | ATE Max | Poses | Notes |
+|--------|----------|------------|---------|-------|-------|
+| ORB-SLAM2 monocular (measured) | 0.0752 m | 0.0643 m | 0.1953 m | 575 | Built from source, no display, per-frame trajectory |
+| ORB-SLAM2 monocular (published) | 0.0090 m | — | — | 798 | Mur-Artal 2015, Table 1; loop closure + BA |
+| simple_slam v1.24 | 0.1789 m | 0.1546 m | 0.3312 m | 750 | No loop closure, Local Windowed BA |
+| geohot/twitchslam (compat mode) | 0.1763 m | 0.1496 m | 0.3259 m | 750 | Headless run with no-op optimizer fallback; Python/OpenCV/NumPy compatibility shim |
 
 > Measured gap: **~2.4×** (575 vs 750 frames, both Umeyama-aligned).
 > Published gap: **~20×** — ORB-SLAM2's published result uses loop closure + BA on a clean run.
