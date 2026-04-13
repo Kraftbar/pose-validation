@@ -380,3 +380,19 @@ That targets the observed map-growth plateau directly while avoiding another bro
   - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
   - trial: `ATE RMSE 0.1788`, `points 14172`, `keyframes 737`
 - Conclusion: even this more structurally grounded PnP-side change regressed the shaping sequence; not promoted and not worth a full GT sweep
+
+- Trial: projected-search BRIEF in `pure_c_brief` (layered on top of promoted brute-force BRIEF-256 reloc)
+  - Intent: replace O(N_corners × N_map) brute-force Hamming with a per-corner candidate set. Project each map point into the current frame using the previous-frame pose and intrinsics (`fx,fy,cx,cy`), then only evaluate map points within a pixel search radius of each unlinked corner. Expected to help xyz (fewer false relinks to distant points preempting triangulations) while preserving or widening the room gain.
+  - Implementation: `brief_relink(..., const Pose* prior, double fx, double fy, double cx, double cy)`, pre-projects all map points once per call, gates by `vis && (du*du+dv*dv) <= SR^2` before Hamming. Kept the same decision thresholds as brute-force (`best < 35`, Lowe ratio `0.60`, trigger `_nlink < 50`).
+  - Radius sweep on spot-check sequences (note: spot-check frame counts were lower than the canonical benchmark, so these numbers were optimistic):
+    - `SR=30`: room 1.8401 (worse than brute-force 1.7934), xyz 0.1814 (worse)
+    - `SR=60`: room 1.7373, xyz 0.1825
+    - `SR=80`: room 1.6711, xyz 0.1788
+  - Full canonical `benchmark_native.py --all_gt --force` at `SR=80` (full 750/723/613 frame counts):
+    - `test_freiburgdesk525`: 0.7410 → 0.7546 (**+0.0136**, outside ~0.01 m noise floor)
+    - `test_freiburgroom525`: 1.7934 → 1.7821 (−0.0113, barely above noise)
+    - `test_freiburgrpy525`:  0.0979 → 0.0994 (+0.0015, within noise)
+    - `test_freiburgxyz525`:  0.1788 → 0.1788 (unchanged)
+    - Mean ATE: 0.7028 → 0.7037 (slight net regression)
+  - Conclusion: the headline room gain evaporates when measured on the full sequence (n=750 vs spot-check n=621), and desk incurs a real regression above the noise floor. Per the active promotion rule (all-GT validation, no promotion for ATE-neutral changes), projected-search at `SR=80` is rejected. Brute-force BRIEF retained.
+  - Takeaway: prev-frame pose as a reloc prior is brittle under rotation/drift on desk and room. A useful future variant would gate radius by rotation magnitude, or use the propagated (constant-velocity) pose rather than the raw prev pose. Not implementing until a cleaner hypothesis emerges.
