@@ -6,7 +6,7 @@ A lightweight SLAM benchmark repo comparing Python, C++, OpenCV-linked C, and li
 - **`simple_slam.py`**: Python baseline using OpenCV and SciPy.
 - **`simple_slam_opt.cpp`**: Optimized C++ port using OpenCV.
 - **`simple_slam_c.c`**: Current standalone pure C implementation.
-- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~363 LOC`), now tracked as a first-class benchmark variant.
+- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~398 LOC`), first-class benchmark variant with in-tree BRIEF-256 relocalization.
 
 ## Current GT Tracking
 The benchmark suite now tracks the full **4 GT datasets × 5 implementations = 20 runs** across:
@@ -18,7 +18,7 @@ The benchmark suite now tracks the full **4 GT datasets × 5 implementations = 2
 Current highlights:
 - **`cpp`**: Best overall tradeoff, with **3 / 4 GT wins**.
 - **`python`**: Best on `test_freiburgdesk525`.
-- **`pure_c_brief`**: Best small-code pure C reference, runner-up on **3 / 4 GT datasets**.
+- **`pure_c_brief`**: Best small-code pure C reference, runner-up on **2 / 4 GT datasets** (room, rpy). Room gap to `cpp` narrowed from 0.296 m to 0.248 m after adding an in-tree BRIEF-256 relocalization path.
 
 The generated tracking artifacts live in `runs/benchmark/`:
 - `gt_tracking.json`

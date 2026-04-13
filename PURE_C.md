@@ -53,6 +53,29 @@ That note records:
 - trials that were measured and rejected,
 - and the reasoning for keeping `simple_slam_c.c` on the restored healthy baseline.
 
+## BRIEF Relocalization in `pure_c_brief`
+
+The `pure_c_brief` variant (`simple_slam_c_brief.c`) gained an in-tree
+BRIEF-256 relocalization path — still zero external dependencies. Each `MapPoint`
+stores a 256-bit BRIEF descriptor computed from its birth keyframe. When fewer
+than 50 tracked corners carry a map-point link in the current frame, unmatched
+tracked corners are described and matched by Hamming distance against the map
+(thresholds: `best < 35`, Lowe ratio `0.60`). Accepted matches set the corner's
+`pt_idx` and flow into the existing PnP path.
+
+Effect on the 30-second all-GT sweep (vs the prior `pure_c_brief` baseline):
+
+| Sequence | Before | After | Δ |
+|----------|--------|-------|---|
+| `test_freiburgroom525` | 1.8414 | **1.7934** | **−0.0480** |
+| `test_freiburgdesk525` | 0.7412 | 0.7410 | −0.0002 |
+| `test_freiburgrpy525`  | 0.0980 | 0.0979 | −0.0001 |
+| `test_freiburgxyz525`  | 0.1760 | 0.1788 | +0.0028 |
+
+The room gain is the primary signal; other sequences move within the ~0.01 m
+noise floor. The xyz delta is a small regression and cost `pure_c_brief` its
+runner-up position on that sequence by 0.0006 m.
+
 ## Comparison with State-of-the-Art (SOTA)
 
 Typical monocular ATE RMSE results for the Freiburg sequences:

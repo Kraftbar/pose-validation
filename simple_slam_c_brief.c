@@ -23,8 +23,41 @@ typedef struct { Match* data; int size, cap; } MatchVec;
 typedef struct { FrameStat* data; int size, cap; } FrameStatVec;
 typedef struct { double m[16]; } Pose;
 typedef struct { CornerVec corners; Pose pose; unsigned char* gray; } FrameLite;
-typedef struct { double x, y, z; int obs; } MapPoint;
+typedef struct { uint64_t bits[4]; } Brief256;
+typedef struct { double x, y, z; int obs; Brief256 desc; } MapPoint;
 typedef struct { MapPoint* data; int size, cap; } Map;
+
+
+static int g_brief_pattern[256*4];
+static void brief_init_pattern(void) { srand(42); for (int i = 0; i < 256*4; i++) g_brief_pattern[i] = (rand() % 25) - 12; }
+static int compute_brief(const unsigned char* g, int w, int h, float fx, float fy, Brief256* out) {
+  int cx=(int)fx, cy=(int)fy; if (cx<13||cx>=w-13||cy<13||cy>=h-13) return 0;
+  memset(out->bits, 0, sizeof(out->bits));
+  for (int i=0; i<256; i++) {
+    int dx1=g_brief_pattern[i*4+0], dy1=g_brief_pattern[i*4+1], dx2=g_brief_pattern[i*4+2], dy2=g_brief_pattern[i*4+3];
+    unsigned char a=g[(cy+dy1)*w+(cx+dx1)], b=g[(cy+dy2)*w+(cx+dx2)];
+    if (a > b) out->bits[i/64] |= (uint64_t)1 << (i%64);
+  }
+  return 1;
+}
+static int brief_hamming(const Brief256* a, const Brief256* b) { int d=0; for (int i=0; i<4; i++) d += __builtin_popcountll(a->bits[i] ^ b->bits[i]); return d; }
+
+static int brief_relink(const unsigned char* g, int w, int h, CornerVec* tracked, const Map* map) {
+  if (map->size < 50) return 0;
+  int relinked = 0;
+  for (int i = 0; i < tracked->size; i++) {
+    if (tracked->data[i].pt_idx != -1) continue;
+    Brief256 d; if (!compute_brief(g, w, h, tracked->data[i].x, tracked->data[i].y, &d)) continue;
+    int best = 257, second = 257, best_idx = -1;
+    for (int k = 0; k < map->size; k++) {
+      int dist = brief_hamming(&d, &map->data[k].desc);
+      if (dist < best) { second = best; best = dist; best_idx = k; }
+      else if (dist < second) second = dist;
+    }
+    if (best < 35 && best * 10 < second * 6) { tracked->data[i].pt_idx = best_idx; relinked++; }
+  }
+  return relinked;
+}
 
 static void* xrealloc(void* ptr, size_t size) { void* out = realloc(ptr, size); if(!out){ fprintf(stderr, "out of memory\n"); exit(1); } return out; }
 static void corner_vec_push(CornerVec* vec, Corner v) { if(vec->size == vec->cap){ vec->cap = vec->cap ? vec->cap * 2 : 256; vec->data = (Corner*)xrealloc(vec->data, (size_t)vec->cap * sizeof(Corner)); } vec->data[vec->size++] = v; }
@@ -328,7 +361,7 @@ static double now_seconds(void){ struct timespec ts; clock_gettime(CLOCK_MONOTON
 static Config parse_args(int argc, char** argv){ Config c={"test_kitti984.mp4",5.0,30.0,NULL,20,5.0,15000}; for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"--video_path")&&i+1<argc)c.video_path=argv[++i]; else if(!strcmp(argv[i],"--seconds")&&i+1<argc)c.seconds=atof(argv[++i]); else if(!strcmp(argv[i],"--timeout")&&i+1<argc)c.timeout=atof(argv[++i]); else if(!strcmp(argv[i],"--metrics_out")&&i+1<argc)c.metrics_out=argv[++i]; else if(argv[i][0]!='-')c.video_path=argv[i]; } return c; }
 
 int main(int argc, char** argv) {
-  Config cfg=parse_args(argc,argv); FFmpegCap* cap=ffmpeg_open(cfg.video_path); if(!cap){fprintf(stderr,"Failed pipe.\n");return 1;}
+  Config cfg=parse_args(argc,argv); brief_init_pattern(); FFmpegCap* cap=ffmpeg_open(cfg.video_path); if(!cap){fprintf(stderr,"Failed pipe.\n");return 1;}
   int w=640,h=480; unsigned char *raw=malloc(w*h*3),*pgray=calloc(w*h,1),*cgray=calloc(w*h,1),*cblur=calloc(w*h,1);
   FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
@@ -337,6 +370,8 @@ int main(int argc, char** argv) {
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
     if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,1000); mkf=1; pose_identity(&pose); }
     else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
+      int _nlink=0; for(int _i=0;_i<tracked.size;_i++) if(tracked.data[_i].pt_idx!=-1) _nlink++;
+      if(_nlink < 50 && map.size > 100) brief_relink(cblur, w, h, &tracked, &map);
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else pose=prev.pose;
@@ -344,7 +379,7 @@ int main(int argc, char** argv) {
       if(mkf){
         if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3]; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
           if(triangulate_point(&prev.pose,&pose,prev.corners.data[matches.data[j].query_idx],tracked.data[matches.data[j].train_idx],fx,fy,cx,cy,X)){
-            tracked.data[matches.data[j].train_idx].pt_idx=map.size; map_push(&map,(MapPoint){X[0],X[1],X[2],1}); pts++; added++; tri++; } } else { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
+            Brief256 _d={{0,0,0,0}}; Corner _tc=tracked.data[matches.data[j].train_idx]; compute_brief(cblur,w,h,_tc.x,_tc.y,&_d); tracked.data[matches.data[j].train_idx].pt_idx=map.size; MapPoint _mp={X[0],X[1],X[2],1,_d}; map_push(&map,_mp); pts++; added++; tri++; } } else { map.data[tracked.data[matches.data[j].train_idx].pt_idx].obs++; } } }
         if(tracked.size<600) extract_corners_pure(cblur,w,h,&tracked,1000);
         unsigned char thumb[256]; gen_thumbnail(cgray,w,h,thumb); int lidx=find_loop_candidate(&kf_db,thumb,frame_id);
         if(lidx>=0) { Pose loop_pose; if(verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) { printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id); pose = loop_pose; } }

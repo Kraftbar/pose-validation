@@ -48,46 +48,53 @@ Approx implementation size reference:
 | `cpp` | ~797 | `simple_slam_opt.cpp` |
 | `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
 | `pure_c` | ~438 | standalone `simple_slam_c.c` only |
-| `pure_c_brief` | ~363 | promoted historical snapshot in `simple_slam_c_brief.c` |
+| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c`, now with BRIEF-reloc |
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
 |----------|-----------|---------------|-----------|--------------------|-------|
-| `test_freiburgdesk525` | `python` | **0.6778 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.8414 m | BRIEF snapshot is the runner-up here |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0980 m | BRIEF snapshot edges out Python |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_brief` | 0.1760 m | BRIEF snapshot beats both current pure C and Python |
+| `test_freiburgdesk525` | `python` | **0.6772 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.7934 m | BRIEF relocalization closed the gap from 0.296 m to 0.248 m |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0979 m | BRIEF snapshot still edges out Python |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c` | 0.1782 m | BRIEF-reloc lost brief its xyz runner-up by 0.0006 m |
 
 Full 4×5 ATE matrix for the current 30-second run:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` |
 |----------|----------|-------|-----|----------|---------------|
-| `test_freiburgdesk525` | **0.6778** | 0.7194 | 0.7563 | 0.7574 | 0.7412 |
-| `test_freiburgroom525` | 1.8660 | **1.5452** | 1.8691 | 1.8691 | 1.8414 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0980 |
-| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1760 |
+| `test_freiburgdesk525` | **0.6772** | 0.7194 | 0.7563 | 0.7574 | 0.7410 |
+| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8691 | 1.8691 | 1.7934 |
+| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0979 |
+| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1788 |
 
 Cross-dataset tradeoff summary (mean over the 4 GT datasets):
 
-| Impl | Approx LOC | Mean ATE RMSE | Mean Runtime (s) | Mean Speedup vs Python | GT Wins | GT Runner-up |
-|------|------------|---------------|------------------|------------------------|---------|--------------|
-| `python` | ~618 | 0.7051 | 16.982 | 1.00x | 1 | 0 |
-| `cpp` | ~797 | **0.6338** | **8.209** | **2.07x** | **3** | 1 |
-| `c` | ~438 core (+274 shim) | 0.7260 | 31.744 | 0.56x | 0 | 0 |
-| `pure_c` | ~438 | 0.7261 | 28.235 | 0.83x | 0 | 0 |
-| `pure_c_brief` | ~363 | 0.7141 | 39.179 | 0.44x | 0 | **3** |
+| Impl | Approx LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
+|------|------------|---------------|---------|--------------|
+| `python` | ~618 | 0.7050 | 1 | 0 |
+| `cpp` | ~797 | **0.6338** | **3** | 1 |
+| `c` | ~438 core (+274 shim) | 0.7260 | 0 | 0 |
+| `pure_c` | ~438 | 0.7261 | 0 | 1 |
+| `pure_c_brief` | ~398 | **0.7028** | 0 | **2** |
 
 Promoted historical pure C snapshot comparison:
 
-| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~363 LOC) | Δ current - `brief` |
+| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~398 LOC) | Δ current - `brief` |
 |----------|-----------------------------|--------------------------|-------------------|
-| `test_freiburgdesk525` | 0.7574 | **0.7412** | +0.0162 |
-| `test_freiburgroom525` | 1.8691 | **1.8414** | +0.0277 |
-| `test_freiburgrpy525` | 0.0997 | **0.0980** | +0.0017 |
-| `test_freiburgxyz525` | 0.1782 | **0.1760** | +0.0022 |
+| `test_freiburgdesk525` | 0.7574 | **0.7410** | +0.0164 |
+| `test_freiburgroom525` | 1.8691 | **1.7934** | +0.0757 |
+| `test_freiburgrpy525` | 0.0997 | **0.0979** | +0.0018 |
+| `test_freiburgxyz525` | **0.1782** | 0.1788 | -0.0006 |
 
-`pure_c_brief` is copied into the active repo as `simple_slam_c_brief.c`.
-It matches the pure C source from `6f7fda6` and `2b688ed`, which were identical
-for this file. Historical helper artifacts remain in `runs/benchmark_history/`.
+`pure_c_brief` lives in the active repo as `simple_slam_c_brief.c`.
+The original promoted snapshot (~363 LOC) matched the pure C source from `6f7fda6` and `2b688ed`.
+Current size (~398 LOC) adds an in-tree BRIEF-256 relocalization path:
+on frames where fewer than 50 tracked corners carry a map-point link, the
+unmatched tracked corners are described with a 256-bit BRIEF pattern and
+matched by Hamming distance against the per-point descriptors stored at
+triangulation time (`best < 35`, Lowe ratio `0.60`). Accepted matches set
+`pt_idx` on the corner and flow into the existing PnP path. This is a pure C
+addition (no OpenCV / no external deps). Historical helper artifacts remain
+in `runs/benchmark_history/`.
 
 ---
 

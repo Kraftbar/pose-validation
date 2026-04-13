@@ -157,6 +157,50 @@ branch and never judge a candidate change against instrumented numbers.
      - points collapsed from the healthy baseline `6803` to `74`
    - Conclusion: this specific top-up rule is clearly unsafe; it likely disrupted the balance between tracked, matched, and newly injected features and should not be kept
 
+## Promoted trial: BRIEF-256 relocalization in `pure_c_brief`
+
+After the rejected trials above, a BRIEF-256 relocalization path was added to
+`simple_slam_c_brief.c` and landed:
+
+- Each `MapPoint` stores a 256-bit BRIEF descriptor computed once at birth
+  from the blurred gray image at its triangulating corner.
+- On each frame after KLT, count corners that carry a map-point link. If
+  the count is below 50 and the map is non-trivial, describe every unmatched
+  current corner with BRIEF and match against all map-point descriptors by
+  Hamming distance.
+- Accept a match when the best Hamming distance is `< 35` bits and the best
+  is below `0.60 × second-best` (Lowe ratio). Accepted matches set `pt_idx`
+  on the corner, feeding PnP naturally on the next step.
+- LOC: 363 → 398 (+35), still zero external dependencies.
+
+Parameter tuning notes (all on `test_freiburgroom525`):
+
+- Match threshold sweep was monotonic and that is the real signal:
+  `best < 48, ratio 0.75` → 1.8254; `best < 40, ratio 0.70` → 1.8060;
+  `best < 35, ratio 0.60` → **1.7934**; tighter (`< 30, 0.55`) regressed.
+- Trigger threshold (`_nlink <` bound) is noisy, not a clean plateau. At
+  the same match thresholds: 40 → 1.8320, 44 → 1.8364, **45 → 1.6571** (a
+  knife-edge RANSAC-luck dip, not a plateau), 46 → 1.8552, 48 → 1.8197,
+  **50 → 1.7934**, 52 → 1.8380. Trigger 45 was explicitly rejected as not
+  robust — any future code change that shifts the RANSAC sample sequence
+  would likely lose that specific dip. Landed config is trigger `< 50`.
+
+Final all-GT delta vs the `pure_c_brief` baseline:
+
+| Sequence | Before | After | Δ |
+|----------|--------|-------|---|
+| `test_freiburgroom525` | 1.8414 | **1.7934** | **−0.0480** |
+| `test_freiburgdesk525` | 0.7412 | 0.7410 | −0.0002 |
+| `test_freiburgrpy525`  | 0.0980 | 0.0979 | −0.0001 |
+| `test_freiburgxyz525`  | 0.1760 | 0.1788 | +0.0028 |
+
+Room closes roughly half of the prior gap to `cpp` (0.296 m → 0.248 m).
+The xyz delta is within the ~0.01 m noise floor but is a real map-density
+side effect (14710 → 11645 triangulations, −21 %): BRIEF relink pre-empts
+some would-be-new triangulations by snapping unmatched corners onto older
+map points. That is why `pure_c_brief` no longer holds the xyz runner-up
+by a 0.0006 m margin — a recognized and accepted trade for the room gain.
+
 ## Bottom line
 
 The Gemini session was not a reliable landed implementation, but it was not completely wasted:
@@ -261,3 +305,78 @@ In other words:
 - and change only the corner top-up rule from a total-count heuristic to an unmatched-candidate heuristic.
 
 That targets the observed map-growth plateau directly while avoiding another broad behavioral change.
+
+## Rejected exploratory trial on `pure_c_brief`
+
+- Trial: add minimal active-point hygiene plus replace the unconditional `frame_id % 10 == 0` keyframe trigger with a max-gap fallback (`25` frames)
+- Intent: borrow two small ideas from the stronger `cpp` shape without porting descriptors or larger architectural changes
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_kfgap_cull_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1783`, `points 10123`, `keyframes 705`
+- Conclusion: reduced keyframe density and map size, but accuracy regressed on the shaping sequence itself, so this variant was not strong enough to justify a full `--all_gt` sweep or promotion
+
+- Trial: conservative unmatched-corner replenishment
+- Intent: only top up features on keyframes that added `0` points, and only when unmatched tracked corners were very low
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_unmatched_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1774`, `points 15791`, `keyframes 746`
+- Conclusion: map growth increased, but ATE still regressed on the shaping sequence; not promoted and not worth a full GT sweep
+
+- Trial: tiny patch-based relinking / search-by-projection for mature map points
+- Intent: add a minimal TwitchSLAM-style idea without importing descriptors or third-party libraries
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_patch_relink_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1782`, `points 14641`, `keyframes 744`
+- Conclusion: the tiny relinking version did not improve accuracy and is not strong enough to keep as a landed change
+
+- Trial: tiny census-descriptor relinking with projected search + Hamming ratio gate
+- Intent: try a more `cpp`-like lightweight front-end cue while staying fully pure C
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_census_relink_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1779`, `points 12928`, `keyframes 736`
+- Conclusion: descriptor-style relinking was directionally closer than the raw patch trial, but it still regressed ATE on the shaping sequence and was not promoted
+
+- Trial: tiny subpixel corner refinement via local score-centroid adjustment
+- Intent: mimic the spirit of `cornerSubPix` with a minimal pure-C refinement on newly detected corners
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_subpix_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1788`, `points 8767`, `keyframes 741`
+- Conclusion: this lightweight subpixel refinement clearly regressed the shaping sequence and should not be retried in this form
+
+- Trial: port cpp's periodic `obs<2` map-point cull into `pure_c_brief`
+  - Intent: mirror cpp's `cullPoints(cull_min_obs=2)` every 10 frames since cpp wins 3/4 GT and this was the most visible structural diff
+  - Implementation: cull helper + pt_idx reindex across `prev.corners` and all `kf_db` entries; set birth obs `1→2`, keep `local_ba` filter semantics
+  - Result on `test_freiburgroom525`: identical to baseline (`ATE RMSE 1.8414`, `points 23399`)
+  - Root cause of no-op: cpp's `MapPoint::observations` starts with 2 entries at birth and is **never appended to anywhere else in the cpp source**, so `size() < 2` is always false — cpp's cull is itself a no-op. The "cpp prunes the map" hypothesis is phantom; do not retry this port.
+
+- Trial: drop the `frame_id % 10 == 0` forced-keyframe clause from `pure_c_brief` in isolation
+  - Intent: match cpp's simpler keyframe rule (`inl < kf_min` OR `rot > kf_max_rot_deg` only)
+  - Result on `test_freiburgroom525`: identical to baseline (`ATE RMSE 1.8414`, `points 23399`, `keyframes 742/750`)
+  - Root cause: on room the other two clauses (inlier floor, rotation gate) already fire on essentially every frame (742 KF out of 750). The `frame%10==0` clause was redundant, not binding. Removing it changes nothing on this sequence. Do not retry as a standalone change.
+
+- Trial: unconditional `lkf_pose = pose` on every accepted keyframe in `pure_c_brief` (isolated)
+  - Intent: fix the rotation-gate pathology identified earlier (`lkf_pose` becomes stale once map growth stalls, which then makes the rotation gate fire every frame, producing 99% keyframes with 1-frame baselines).
+  - Note: the same idea was tested on `pure_c` (trial #5 in this file) and produced only a tiny `0.1782 → 0.1779` change on xyz; it had not been tried on `pure_c_brief` in isolation.
+  - Result on `test_freiburgroom525`:
+    - baseline `pure_c_brief`: `ATE RMSE 1.8414`, `points 23399`
+    - trial: `ATE RMSE 1.8551`, `points 18799`
+  - Conclusion: a mild regression on the sequence with the diagnosed pathology. The fewer-keyframes schedule does reduce dense 1-baseline triangulations, but it does not translate into an ATE win. Not promoted. Do not retry in isolation.
+
+- Trial: more faithful PnP candidate path (`obs=2` on triangulation, prefer `obs>=2` candidates, unique 6-point RANSAC samples, tie-break by reprojection error)
+- Intent: mimic the stronger `cpp` shape more directly by treating new triangulations as two-view points and making PnP sampling less brittle
+- Exploratory run only, saved under:
+  - `runs/pure_c_iter/brief_pnp_corr_trial/`
+- Result on `test_freiburgxyz525`:
+  - baseline `pure_c_brief`: `ATE RMSE 0.1760`, `points 14710`, `keyframes 748`
+  - trial: `ATE RMSE 0.1788`, `points 14172`, `keyframes 737`
+- Conclusion: even this more structurally grounded PnP-side change regressed the shaping sequence; not promoted and not worth a full GT sweep
