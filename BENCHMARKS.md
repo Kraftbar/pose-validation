@@ -42,48 +42,58 @@ This section tracks the full **4 GT datasets × 5 implementations = 20 measured 
 
 Approx implementation size reference:
 
-| Impl | Approx LOC | Counting rule |
-|------|------------|---------------|
-| `python` | ~618 | `simple_slam.py` |
-| `cpp` | ~797 | `simple_slam_opt.cpp` |
-| `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
-| `pure_c` | ~438 | standalone `simple_slam_c.c` only |
-| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c`, now with BRIEF-reloc |
+```
+Impl            Approx LOC              Counting rule
+--------------  ----------------------  -------------------------------------------------------
+python          ~618                    simple_slam.py
+cpp             ~797                    simple_slam_opt.cpp
+c               ~438 core (+274 shim)   simple_slam_c.c + simple_slam_c_shim.cpp/.h (OpenCV bridge)
+pure_c          ~438                    standalone simple_slam_c.c only
+pure_c_brief   ~398                    standalone simple_slam_c_brief.c, now with BRIEF-reloc
+```
 
-| Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
-|----------|-----------|---------------|-----------|--------------------|-------|
-| `test_freiburgdesk525` | `python` | **0.6772 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.7934 m | BRIEF relocalization closed the gap from 0.296 m to 0.248 m |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0979 m | BRIEF snapshot still edges out Python |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c` | 0.1782 m | BRIEF-reloc lost brief its xyz runner-up by 0.0006 m |
+```
+Sequence                 Best Impl  Best ATE   Runner-up       Runner-up ATE  Notes
+-----------------------  ---------  ---------  --------------  -------------  --------------------------------------------------------
+test_freiburgdesk525     python     0.6772 m   cpp             0.7194 m       Only GT set where Python currently leads
+test_freiburgroom525     cpp        1.5452 m   pure_c_brief   1.7934 m       BRIEF reloc closed gap from 0.296 m to 0.248 m
+test_freiburgrpy525      cpp        0.0977 m   pure_c_brief   0.0979 m       BRIEF snapshot still edges out Python
+test_freiburgxyz525      cpp        0.1729 m   pure_c          0.1782 m       BRIEF-reloc lost brief its xyz runner-up by 0.0006 m
+```
 
-Full 4×5 ATE matrix for the current 30-second run:
+Full 4×5 ATE matrix for the current 30-second run (best per row in brackets):
 
-| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` |
-|----------|----------|-------|-----|----------|---------------|
-| `test_freiburgdesk525` | **0.6772** | 0.7194 | 0.7563 | 0.7574 | 0.7410 |
-| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8691 | 1.8691 | 1.7934 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0979 |
-| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1788 |
+```
+Sequence                 python      cpp         c         pure_c    pure_c_brief
+-----------------------  ----------  ----------  --------  --------  -------------
+test_freiburgdesk525     [0.6772]    0.7194      0.7563    0.7574    0.7410
+test_freiburgroom525     1.8659      [1.5452]    1.8691    1.8691    1.7934
+test_freiburgrpy525      0.0982      [0.0977]    0.0997    0.0997    0.0979
+test_freiburgxyz525      0.1785      [0.1729]    0.1789    0.1782    0.1788
+```
 
 Cross-dataset tradeoff summary (mean over the 4 GT datasets):
 
-| Impl | Approx LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
-|------|------------|---------------|---------|--------------|
-| `python` | ~618 | 0.7050 | 1 | 0 |
-| `cpp` | ~797 | **0.6338** | **3** | 1 |
-| `c` | ~438 core (+274 shim) | 0.7260 | 0 | 0 |
-| `pure_c` | ~438 | 0.7261 | 0 | 1 |
-| `pure_c_brief` | ~398 | **0.7028** | 0 | **2** |
+```
+Impl            Approx LOC              Mean ATE    GT Wins  GT Runner-up
+--------------  ----------------------  ----------  -------  ------------
+python          ~618                    0.7050      1        0
+cpp             ~797                    [0.6338]    [3]      1
+c               ~438 core (+274 shim)   0.7260      0        0
+pure_c          ~438                    0.7261      0        1
+pure_c_brief   ~398                    [0.7028]    0        [2]
+```
 
 Promoted historical pure C snapshot comparison:
 
-| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~398 LOC) | Δ current - `brief` |
-|----------|-----------------------------|--------------------------|-------------------|
-| `test_freiburgdesk525` | 0.7574 | **0.7410** | +0.0164 |
-| `test_freiburgroom525` | 1.8691 | **1.7934** | +0.0757 |
-| `test_freiburgrpy525` | 0.0997 | **0.0979** | +0.0018 |
-| `test_freiburgxyz525` | **0.1782** | 0.1788 | -0.0006 |
+```
+Sequence                 pure_c current (~438)  pure_c_brief (~398)  Delta (current - brief)
+-----------------------  ---------------------  --------------------  ------------------------
+test_freiburgdesk525     0.7574                 [0.7410]              +0.0164
+test_freiburgroom525     1.8691                 [1.7934]              +0.0757
+test_freiburgrpy525      0.0997                 [0.0979]              +0.0018
+test_freiburgxyz525      [0.1782]               0.1788                -0.0006
+```
 
 `pure_c_brief` lives in the active repo as `simple_slam_c_brief.c`.
 The original promoted snapshot (~363 LOC) matched the pure C source from `6f7fda6` and `2b688ed`.
@@ -104,23 +114,27 @@ in `runs/benchmark_history/`.
 
 #### simple_slam.py
 
-| Version | ATE RMSE | ATE Median | ATE Max | KF% | Points | Runtime | Notes |
-|---------|----------|------------|---------|-----|--------|---------|-------|
-| v1.21   | 0.1773 m | 0.1495 m   | 0.3289 m | 100% | 15000 (cap) | ~47s | KF trans threshold bug |
-| v1.22   | 0.1778 m | 0.1521 m   | 0.3391 m |  52% | 11779       | ~78s | Trans threshold removed, res cap added |
-| v1.23   | 0.1786 m | 0.1536 m   | 0.3337 m |  52% | 12096       | ~29s | BA gap bug fixed; large videos now run at speed |
-| v1.24   | 0.1789 m | 0.1546 m   | 0.3312 m |  93% | 2577        | ~20s | Local Windowed BA + Sparsity + Sub-pixel refinement |
+```
+Version  ATE RMSE   ATE Median  ATE Max    KF%   Points       Runtime  Notes
+-------  ---------  ----------  ---------  ----  -----------  -------  -----------------------------------------------------
+v1.21    0.1773 m   0.1495 m    0.3289 m   100%  15000 (cap)  ~47s     KF trans threshold bug
+v1.22    0.1778 m   0.1521 m    0.3391 m    52%  11779        ~78s     Trans threshold removed, res cap added
+v1.23    0.1786 m   0.1536 m    0.3337 m    52%  12096        ~29s     BA gap bug fixed; large videos now run at speed
+v1.24    0.1789 m   0.1546 m    0.3312 m    93%   2577        ~20s     Local Windowed BA + Sparsity + Sub-pixel refinement
+```
 
 Settings: `--seconds 30 --ba_min_gap_sec 0.5` (BA enabled), all other params default.
 
 #### ORB-SLAM2 (reference)
 
-| System | ATE RMSE | ATE Median | ATE Max | Poses | Notes |
-|--------|----------|------------|---------|-------|-------|
-| ORB-SLAM2 monocular (measured) | 0.0752 m | 0.0643 m | 0.1953 m | 575 | Built from source, no display, per-frame trajectory |
-| ORB-SLAM2 monocular (published) | 0.0090 m | — | — | 798 | Mur-Artal 2015, Table 1; loop closure + BA |
-| simple_slam v1.24 | 0.1789 m | 0.1546 m | 0.3312 m | 750 | No loop closure, Local Windowed BA |
-| geohot/twitchslam (compat mode) | 0.1763 m | 0.1496 m | 0.3259 m | 750 | Headless run with no-op optimizer fallback; Python/OpenCV/NumPy compatibility shim |
+```
+System                            ATE RMSE   ATE Median  ATE Max    Poses  Notes
+--------------------------------  ---------  ----------  ---------  -----  ------------------------------------------------------------
+ORB-SLAM2 monocular (measured)    0.0752 m   0.0643 m    0.1953 m   575    Built from source, no display, per-frame trajectory
+ORB-SLAM2 monocular (published)   0.0090 m   —           —          798    Mur-Artal 2015, Table 1; loop closure + BA
+simple_slam v1.24                 0.1789 m   0.1546 m    0.3312 m   750    No loop closure, Local Windowed BA
+geohot/twitchslam (compat mode)   0.1763 m   0.1496 m    0.3259 m   750    Headless, no-op optimizer fallback; Python compatibility shim
+```
 
 > Measured gap: **~2.4×** (575 vs 750 frames, both Umeyama-aligned).
 > Published gap: **~20×** — ORB-SLAM2's published result uses loop closure + BA on a clean run.
@@ -134,6 +148,141 @@ Settings: `--seconds 30 --ba_min_gap_sec 0.5` (BA enabled), all other params def
 >
 > To run ORB-SLAM2 yourself: `setup_orbslam2.sh` + `run_orbslam_benchmark.py`
 > (builds from source; see build notes below).
+
+---
+
+## Published ORB-SLAM reference numbers
+
+Verified from the original papers on 2026-04-13. Use as a ceiling when comparing
+this repo's variants; don't trust unsourced recollections.
+
+### ORB-SLAM (Mur-Artal 2015) — monocular, Table III
+
+Median of 5 runs, 7-DoF Umeyama aligned. ATE RMSE:
+
+| Sequence | ORB-SLAM mono | This repo best | Ratio |
+|----------|---------------|----------------|-------|
+| fr1/xyz | **0.009 m** | 0.1729 m (cpp) | ~19× |
+| fr1/desk | **0.017 m** | 0.6772 m (python) | ~40× |
+| fr1/floor | 0.030 m | — | — |
+| fr2/xyz | 0.003 m | — | — |
+| fr2/desk | 0.009 m | — | — |
+| fr3/long_office | 0.035 m | — | — |
+| fr3/nstr_tex_far | planar ambiguity (failed) | — | — |
+
+**Gap in the literature:** `fr1/room` and `fr1/rpy` are NOT in the ORB-SLAM
+paper. Likely because mono struggles on rotation-heavy / revisit-heavy
+sequences and the authors cherry-picked converging ones. No credible published
+mono number exists for those two — our 1.545 m (room) and 0.098 m (rpy) have
+no fair reference.
+
+### ORB-SLAM2 (Mur-Artal 2017) — RGB-D only on TUM
+
+Paper reports RGB-D, not mono, on TUM:
+- fr1/desk (RGB-D): 0.016 m
+- fr1/room (RGB-D): 0.047 m
+
+RGB-D has per-pixel depth — only a loose lower bound for mono.
+
+### ORB-SLAM3 (Campos 2021)
+
+No TUM RGB-D evaluation. Switched to EuRoC and TUM-VI.
+
+### RTAB-Map (Labbé & Michaud 2019 / 2024)
+
+Benchmarks TUM RGB-D with overall range **ATE-RMSE 0.004–0.14 m**. Per-sequence
+numbers exist in the JFR 2019 paper but weren't extractable via WebFetch —
+check the PDF directly if exact values needed. RTAB-Map **requires RGB-D or
+stereo** for metric SLAM; monocular mode is loop-closure detection only, so
+it's not a fair ceiling for this repo's pure-mono pipeline (treat as
+depth-assisted lower bound, like ORB-SLAM2 RGB-D).
+
+### Dataset coverage in published SLAM papers
+
+Which of this repo's four GT sequences are documented where (verified
+2026-04-13):
+
+| Sequence | ORB-SLAM mono 2015 | ORB-SLAM2 RGB-D 2017 | ORB-SLAM3 2021 | RTAB-Map |
+|----------|--------------------|-----------------------|-----------------|----------|
+| fr1/xyz  | ✅ 0.009 m | — | — | in TUM range |
+| fr1/desk | ✅ 0.017 m | ✅ 0.016 m (RGB-D) | — | in TUM range |
+| fr1/room | ❌ skipped | ✅ 0.047 m (RGB-D) | — | in TUM range |
+| fr1/rpy  | ❌ skipped | ❌ not reported | — | unclear |
+
+Takeaway: **fr1/rpy has no published mono reference anywhere we could find**,
+and fr1/room only has an RGB-D reference. For apples-to-apples mono comparison,
+fr1/xyz and fr1/desk are the only two datasets with credible published
+monocular ceilings. The third-party Kasar 2018 comparison (arXiv 1811.09895)
+benchmarks multiple systems on TUM but its PDF also didn't parse here.
+
+### Sources
+- https://ar5iv.labs.arxiv.org/html/1502.00956 (ORB-SLAM)
+- https://ar5iv.labs.arxiv.org/html/1610.06475 (ORB-SLAM2)
+- https://ar5iv.labs.arxiv.org/html/2007.11898 (ORB-SLAM3)
+- https://arxiv.org/html/2403.06341v1 (RTAB-Map 2024 update)
+- https://onlinelibrary.wiley.com/doi/10.1002/rob.21831 (RTAB-Map JFR 2019)
+- https://arxiv.org/pdf/1811.09895 (Kasar 2018 SLAM comparison)
+
+---
+
+## Improvement roadmap — rough LOC vs. accuracy estimates
+
+Pure-C style, no g2o/ceres. Anchors expectations when planning SLAM work.
+
+| Feature | LOC cost | Expected ATE on fr1/xyz (from 0.173 m) |
+|---------|----------|----------------------------------------|
+| Expand local BA window (3 KF → all KFs) | +30–60 | → ~0.15 m |
+| Global BA (full map, sparse LM) | +200–350 | → ~0.11 m |
+| Loop closure detection (BRIEF/DBoW-lite + geometric verify) | +150–250 | xyz: ~0 (no loops); room: 1.79 → ~1.0 |
+| Pose-graph optimization (SE(3) LM) | +100–200 | Only useful with loops |
+| Better init (homography fallback, more RANSAC iters) | +40–80 | Robustness, not RMSE |
+| Keyframe culling + better selection | +30–60 | ~0.01 m |
+
+**Realistic target:** +~400 LOC (global BA + loop closure) roughly halves error
+to ~0.09 m on xyz, matching *measured* ORB-SLAM2 (0.0752 m). Matching
+*published* 0.009 m would need full DBoW + essential graph + extensive tuning —
+that is the ORB-SLAM2 codebase itself (~30K LOC), not an incremental
+improvement.
+
+Recent frontier has shifted from "lower RMSE" to robustness / don't-regress
+(commits `4ba2ddd`, `8aa9201`, `13ebb6c`). Treat accuracy claims beyond ~0.09 m
+on fr1/xyz with skepticism unless backed by one of the structural changes
+above.
+
+---
+
+## Strategy notes
+
+Framing to use when planning future SLAM work in this repo:
+
+1. **xyz and desk have plateaued.** All 5 variants are within 0.006 m on xyz
+   and within 0.08 m on desk. Micro-tuning will not move either without a
+   structural change. Recent commits already reflect this shift to
+   robustness/recovery — keep that direction unless one of the structural
+   features below is being added.
+
+2. **Pick one structural feature, commit fully.** Biggest bang-for-LOC:
+   - Global BA (+200–350 LOC) → improves every sequence uniformly,
+     ~0.17 → ~0.11 on xyz.
+   - Loop closure (+150–250 LOC) → near-zero gain on xyz, but could crush
+     Room (1.79 → ~1.0). Room is the worst outlier AND has no published mono
+     reference, so landing at ~1.0 m would be the first credible monocular
+     number for fr1/room in the literature. That is a more interesting
+     contribution than shaving 0.02 m off xyz.
+
+3. **Do not frame this as "catching ORB-SLAM".** 19–40× gap at ~1/75th the
+   LOC is the real story. Match-`twitchslam`-at-400-LOC is the honest
+   framing. Published ORB-SLAM is a 30K-LOC production system — not an
+   incremental target.
+
+4. **Treat fr1/rpy numbers with care.** No published mono reference exists
+   and the sequence is rotation-heavy (degenerate for mono init). Keep as a
+   regression guard but do not treat the 0.098 m number as a meaningful
+   accuracy claim — it is compared against nothing.
+
+Recommended next step: loop closure on Room. Biggest novelty, worst current
+gap, and the missing literature reference means there is actually something
+to say.
 
 ---
 
