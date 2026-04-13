@@ -52,6 +52,11 @@ Use these first when summarizing benchmark state:
 - If you promote an old experiment into the active repo, give it a stable in-tree name (like `simple_slam_c_brief.c`) and add it to the benchmark tables.
 - When changing benchmark-visible behavior, keep naming/versioning clear enough that a later agent can tell which results are canonical and which are exploratory.
 
+## Git Workflow
+- Do not create a new branch by default. Work on the current branch unless the user explicitly asks for a branch or there is a clear repo-specific reason to isolate the work.
+- Do not commit or push unless the user explicitly asks.
+- If a commit is requested, use the repo's existing Git identity. Do not set or override `git config user.name` / `user.email` to an agent-specific name.
+
 ## Design Philosophy
 - **Pure C Focus:** The primary goal is a library-free C implementation. All architectural improvements should eventually be ported or implemented directly in `simple_slam_c.c`.
 - **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries. Avoid over-engineering while pushing for industry-standard accuracy.

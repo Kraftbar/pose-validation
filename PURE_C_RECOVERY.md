@@ -396,3 +396,37 @@ That targets the observed map-growth plateau directly while avoiding another bro
     - Mean ATE: 0.7028 → 0.7037 (slight net regression)
   - Conclusion: the headline room gain evaporates when measured on the full sequence (n=750 vs spot-check n=621), and desk incurs a real regression above the noise floor. Per the active promotion rule (all-GT validation, no promotion for ATE-neutral changes), projected-search at `SR=80` is rejected. Brute-force BRIEF retained.
   - Takeaway: prev-frame pose as a reloc prior is brittle under rotation/drift on desk and room. A useful future variant would gate radius by rotation magnitude, or use the propagated (constant-velocity) pose rather than the raw prev pose. Not implementing until a cleaner hypothesis emerges.
+
+- Trial: IC-angle rotated BRIEF in `pure_c_brief`
+  - Intent: make the in-tree BRIEF relocalization path rotation-aware without importing the full OpenCV ORB descriptor table.
+  - Implementation: kept the same 256-pair random BRIEF layout, added an intensity-centroid angle over a `31x31` patch, and rotated descriptor sample offsets both at map-point birth and during relocalization matching.
+  - Full canonical `benchmark_native.py --all_gt --force`:
+    - `test_freiburgdesk525`: 0.7410 → 0.7528 (**+0.0118**)
+    - `test_freiburgroom525`: 1.7934 → 1.8392 (**+0.0458**)
+    - `test_freiburgrpy525`:  0.0979 → 0.0996 (+0.0017)
+    - `test_freiburgxyz525`:  0.1788 → 0.1782 (−0.0006, within noise)
+  - Saved trial artifacts under `runs/pure_c_iter/2026-04-13_rbrief_ic_angle/`.
+  - Conclusion: rejected. A tiny xyz gain does not offset the clear desk and room regressions, so this intermediate "rotated random BRIEF" step should not be retried. If ORB-style work resumes, skip to a more faithful descriptor+matching port closer to the `cpp` path.
+
+- Trial: prev-frame BRIEF kNN augmentation in `pure_c_brief`
+  - Intent: port the smallest useful slice of the `cpp` front-end by caching BRIEF descriptors on the previous frame, extracting fresh current-frame corners, kNN-matching prev→curr with Lowe ratio `0.80`, and merging only mapped-point carry-forward matches into the existing KLT track set before PnP / E.
+  - Implementation: no OpenCV or ORB pattern import; reused the in-tree BRIEF-256 descriptor, built a prev-frame descriptor cache, detected up to `1200` fresh current corners each frame, and accepted descriptor matches with `best < 48` and ratio `0.80`. To avoid obvious map blow-up, only previous corners with `pt_idx != -1` were allowed to add new current tracks.
+  - Full canonical `benchmark_native.py --all_gt --force`:
+    - `test_freiburgdesk525`: 0.7410 → 0.7490 (+0.0080)
+    - `test_freiburgroom525`: 1.7934 → 1.8371 (**+0.0437**)
+    - `test_freiburgrpy525`:  0.0979 → 0.0989 (+0.0010)
+    - `test_freiburgxyz525`:  0.1788 → 0.1779 (−0.0009)
+    - Mean ATE: 0.7028 → 0.7157 (net regression)
+  - Saved trial artifacts under `runs/pure_c_iter/2026-04-13_prev_frame_brief_match/`.
+  - Conclusion: rejected. The hoped-for room gain went the wrong way, and even the constrained "mapped-points only" merge still degraded mean ATE. Future descriptor ports should avoid bolting noisy BRIEF matches directly into the KLT track set; a more faithful `cpp`-style path likely needs its own standalone prev/curr feature sets rather than hybridizing against the tracked corner array.
+
+- Trial: separate descriptor-only pose fallback in `pure_c_brief`
+  - Intent: test the cleaner version of the same idea without polluting the KLT track array. Each frame builds an independent BRIEF feature set, matches prev→curr by Hamming kNN (`best < 48`, Lowe ratio `0.80`), and only uses descriptor matches as a rescue E-pose fallback when PnP fails and the normal LK-based E path is weak. No descriptor-based triangulation was allowed.
+  - Implementation: added a per-frame BRIEF feature cache (`feat_corners`, `feat_descs`, `feat_ok`) beside the existing tracked corners; descriptor E was chosen only when LK-E either failed outright or had `< 24` inliers and the descriptor path exceeded it by `> 12` inliers.
+  - Full canonical `benchmark_native.py --all_gt --force`:
+    - `test_freiburgdesk525`: 0.7410 → 0.7480 (+0.0070)
+    - `test_freiburgroom525`: 1.7934 → 1.8243 (**+0.0309**)
+    - `test_freiburgrpy525`:  0.0979 → 0.0989 (+0.0010)
+    - `test_freiburgxyz525`:  0.1788 → 0.1788 (+0.0000)
+  - Saved trial artifacts under `runs/pure_c_iter/2026-04-13_desc_pose_fallback/`.
+  - Conclusion: rejected. Keeping descriptor pose rescue separate from KLT tracks avoids map corruption, but it still hurts room materially and does not buy anything on xyz. The likely lesson is that random BRIEF plus this corner detector is not close enough to the `cpp` ORB front-end to be a useful prev/curr pose source by itself.
