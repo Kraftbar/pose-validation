@@ -75,6 +75,7 @@ static void mat3_vec_mul(const double A[9], const double x[3], double y[3]) { fo
 static double mat3_det(const double A[9]) { return A[0]*(A[4]*A[8]-A[5]*A[7]) - A[1]*(A[3]*A[8]-A[5]*A[6]) + A[2]*(A[3]*A[7]-A[4]*A[6]); }
 static void pose_compose_relative(const Pose* rel, const Pose* prev, Pose* out) { double Rrel[9], Rprev[9], Rout[9], trel[3], tprev[3], tout[3]; pose_get_rotation(rel,Rrel); pose_get_rotation(prev,Rprev); pose_get_translation(rel,trel); pose_get_translation(prev,tprev); mat3_mul(Rrel,Rprev,Rout); mat3_vec_mul(Rrel,tprev,tout); tout[0]+=trel[0]; tout[1]+=trel[1]; tout[2]+=trel[2]; pose_from_rt(Rout,tout,out); }
 static void camera_center_from_pose(const Pose* pose, double c[3]) { double R[9], Rt[9], t[3], tmp[3]; pose_get_rotation(pose,R); pose_get_translation(pose,t); mat3_transpose(R,Rt); mat3_vec_mul(Rt,t,tmp); c[0]=-tmp[0]; c[1]=-tmp[1]; c[2]=-tmp[2]; }
+static void pose_inverse(const Pose* p, Pose* out) { double R[9], Rt[9], t[3], nt[3]; pose_get_rotation(p,R); pose_get_translation(p,t); mat3_transpose(R,Rt); mat3_vec_mul(Rt,t,nt); pose_from_rt(Rt,(double[]){-nt[0],-nt[1],-nt[2]},out); }
 static double rotation_degrees_between(const Pose* a, const Pose* b) { double Ra[9], Rb[9], Rat[9], R[9]; pose_get_rotation(a,Ra); pose_get_rotation(b,Rb); mat3_transpose(Ra,Rat); mat3_mul(Rb,Rat,R); double tr=R[0]+R[4]+R[8], cos_th=(tr-1.0)*0.5; if(cos_th>1)cos_th=1; if(cos_th<-1)cos_th=-1; return acos(cos_th)*180.0/M_PI; }
 static void normalize_point(double fx, double fy, double cx, double cy, Corner p, double out[3]) { out[0]=((double)p.x-cx)/fx; out[1]=((double)p.y-cy)/fy; out[2]=1.0; }
 
@@ -118,7 +119,7 @@ static int estimate_essential_from_indices(const CornerVec* p_pts, const CornerV
 }
 
 static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const MatchVec* matches, double fx, double fy, double cx, double cy, Pose* out_rel, unsigned char** out_mask, int* out_inliers) {
-  const double th=1e-4; const int iters=150; double best_E[9]={0}; int best_inl=0; if(matches->size<8)return 0;
+  const double th=1e-4; const int iters=500; double best_E[9]={0}; int best_inl=0; if(matches->size<8)return 0;
   double *n1=malloc(matches->size*3*sizeof(double)), *n2=malloc(matches->size*3*sizeof(double));
   for(int i=0;i<matches->size;i++){ normalize_point(fx,fy,cx,cy,p_pts->data[matches->data[i].query_idx],&n1[i*3]); normalize_point(fx,fy,cx,cy,c_pts->data[matches->data[i].train_idx],&n2[i*3]); }
   unsigned char* bmask=calloc(matches->size,1); srand(0);
@@ -144,9 +145,10 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
 static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx, double fy, double cx, double cy, Pose* out_pose, int* out_inl) {
   int n=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) n++;
   if(n < 12) return 0;
-  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1) ids[k++] = i;
+  int* ids = malloc(n * sizeof(int)); int k=0; for(int i=0; i<corners->size; i++) if(corners->data[i].pt_idx != -1 && map->data[corners->data[i].pt_idx].obs > 0) ids[k++] = i;
+  n = k; if(n < 12) { free(ids); return 0; }
   double best_P[12]; int best_inl = 0; srand(0);
-  for(int it=0; it<150; it++){
+  for(int it=0; it<500; it++){
     double AtA[144]={0}, W[12], V[144], P[12];
     for(int i=0; i<6; i++){
       int idx = ids[rand()%n]; MapPoint p = map->data[corners->data[idx].pt_idx];
@@ -188,7 +190,7 @@ static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, 
   for (int iter = 0; iter < 10; iter++) {
     double H[36] = {0}, b[6] = {0};
     for (int i = 0; i < corners->size; i++) {
-      if (corners->data[i].pt_idx == -1) continue;
+      if (corners->data[i].pt_idx == -1 || map->data[corners->data[i].pt_idx].obs == 0) continue;
       MapPoint p = map->data[corners->data[i].pt_idx];
       double cp[3] = { R[0]*p.x+R[1]*p.y+R[2]*p.z+t[0], R[3]*p.x+R[4]*p.y+R[5]*p.z+t[1], R[6]*p.x+R[7]*p.y+R[8]*p.z+t[2] };
       if (cp[2] < 0.1) continue;
@@ -196,16 +198,12 @@ static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, 
       double u = fx * cp[0] * inv_z + cx, v = fy * cp[1] * inv_z + cy;
       double du = corners->data[i].x - u, dv = corners->data[i].y - v;
       double err2 = du*du + dv*dv;
-      double weight = (err2 > 4.0) ? 2.0 / sqrt(err2) : 1.0; 
-      double J[2][6] = {
-        { fx*inv_z, 0, -fx*cp[0]*inv_z2, -fx*cp[0]*cp[1]*inv_z2, fx*(1+cp[0]*cp[0]*inv_z2), -fx*cp[1]*inv_z },
-        { 0, fy*inv_z, -fy*cp[1]*inv_z2, -fy*(1+cp[1]*cp[1]*inv_z2), fy*cp[0]*cp[1]*inv_z2, fy*cp[0]*inv_z }
-      };
-      for (int r = 0; r < 6; r++) {
-        b[r] += weight * (J[0][r] * du + J[1][r] * dv);
-        for (int c = 0; c < 6; c++) H[r*6+c] += weight * (J[0][r]*J[0][c] + J[1][r]*J[1][c]);
-      }
+      double weight = (err2 > 4.0) ? 2.0 / sqrt(err2) : 1.0;
+      double J[2][6] = { { fx*inv_z, 0, -fx*cp[0]*inv_z2, -fx*cp[0]*cp[1]*inv_z2, fx*(1+cp[0]*cp[0]*inv_z2), -fx*cp[1]*inv_z },
+                         { 0, fy*inv_z, -fy*cp[1]*inv_z2, -fy*(1+cp[1]*cp[1]*inv_z2), fy*cp[0]*cp[1]*inv_z2, fy*cp[0]*inv_z } };
+      for (int r = 0; r < 6; r++) { b[r] += weight * (J[0][r] * du + J[1][r] * dv); for (int c = 0; c < 6; c++) H[r*6+c] += weight * (J[0][r]*J[0][c] + J[1][r]*J[1][c]); }
     }
+
     for(int i=0; i<6; i++) H[i*6+i] += lambda * H[i*6+i] + 1e-6;
     double dx[6]; if (!solve_6x6(H, b, dx)) break;
     t[0] += dx[0]; t[1] += dx[1]; t[2] += dx[2];
@@ -243,7 +241,17 @@ static void extract_corners_pure(const unsigned char* g, int w, int h, CornerVec
   #pragma omp parallel for collapse(2)
   for(int y=2;y<h-2;y++)for(int x=2;x<w-2;x++){ float Ixx=0,Iyy=0,Ixy=0; for(int i=-1;i<=1;i++)for(int j=-1;j<=1;j++){ float gx=(float)g[(y+i)*w+x+j+1]-g[(y+i)*w+x+j-1], gy=(float)g[(y+i+1)*w+x+j]-g[(y+i-1)*w+x+j]; Ixx+=gx*gx; Iyy+=gy*gy; Ixy+=gx*gy; }
     float det=Ixx*Iyy-Ixy*Ixy, tr=Ixx+Iyy; s[y*w+x]=0.5f*(tr-sqrtf(tr*tr-4.0f*det+1e-6f)); }
-  for(int y=5;y<h-5;y++)for(int x=5;x<w-5;x++){ float val=s[y*w+x]; if(val<0.1f)continue; int ok=1; for(int i=-3;i<=3;i++)for(int j=-3;j<=3;j++) if(s[(y+i)*w+x+j]>val){ok=0;break;} if(ok){corner_vec_push(c,(Corner){(float)x,(float)y,-1}); if(c->size>=max)break;} }
+  for(int y=5;y<h-5;y++)for(int x=5;x<w-5;x++){
+    float val=s[y*w+x]; if(val<0.1f)continue;
+    int ok=1; for(int i=-3;i<=3;i++)for(int j=-3;j<=3;j++) if(s[(y+i)*w+x+j]>val){ok=0;break;}
+    if(ok){
+      float sum=0, sx=0, sy=0;
+      for(int i=-1;i<=1;i++)for(int j=-1;j<=1;j++){ float v=s[(y+i)*w+x+j]; sum+=v; sx+=v*(x+j); sy+=v*(y+i); }
+      if(sum > 1e-6f) corner_vec_push(c,(Corner){sx/sum,sy/sum,-1});
+      else corner_vec_push(c,(Corner){(float)x,(float)y,-1});
+      if(c->size>=max)break;
+    }
+  }
   free(s);
 }
 
@@ -266,7 +274,8 @@ static void track_corners_pure_lk(const unsigned char* p_g, const unsigned char*
           float It = get_pixel_bilinear(cg,lw,lh,nxt_x,nxt_y) - get_pixel_bilinear(pg,lw,lh,cur_x,cur_y);
           G[0]+=Ix*Ix; G[1]+=Ix*Iy; G[3]+=Iy*Iy; b[0]-=Ix*It; b[1]-=Iy*It; }
         G[2]=G[1]; float det=G[0]*G[3]-G[1]*G[2]; if(fabs(det)<1e-6)break;
-        float vx=(G[3]*b[0]-G[1]*b[1])/det, vy=(G[0]*b[1]-G[2]*b[0])/det; l_dx+=vx; l_dy+=vy; if(vx*vx+vy*vy<0.01)break;
+        float vx=(G[3]*b[0]-G[1]*b[1])/det, vy=(G[0]*b[1]-G[2]*b[0])/det; l_dx+=vx; l_dy+=vy;
+        if(vx*vx+vy*vy<1e-6)break;
       }
       dx=l_dx/sc; dy=l_dy/sc;
     }
@@ -314,11 +323,11 @@ static int verify_loop(KFDB* db, int lidx, const unsigned char* cgray, int w, in
 
 static void local_ba(KFDB* db, Map* map, double fx, double fy, double cx, double cy) {
   if (db->size < 3) return;
-  for (int iter = 0; iter < 5; iter++) {
+  for(int iter = 0; iter < 5; iter++) {
+
     for (int k = db->size - 3; k < db->size; k++) {
       refine_pose_lm(map, &db->data[k].corners, fx, fy, cx, cy, &db->data[k].pose);
     }
-    // Shared Map Point Refinement
     for (int i = 0; i < map->size; i++) {
       if (map->data[i].obs < 2) continue;
       double H[9] = {0}, b[3] = {0};
@@ -363,18 +372,21 @@ static Config parse_args(int argc, char** argv){ Config c={"test_kitti984.mp4",5
 int main(int argc, char** argv) {
   Config cfg=parse_args(argc,argv); brief_init_pattern(); FFmpegCap* cap=ffmpeg_open(cfg.video_path); if(!cap){fprintf(stderr,"Failed pipe.\n");return 1;}
   int w=640,h=480; unsigned char *raw=malloc(w*h*3),*pgray=calloc(w*h,1),*cgray=calloc(w*h,1),*cblur=calloc(w*h,1);
-  FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose; pose_identity(&lkf_pose);
+  FrameLite prev={0},curr={0}; FrameStatVec stats={0}; Pose lkf_pose, last_rel; pose_identity(&lkf_pose); pose_identity(&last_rel);
   KFDB kf_db = {0}; Map map = {0}; int frame_id=0,pts=0,tri=0; double start=now_seconds();
   double fx=525.0, fy=525.0, cx=319.5, cy=239.5;
   while(frame_id < (int)(25.0*cfg.seconds) && ffmpeg_read(cap,raw)){
     if(now_seconds()-start > cfg.timeout)break; bgr_to_gray(raw,w,h,cgray); blur_3x3(cgray,w,h,cblur); MatchVec matches={0}; CornerVec tracked={0}; Pose pose,rel; unsigned char* mask=NULL; int inl=0,mkf=0,added=0;
     if(frame_id==0){ extract_corners_pure(cblur,w,h,&curr.corners,1000); mkf=1; pose_identity(&pose); }
-    else { track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
+    else {
+      Pose predicted; pose_compose_relative(&last_rel, &prev.pose, &predicted);
+      track_corners_pure_lk(pgray,cblur,w,h,&prev.corners,&tracked,&matches);
+
       int _nlink=0; for(int _i=0;_i<tracked.size;_i++) if(tracked.data[_i].pt_idx!=-1) _nlink++;
       if(_nlink < 50 && map.size > 100) brief_relink(cblur, w, h, &tracked, &map);
       if(estimate_pose_PnP(&map,&tracked,fx,fy,cx,cy,&pose,&inl)){ refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       else if(estimate_pose_E(&prev.corners,&tracked,&matches,fx,fy,cx,cy,&rel,&mask,&inl)) { pose_compose_relative(&rel,&prev.pose,&pose); refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
-      else pose=prev.pose;
+      else { pose=predicted; refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose); }
       if(inl<40 || rotation_degrees_between(&lkf_pose,&pose)>cfg.kf_max_rot_deg || frame_id%10==0) mkf=1;
       if(mkf){
         if(inl>=8){ for(int j=0; j<matches.size; j++){ double X[3]; if(!mask||!mask[j])continue; if(tracked.data[matches.data[j].train_idx].pt_idx==-1){
@@ -389,7 +401,8 @@ int main(int argc, char** argv) {
       }
       curr.corners=tracked;
     }
-    curr.pose=pose; double c[3]; camera_center_from_pose(&pose,c); frame_stat_vec_push(&stats,(FrameStat){frame_id,inl,mkf,added,pts,{c[0],c[1],c[2]}});
+    curr.pose=pose; if(frame_id > 0) { Pose inv_prev; pose_inverse(&prev.pose, &inv_prev); pose_compose_relative(&pose, &inv_prev, &last_rel); }
+    double c[3]; camera_center_from_pose(&pose,c); frame_stat_vec_push(&stats,(FrameStat){frame_id,inl,mkf,added,pts,{c[0],c[1],c[2]}});
     if((frame_id+1)%10==0)printf("Frames=%d Pts=%d KF=%d Map=%d\n",frame_id+1,pts,kf_db.size,map.size);
     memcpy(pgray,cblur,w*h); free(prev.corners.data); prev=curr; memset(&curr,0,sizeof(curr)); free(matches.data); free(mask); frame_id++;
   }
