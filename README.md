@@ -6,10 +6,11 @@ A lightweight SLAM benchmark repo comparing Python, C++, OpenCV-linked C, and li
 - **`simple_slam.py`**: Python baseline using OpenCV and SciPy.
 - **`simple_slam_opt.cpp`**: Optimized C++ port using OpenCV.
 - **`simple_slam_c.c`**: Current standalone pure C implementation.
-- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~398 LOC`), first-class benchmark variant with in-tree BRIEF-256 relocalization.
+- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~398 LOC`).
+- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (`~480 LOC`) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA. Completed during the 2026 Strategy Pivot.
 
 ## Current GT Tracking
-The benchmark suite now tracks the full **4 GT datasets × 5 implementations = 20 runs** across:
+The benchmark suite now tracks the full **4 GT datasets × 6 implementations = 24 runs** across:
 - `test_freiburgxyz525`
 - `test_freiburgrpy525`
 - `test_freiburgroom525`

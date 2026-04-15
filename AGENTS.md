@@ -25,6 +25,11 @@ Current GT-backed datasets:
 - `test_freiburgroom525`
 - `test_freiburgdesk525`
 
+## Diagnostic Tools
+- `tools/diagnose_trace.py`: Analyzes SLAM metrics JSON against GT NPZ.
+  Usage: `python3 tools/diagnose_trace.py runs/your_metrics.json external/twitchslam/videos/your_gt.npz`
+  Surfaces per-frame translation/rotation error and tracking method.
+
 ## Source of Truth
 Use these first when summarizing benchmark state:
 - `runs/benchmark/gt_tracking.csv`
@@ -58,10 +63,16 @@ Use these first when summarizing benchmark state:
 - If a commit is requested, use the repo's existing Git identity. Do not set or override `git config user.name` / `user.email` to an agent-specific name.
 
 ## Design Philosophy
-- **Pure C Focus:** The primary goal is a library-free C implementation. All architectural improvements should eventually be ported or implemented directly in `simple_slam_c.c`.
-- **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries. Avoid over-engineering while pushing for industry-standard accuracy.
-- **LOC is High Priority:** Small code size (LOC) is a first-class metric alongside ATE RMSE and runtime. Strive for the most "concise yet correct" implementation.
-- **Benchmark Driven:** Accuracy (ATE RMSE) remains the primary goal. Improvements must be empirically verified against GT datasets.
+
+### Phase 1 — Close the ATE gap (active)
+- **Pure C Focus:** The primary goal is a library-free C implementation. The new `simple_slam_c_orb.c` provides a standard ORB-style pipeline (Scale Pyramid, FAST-9, ORB descriptors, Hamming distance, PnP, and Motion-only BA).
+- **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries.
+- **Benchmark Driven:** Accuracy (ATE RMSE) is the primary goal. `pure_c_orb` has achieved parity with other pure C implementations across all GT sequences.
+- **LOC is a tiebreaker, not first-class.** Currently suspended while refining `pure_c_orb`.
+
+### Phase 2 — Compress (gated)
+- **Gate:** activate phase 2 once `pure_c_orb` has mean ATE within 0.02 m of `cpp` across the GT sequences.
+- **LOC is High Priority:** Once gated in, golfing the implementation while maintaining accuracy is the next step.
 
 ## Important Notes
 - `pure_c_brief` is the promoted BRIEF-relocalization snapshot kept in-tree.

@@ -430,3 +430,16 @@ That targets the observed map-growth plateau directly while avoiding another bro
     - `test_freiburgxyz525`:  0.1788 → 0.1788 (+0.0000)
   - Saved trial artifacts under `runs/pure_c_iter/2026-04-13_desc_pose_fallback/`.
   - Conclusion: rejected. Keeping descriptor pose rescue separate from KLT tracks avoids map corruption, but it still hurts room materially and does not buy anything on xyz. The likely lesson is that random BRIEF plus this corner detector is not close enough to the `cpp` ORB front-end to be a useful prev/curr pose source by itself.
+
+
+- Trial: global BA every 10 keyframes in `simple_slam_c_plus.c` (scratch fork of `simple_slam_c_brief.c`)
+  - Intent: see whether a periodic full-map BA pass layered on top of the existing `local_ba` reduces ATE by refining all keyframe poses and all map points together every 10 keyframes. Added `refine_map_point_against_kfs` (Gauss-Newton 3x3 normal equations per point) and `global_ba(kf_db, map, ..., iters=3)` with OpenMP parallel loops over keyframes and map points.
+  - Implementation: `simple_slam_c_plus.c` is `simple_slam_c_brief.c` plus the two new routines and a call site of `if (kf_db.size > 0 && kf_db.size % 10 == 0) global_ba(&kf_db, &map, fx, fy, cx, cy, 3);` right after `local_ba`. No other algorithmic changes.
+  - Full canonical `benchmark_native.py --all_gt --force`:
+    - `test_freiburgdesk525`: 0.7198 → 0.7515 (**+0.0317**, clear regression)
+    - `test_freiburgroom525`: 1.8518 → 1.8304 (−0.0214)
+    - `test_freiburgrpy525`:  0.0992 → 0.0987 (−0.0005, within noise)
+    - `test_freiburgxyz525`:  0.1782 → 0.1781 (−0.0001, within noise)
+    - Point counts grow substantially (e.g. xyz 13429 → 19616, room 21261 → 30745, rpy 27637 → 34101, desk 18874 → 23273) and runtime grows ~1.5x on every sequence.
+  - Conclusion: rejected. Per the AGENTS.md promotion rule, desk's +0.0317 m regression is well outside the ~0.01 m noise floor and disqualifies promotion; the room improvement is only marginally above noise and does not compensate. Map-density growth is expected (more BA iterations lock in more triangulations) but is not a goal. Scratch sources `simple_slam_c_plus.c` and binary `simple_slam_pure_c_plus` are not promoted into the in-tree benchmark roster.
+  - Takeaway: a naive "global BA every N keyframes" at full-map scope is not ATE-positive here. A future variant worth trying would be a windowed BA (last K keyframes + their co-visible map points) rather than all-keyframes/all-points, so the denser map edits do not drag desk away from its current fit.

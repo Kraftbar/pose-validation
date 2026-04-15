@@ -38,7 +38,7 @@ The generated tracking artifacts are:
 `runs/benchmark/gt_tracking.json`, `runs/benchmark/gt_tracking.csv`, and
 `runs/benchmark/gt_tracking.md`.
 
-This section tracks the full **4 GT datasets × 5 implementations = 20 measured runs**.
+This section tracks the full **4 GT datasets × 6 implementations = 24 measured runs**.
 
 Approx implementation size reference:
 
@@ -48,23 +48,24 @@ Approx implementation size reference:
 | `cpp` | ~797 | `simple_slam_opt.cpp` |
 | `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
 | `pure_c` | ~438 | standalone `simple_slam_c.c` only |
-| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c`, now with BRIEF-reloc |
+| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c` |
+| `pure_c_orb` | ~480 | standalone `simple_slam_c_orb.c`, full ORB-SLAM pipeline |
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
 |----------|-----------|---------------|-----------|--------------------|-------|
-| `test_freiburgdesk525` | `python` | **0.6772 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.7934 m | BRIEF relocalization closed the gap from 0.296 m to 0.248 m |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `pure_c_brief` | 0.0979 m | BRIEF snapshot still edges out Python |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c` | 0.1782 m | BRIEF-reloc lost brief its xyz runner-up by 0.0006 m |
+| `test_freiburgdesk525` | `python` | **0.6745 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.8518 m | pure_c_orb matches Python/pure_c baselines |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0982 m | All variants are very close |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `c` | 0.1777 m | pure_c_orb matches at 0.1788 m |
 
-Full 4×5 ATE matrix for the current 30-second run:
+Full 4×6 ATE matrix for the current 30-second run:
 
-| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` |
-|----------|----------|-------|-----|----------|---------------|
-| `test_freiburgdesk525` | **0.6772** | 0.7194 | 0.7563 | 0.7574 | 0.7410 |
-| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8691 | 1.8691 | 1.7934 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0997 | 0.0997 | 0.0979 |
-| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1789 | 0.1782 | 0.1788 |
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` |
+|----------|----------|-------|-----|----------|---------------|--------------|
+| `test_freiburgdesk525` | **0.6745** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7576 |
+| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8669 |
+| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0998 |
+| `test_freiburgxyz525` | 0.1787 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1788 |
 
 Cross-dataset tradeoff summary (mean over the 4 GT datasets):
 

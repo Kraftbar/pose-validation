@@ -27,3 +27,6 @@ Makefile
 
 # Local vendored repos
 external/
+simple_slam_c_orb
+simple_slam_pure_c_orb
+simple_slam_pure_c_plus

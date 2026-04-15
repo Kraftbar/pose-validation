@@ -104,14 +104,9 @@ static int triangulate_point(const Pose* p1, const Pose* p2, Corner pt1, Corner 
   for(int r=0; r<3; r++){ Rt1[r*4+0]=R1[r*3+0]; Rt1[r*4+1]=R1[r*3+1]; Rt1[r*4+2]=R1[r*3+2]; Rt1[r*4+3]=t1[r]; Rt2[r*4+0]=R2[r*3+0]; Rt2[r*4+1]=R2[r*3+1]; Rt2[r*4+2]=R2[r*3+2]; Rt2[r*4+3]=t2[r]; }
   for(int r=0; r<3; r++) for(int c=0; c<4; c++){ P1[r*4+c]=K[r*3+0]*Rt1[c]+K[r*3+1]*Rt1[c+4]+K[r*3+2]*Rt1[c+8]; P2[r*4+c]=K[r*3+0]*Rt2[c]+K[r*3+1]*Rt2[c+4]+K[r*3+2]*Rt2[c+8]; }
   for(int c=0; c<4; c++){ A[0*4+c]=pt1.x*P1[2*4+c]-P1[0*4+c]; A[1*4+c]=pt1.y*P1[2*4+c]-P1[1*4+c]; A[2*4+c]=pt2.x*P2[2*4+c]-P2[0*4+c]; A[3*4+c]=pt2.y*P2[2*4+c]-P2[1*4+c]; }
-  double AtA[16]={0}, V[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-  for(int r=0; r<4; r++) for(int c=0; c<4; c++) for(int k=0; k<4; k++) AtA[r*4+c]+=A[k*4+r]*A[k*4+c];
-  for(int it=0; it<30; it++){ int p=0, q=1; double mv=0; for(int i=0; i<3; i++) for(int j=i+1; j<4; j++) if(fabs(AtA[i*4+j])>mv){mv=fabs(AtA[i*4+j]); p=i; q=j;}
-    if(mv<1e-15)break; double ph=0.5*atan2(2.0*AtA[p*4+q], AtA[q*4+q]-AtA[p*4+p]), co=cos(ph), si=sin(ph);
-    for(int i=0; i<4; i++){ double r1=AtA[i*4+p], r2=AtA[i*4+q]; AtA[i*4+p]=co*r1-si*r2; AtA[i*4+q]=si*r1+co*r2; }
-    for(int i=0; i<4; i++){ double r1=AtA[p*4+i], r2=AtA[q*4+i]; AtA[p*4+i]=co*r1-si*r2; AtA[q*4+i]=si*r1+co*r2; }
-    for(int i=0; i<4; i++){ double v1=V[i*4+p], v2=V[i*4+q]; V[i*4+p]=co*v1-si*v2; V[i*4+q]=si*v1+co*v2; } }
-  int bi=0; double mw=AtA[0]; for(int i=1; i<4; i++) if(AtA[i*4+i]<mw){mw=AtA[i*4+i]; bi=i;} for(int i=0; i<4; i++) VT[i]=V[i*4+bi];
+  double AtA[16]={0}, V[16], W4[4]; for(int r=0; r<4; r++) for(int c=0; c<4; c++) for(int k=0; k<4; k++) AtA[r*4+c]+=A[k*4+r]*A[k*4+c];
+  jacobi_nxn(AtA, 4, W4, V);
+  int bi=0; double mw=W4[0]; for(int i=1; i<4; i++) if(W4[i]<mw){mw=W4[i]; bi=i;} for(int i=0; i<4; i++) VT[i]=V[i*4+bi];
   if(fabs(VT[3])<1e-8)return 0; X[0]=VT[0]/VT[3]; X[1]=VT[1]/VT[3]; X[2]=VT[2]/VT[3];
   double z1=R1[6]*X[0]+R1[7]*X[1]+R1[8]*X[2]+t1[2], z2=R2[6]*X[0]+R2[7]*X[1]+R2[8]*X[2]+t2[2];
   return (isfinite(X[0]) && z1>0 && z2>0);
@@ -134,7 +129,7 @@ static int estimate_essential_from_indices(const CornerVec* p_pts, const CornerV
   for(int i=0; i<n; i++){ double x1[3], x2[3], A[9]; Match m=matches->data[idxs[i]]; normalize_point(fx,fy,cx,cy,p_pts->data[m.query_idx],x1); normalize_point(fx,fy,cx,cy,c_pts->data[m.train_idx],x2);
     A[0]=x2[0]*x1[0]; A[1]=x2[0]*x1[1]; A[2]=x2[0]; A[3]=x2[1]*x1[0]; A[4]=x2[1]*x1[1]; A[5]=x2[1]; A[6]=x1[0]; A[7]=x1[1]; A[8]=1.0;
     for(int r=0; r<9; r++) for(int c=0; c<9; c++) AtA[r*9+c]+=A[r]*A[c]; }
-  jacobi_9x9(AtA,W,V); int bi=0; double mw=W[0]; for(int k=1; k<9; k++) if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0; k<9; k++) E[k]=V[k*9+bi]; return 1;
+  jacobi_nxn(AtA,9,W,V); int bi=0; double mw=W[0]; for(int k=1; k<9; k++) if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0; k<9; k++) E[k]=V[k*9+bi]; return 1;
 }
 
 static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const MatchVec* matches, double fx, double fy, double cx, double cy, Pose* out_rel, unsigned char** out_mask, int* out_inliers) {
@@ -146,7 +141,7 @@ static int estimate_pose_E(const CornerVec* p_pts, const CornerVec* c_pts, const
     int smp[8]; unsigned char used[4096]={0}; double cand_E[9], AtA[81]={0}, W[9], V[81];
     for(int j=0;j<8;j++){ int idx; do{idx=rand()%matches->size;}while(used[idx%4096]); used[idx%4096]=1; smp[j]=idx; }
     for(int k=0;k<8;k++){ double *x1=&n1[smp[k]*3], *x2=&n2[smp[k]*3], A[9]={x2[0]*x1[0],x2[0]*x1[1],x2[0],x2[1]*x1[0],x2[1]*x1[1],x2[1],x1[0],x1[1],1.0}; for(int r=0;r<9;r++)for(int c=0;c<9;c++)AtA[r*9+c]+=A[r]*A[c]; }
-    jacobi_9x9(AtA,W,V); int bi=0; double mw=W[0]; for(int k=1;k<9;k++)if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0;k<9;k++) cand_E[k]=V[k*9+bi];
+    jacobi_nxn(AtA,9,W,V); int bi=0; double mw=W[0]; for(int k=1;k<9;k++)if(W[k]<mw){mw=W[k]; bi=k;} for(int k=0;k<9;k++) cand_E[k]=V[k*9+bi];
     enforce_essential_constraints(cand_E); int inl=0; double Et[9]; mat3_transpose(cand_E,Et);
     for(int j=0;j<matches->size;j++){ double *x1=&n1[j*3], *x2=&n2[j*3], Ex1[3]={cand_E[0]*x1[0]+cand_E[1]*x1[1]+cand_E[2], cand_E[3]*x1[0]+cand_E[4]*x1[1]+cand_E[5], cand_E[6]*x1[0]+cand_E[7]*x1[1]+cand_E[8]}, Etx2[3]={Et[0]*x2[0]+Et[1]*x2[1]+Et[2], Et[3]*x2[0]+Et[4]*x2[1]+Et[5], Et[6]*x2[0]+Et[7]*x2[1]+Et[8]}, num=x2[0]*Ex1[0]+x2[1]*Ex1[1]+Ex1[2], den=Ex1[0]*Ex1[0]+Ex1[1]*Ex1[1]+Etx2[0]*Etx2[0]+Etx2[1]*Etx2[1]+1e-12; if(num*num/den<th)inl++; }
     if(inl>best_inl){best_inl=inl; memcpy(best_E,cand_E,9*sizeof(double)); if(inl > matches->size*0.95) break; }
@@ -178,11 +173,9 @@ static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx
       double r1[12]={p.x,p.y,p.z,1, 0,0,0,0, -u*p.x,-u*p.y,-u*p.z,-u}, r2[12]={0,0,0,0, p.x,p.y,p.z,1, -v*p.x,-v*p.y,-v*p.z,-v};
       for(int r=0; r<12; r++) for(int c=0; c<12; c++) AtA[r*12+c] += r1[r]*r1[c] + r2[r]*r2[c];
     }
-    jacobi_12x12(AtA, W, V); int bi=0; double mw=W[0]; for(int j=1;j<12;j++) if(W[j]<mw){mw=W[j]; bi=j;}
+    jacobi_nxn(AtA, 12, W, V); int bi=0; double mw=W[0]; for(int j=1;j<12;j++) if(W[j]<mw){mw=W[j]; bi=j;}
     for(int j=0; j<12; j++) P[j] = V[j*12+bi];
-    int inl=0; double err_sum=0, R[9]={P[0],P[1],P[2], P[4],P[5],P[6], P[8],P[9],P[10]}, t[3]={P[3],P[7],P[11]};
-    double sc = 1.0 / sqrt(R[6]*R[6] + R[7]*R[7] + R[8]*R[8]); if(P[11]*sc < 0) sc = -sc;
-    for(int j=0; j<9; j++) R[j]*=sc; for(int j=0; j<3; j++) t[j]*=sc;
+    int inl=0; double err_sum=0, R[9], t[3]; pnp_unpack(P, R, t);
     for(int j=0; j<n; j++){
       MapPoint p = map->data[corners->data[ids[j]].pt_idx];
       double cx_p = R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0], cy_p = R[3]*p.x + R[4]*p.y + R[5]*p.z + t[1], cz_p = R[6]*p.x + R[7]*p.y + R[8]*p.z + t[2];
@@ -195,12 +188,7 @@ static int estimate_pose_PnP(const Map* map, const CornerVec* corners, double fx
     if(inl > n * 0.8) break;
   }
   if(best_inl >= 12){
-    double R[9]={best_P[0],best_P[1],best_P[2], best_P[4],best_P[5],best_P[6], best_P[8],best_P[9],best_P[10]}, t[3]={best_P[3],best_P[7],best_P[11]};
-    double sc = 1.0 / sqrt(R[6]*R[6] + R[7]*R[7] + R[8]*R[8]); if(best_P[11]*sc < 0) sc = -sc;
-    for(int j=0; j<9; j++) R[j]*=sc; for(int j=0; j<3; j++) t[j]*=sc;
-    double W[3], U[9], V[9], Ro[9]; svd_3x3(R, W, U, V);
-    double VT[9]; for(int i=0;i<3;i++)for(int j=0;j<3;j++)VT[i*3+j]=V[j*3+i]; mat3_mul(U, VT, Ro);
-    if(mat3_det(Ro) < 0) for(int j=0;j<9;j++) Ro[j]=-Ro[j];
+    double R[9], t[3], Ro[9]; pnp_unpack(best_P, R, t); project_to_SO3(R, Ro);
     pose_from_rt(Ro, t, out_pose); *out_inl = best_inl; free(ids); return 1;
   }
   free(ids); return 0;
@@ -238,11 +226,9 @@ static void refine_pose_lm(const Map* map, const CornerVec* corners, double fx, 
     double dx[6]; if (!solve_6x6(H, b, dx)) break;
     {
       double cand_t[3] = { t[0] + dx[0], t[1] + dx[1], t[2] + dx[2] };
-      double dr[9] = { 1, -dx[5], dx[4], dx[5], 1, -dx[3], -dx[4], dx[3], 1 }, Rn[9], cand_R[9], W[3], U[9], V[9], VT[9];
+      double dr[9] = { 1, -dx[5], dx[4], dx[5], 1, -dx[3], -dx[4], dx[3], 1 }, Rn[9], cand_R[9];
       Pose cand_pose;
-      mat3_mul(dr, R, Rn);
-      svd_3x3(Rn, W, U, V);
-      for(int i=0;i<3;i++)for(int j=0;j<3;j++)VT[i*3+j]=V[j*3+i]; mat3_mul(U, VT, cand_R);
+      mat3_mul(dr, R, Rn); project_to_SO3(Rn, cand_R);
       pose_from_rt(cand_R, cand_t, &cand_pose);
       {
         double cand_cost = pose_reprojection_cost(map, corners, &cand_pose, fx, fy, cx, cy);

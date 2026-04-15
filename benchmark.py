@@ -22,7 +22,7 @@ import numpy as np
 
 
 DEFAULT_BENCHMARK_SECONDS = 30.0
-IMPLEMENTATIONS = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief')
+IMPLEMENTATIONS = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief', 'pure_c_orb')
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +200,15 @@ def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeo
         ] + extra_args
     if impl == 'pure_c_brief':
         binary = ensure_pure_c_binary(root, source_name='simple_slam_c_brief.c', binary_name='simple_slam_pure_c_brief')
+        return [
+            str(binary),
+            '--video_path', str(video),
+            '--seconds', str(seconds),
+            '--timeout', str(timeout),
+            '--metrics_out', str(out_json),
+        ] + extra_args
+    if impl == 'pure_c_orb':
+        binary = ensure_pure_c_binary(root, source_name='simple_slam_c_orb.c', binary_name='simple_slam_pure_c_orb')
         return [
             str(binary),
             '--video_path', str(video),
