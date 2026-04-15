@@ -17,6 +17,11 @@ Canonical benchmark outputs live in `runs/benchmark/`:
 `gt_tracking.json`, `gt_tracking.csv`, `gt_tracking.md`, and
 `orbslam2_trajectory.txt`.
 
+For paper-style frame-by-frame diagnostics, use `tools/plot_frame_errors.py`
+against the saved per-implementation JSON outputs and the matching GT `.npz`.
+Treat those plots as diagnostic scaffolding; `gt_tracking.csv`, `gt_tracking.md`,
+`summary_all.json`, and this file remain the source of truth for comparisons.
+
 Runs with non-default `--seconds` use suffixed filenames such as
 `test_freiburgxyz525_1s.json` and `summary_1s.json` so they do not overwrite
 the canonical 30-second results.

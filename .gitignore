@@ -30,3 +30,7 @@ external/
 simple_slam_c_orb
 simple_slam_pure_c_orb
 simple_slam_pure_c_plus
+simple_slam_c_brief
+orb_matches.pgm
+*.jpg
+*.pgm

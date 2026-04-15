@@ -34,6 +34,22 @@ For the full tables and LOC-aware comparison, see [BENCHMARKS.md](BENCHMARKS.md)
 python3 benchmark_native.py --all_gt --force
 ```
 
+## Frame-by-Frame GT Plots
+For paper-style error curves, use the saved per-run metrics JSON plus the GT `.npz`.
+
+```bash
+# Compare a few implementations on the xyz sequence
+python3 tools/plot_frame_errors.py \
+  --gt test_freiburgxyz525.npz \
+  --output runs/plots/test_freiburgxyz525_compare.svg \
+  --csv runs/plots/test_freiburgxyz525_compare.csv \
+  python=runs/benchmark/test_freiburgxyz525.json \
+  cpp=runs/benchmark/test_freiburgxyz525_cpp.json \
+  pure_c_orb=runs/benchmark/test_freiburgxyz525_pure_c_orb.json
+```
+
+This produces an SVG with per-frame translation error, plus rotation error when the trace contains rotations. Keep generated plots under `runs/plots/`. For single-run diagnosis and worst-frame inspection, keep using `tools/diagnose_trace.py`.
+
 ## Pure C Binaries
 ```bash
 # Current pure C

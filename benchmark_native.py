@@ -26,7 +26,7 @@ from typing import Iterable
 
 
 DEFAULT_BENCHMARK_SECONDS = 30.0
-IMPLEMENTATION_ORDER = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief', 'pure_c_orb')
+IMPLEMENTATION_ORDER = ('python', 'cpp', 'c', 'pure_c', 'pure_c_brief', 'pure_c_orb', 'pure_c_plus')
 
 
 def seconds_tag(seconds: float) -> str:
