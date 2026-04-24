@@ -43,7 +43,7 @@ The generated tracking artifacts are:
 `runs/benchmark/gt_tracking.json`, `runs/benchmark/gt_tracking.csv`, and
 `runs/benchmark/gt_tracking.md`.
 
-This section tracks the full **4 GT datasets × 6 implementations = 24 measured runs**.
+This section tracks the full **4 GT datasets × 7 implementations = 28 measured runs**.
 
 Approx implementation size reference:
 
@@ -51,45 +51,48 @@ Approx implementation size reference:
 |------|------------|---------------|
 | `python` | ~618 | `simple_slam.py` |
 | `cpp` | ~797 | `simple_slam_opt.cpp` |
-| `c` | ~438 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
-| `pure_c` | ~438 | standalone `simple_slam_c.c` only |
-| `pure_c_brief` | ~398 | standalone `simple_slam_c_brief.c` |
-| `pure_c_orb` | ~480 | standalone `simple_slam_c_orb.c`, full ORB-SLAM pipeline |
+| `c` | ~424 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
+| `pure_c` | ~424 | standalone `simple_slam_c.c` only |
+| `pure_c_brief` | ~409 | standalone `simple_slam_c_brief.c` |
+| `pure_c_orb` | ~466 | standalone `simple_slam_c_orb.c`, full ORB-SLAM pipeline |
+| `pure_c_plus` | ~453 | standalone `simple_slam_c_plus.c`, adds local BA + loop closure |
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
 |----------|-----------|---------------|-----------|--------------------|-------|
-| `test_freiburgdesk525` | `python` | **0.6745 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_brief` | 1.8518 m | pure_c_orb matches Python/pure_c baselines |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0982 m | All variants are very close |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `c` | 0.1777 m | pure_c_orb matches at 0.1788 m |
+| `test_freiburgdesk525` | `python` | **0.6758 m** | `cpp` | 0.7194 m | Only GT set where Python currently leads |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7591 m | `pure_c_plus` closes the pure-C gap vs `cpp` to 0.214 m |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0984 m | All variants within ~0.002 m |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_plus` | 0.1768 m | `pure_c_plus` best pure-C here too |
 
-Full 4×6 ATE matrix for the current 30-second run:
+Full 4×7 ATE matrix for the current 30-second run:
 
-| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` |
-|----------|----------|-------|-----|----------|---------------|--------------|
-| `test_freiburgdesk525` | **0.6745** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7576 |
-| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8669 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0998 |
-| `test_freiburgxyz525` | 0.1787 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1788 |
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
+|----------|----------|-------|-----|----------|-----------------|--------------|---------------|
+| `test_freiburgdesk525` | **0.6758** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7569 | 0.7307 |
+| `test_freiburgroom525` | 1.8656 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8646 | 1.7591 |
+| `test_freiburgrpy525` | 0.0984 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0997 | 0.0990 |
+| `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1768 |
 
 Cross-dataset tradeoff summary (mean over the 4 GT datasets):
 
 | Impl | Approx LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
 |------|------------|---------------|---------|--------------|
-| `python` | ~618 | 0.7050 | 1 | 0 |
 | `cpp` | ~797 | **0.6338** | **3** | 1 |
-| `c` | ~438 core (+274 shim) | 0.7260 | 0 | 0 |
-| `pure_c` | ~438 | 0.7261 | 0 | 1 |
-| `pure_c_brief` | ~398 | **0.7028** | 0 | **2** |
+| `pure_c_plus` | ~453 | **0.6914** | 0 | **2** |
+| `python` | ~618 | 0.7047 | 1 | 1 |
+| `pure_c_brief` | ~409 | 0.7123 | 0 | 0 |
+| `pure_c_orb` | ~466 | 0.7250 | 0 | 0 |
+| `c` | ~424 core (+274 shim) | 0.7258 | 0 | 0 |
+| `pure_c` | ~424 | 0.7258 | 0 | 0 |
 
-Promoted historical pure C snapshot comparison:
+Promoted historical pure C snapshot comparison (fresh 30s canonical run):
 
-| Sequence | `pure_c` current (~438 LOC) | `pure_c_brief` (~398 LOC) | Δ current - `brief` |
-|----------|-----------------------------|--------------------------|-------------------|
-| `test_freiburgdesk525` | 0.7574 | **0.7410** | +0.0164 |
-| `test_freiburgroom525` | 1.8691 | **1.7934** | +0.0757 |
-| `test_freiburgrpy525` | 0.0997 | **0.0979** | +0.0018 |
-| `test_freiburgxyz525` | **0.1782** | 0.1788 | -0.0006 |
+| Sequence | `pure_c` (~424 LOC) | `pure_c_brief` (~409 LOC) | Δ `pure_c` - `brief` |
+|----------|--------------------|-----------------------------|------------------------|
+| `test_freiburgdesk525` | 0.7569 | **0.7198** | +0.0371 |
+| `test_freiburgroom525` | 1.8689 | **1.8518** | +0.0171 |
+| `test_freiburgrpy525` | 0.0998 | **0.0992** | +0.0006 |
+| `test_freiburgxyz525` | **0.1777** | 0.1782 | -0.0005 |
 
 `pure_c_brief` lives in the active repo as `simple_slam_c_brief.c`.
 The original promoted snapshot (~363 LOC) matched the pure C source from `6f7fda6` and `2b688ed`.

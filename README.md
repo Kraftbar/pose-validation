@@ -5,21 +5,23 @@ A lightweight SLAM benchmark repo comparing Python, C++, OpenCV-linked C, and li
 ## Key Implementations
 - **`simple_slam.py`**: Python baseline using OpenCV and SciPy.
 - **`simple_slam_opt.cpp`**: Optimized C++ port using OpenCV.
-- **`simple_slam_c.c`**: Current standalone pure C implementation.
-- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~398 LOC`).
-- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (`~480 LOC`) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA. Completed during the 2026 Strategy Pivot.
+- **`simple_slam_c.c`**: Current standalone pure C implementation (`~424 LOC`).
+- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~409 LOC`).
+- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (`~466 LOC`) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA.
+- **`simple_slam_c_plus.c`**: Pure C with local BA + loop closure (`~453 LOC`) — currently the best pure-C by mean ATE.
 
 ## Current GT Tracking
-The benchmark suite now tracks the full **4 GT datasets × 6 implementations = 24 runs** across:
+The benchmark suite tracks the full **4 GT datasets × 7 implementations = 28 runs** across:
 - `test_freiburgxyz525`
 - `test_freiburgrpy525`
 - `test_freiburgroom525`
 - `test_freiburgdesk525`
 
-Current highlights:
-- **`cpp`**: Best overall tradeoff, with **3 / 4 GT wins**.
+Current highlights (30s canonical run):
+- **`cpp`**: Best overall, **3 / 4 GT wins** (room, rpy, xyz).
 - **`python`**: Best on `test_freiburgdesk525`.
-- **`pure_c_brief`**: Best small-code pure C reference, runner-up on **2 / 4 GT datasets** (room, rpy). Room gap to `cpp` narrowed from 0.296 m to 0.248 m after adding an in-tree BRIEF-256 relocalization path.
+- **`pure_c_plus`**: Best pure-C by mean ATE (0.691 m), runner-up on room and xyz. Beats `pure_c_brief` on 3 / 4 sequences.
+- **`pure_c_brief`**: Best pure-C on desk only (0.720 m); otherwise ranks 3rd–4th among pure-C variants.
 
 The generated tracking artifacts live in `runs/benchmark/`:
 - `gt_tracking.json`
