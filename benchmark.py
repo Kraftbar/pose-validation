@@ -170,10 +170,10 @@ def ensure_pure_c_binary(root: Path, source_name: str = 'simple_slam_c.c', binar
 
 
 def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeout: float,
-                       extra_args: list, out_json: Path) -> list[str]:
+                       extra_args: list, out_json: Path, script_name: str = 'simple_slam.py') -> list[str]:
     if impl == 'python':
         return [
-            sys.executable, 'simple_slam.py',
+            sys.executable, script_name,
             '--video_path', str(video),
             '--seconds', str(seconds),
             '--timeout', str(timeout),
@@ -229,9 +229,9 @@ def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeo
 
 
 def run_slam(root: Path, impl: str, video: Path, seconds: float, timeout: float,
-             extra_args: list, out_json: Path) -> bool:
+             extra_args: list, out_json: Path, script_name: str = 'simple_slam.py') -> bool:
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    cmd = build_slam_command(root, impl, video, seconds, timeout, extra_args, out_json)
+    cmd = build_slam_command(root, impl, video, seconds, timeout, extra_args, out_json, script_name)
     print(f"  $ {' '.join(cmd)}")
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -354,11 +354,14 @@ def main():
     parser.add_argument('--all_gt', action='store_true',
                         help='Benchmark all videos in the repo that have adjacent ground-truth .npz files')
     parser.add_argument('--force', action='store_true', help='Re-run even if output already exists')
+    parser.add_argument('--script', type=str, default='simple_slam.py', help='Python script to use for "python" impl')
+    parser.add_argument('--extra_args', type=str, default='', help='Extra arguments to pass to the SLAM script')
     args = parser.parse_args()
 
     root = Path('.')
     out_dir = Path(args.out_dir)
     impls = parse_impls(args.impl)
+    extra_args_list = args.extra_args.split() if args.extra_args else []
 
     # Discover test videos
     videos = select_gt_videos(root, args.video) if args.all_gt else select_videos(root, args.video)
@@ -384,7 +387,7 @@ def main():
                 print(f"    cached → {out_json}")
                 m = json.loads(out_json.read_text())
             else:
-                ok = run_slam(root, impl, video, args.seconds, args.timeout, [], out_json)
+                ok = run_slam(root, impl, video, args.seconds, args.timeout, extra_args_list, out_json, args.script)
                 if not ok:
                     print(f"    FAILED")
                     results.append({'video': stem, 'impl': impl, 'error': 'slam failed'})

@@ -117,6 +117,25 @@ in `runs/benchmark_history/`.
 | v1.23   | 0.1786 m | 0.1536 m   | 0.3337 m |  52% | 12096       | ~29s | BA gap bug fixed; large videos now run at speed |
 | v1.24   | 0.1789 m | 0.1546 m   | 0.3312 m |  93% | 2577        | ~20s | Local Windowed BA + Sparsity + Sub-pixel refinement |
 
+### April 2026 Optimization Sprint — "The Odometry Wall" (archived)
+
+Six tracking-side experiments (v1.25 – v1.30) evaluated against the full GT
+suite. **None promotable.** Sources archived under `runs/archive_v1xx/`; see
+`PYTHON_TRIALS.md` for full per-version numbers.
+
+| Version | Feature | 30s desk ATE | 30s xyz ATE | Verdict |
+|---------|---------|--------------|-------------|---------|
+| baseline (simple_slam.py) | — | 0.6842 m | 0.1784 m | reference |
+| v1.27   | LK Optical Flow | 0.6890 m | 0.1785 m | ATE-neutral, ~5× fewer points |
+| v1.28   | Motion-model guided | — | — | Broken: 0 points on Freiburg |
+| v1.29   | SIFT + Final Global BA | — | — | Hangs >3 min wall-clock on desk |
+| v1.30   | High-Qual ORB + Final Global BA | — | — | Hangs >3 min wall-clock on desk |
+
+**Finding:** No tracking-side change moved the xyz 30s ATE from its ~0.178 m floor;
+v1.27's 5s lead decayed fully by 30s. The remaining error budget is not in
+feature quality but in scale/drift — the natural next lever is loop closure
+and pose-graph optimization, not better features.
+
 Settings: `--seconds 30 --ba_min_gap_sec 0.5` (BA enabled), all other params default.
 
 #### ORB-SLAM2 (reference)
@@ -300,8 +319,10 @@ python simple_slam.py \
   --ba_min_gap_sec 9999 \
   --metrics_out runs/benchmark/test_freiburgxyz525.json
 
-# Compute ATE from saved metrics
-python benchmark.py --seconds 30 --force
+# Compute ATE from saved metrics (supports custom scripts and extra args)
+python benchmark.py --seconds 30 --force \
+  --script simple_slam.py \
+  --extra_args "--ba_min_gap_sec 0.0"
 
 # Refresh ORB-SLAM2 comparison from the saved trajectory
 python run_orbslam_benchmark.py --skip_run
