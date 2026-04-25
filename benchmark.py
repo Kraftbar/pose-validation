@@ -10,12 +10,15 @@ Usage:
     python benchmark.py --impl all --video test_freiburgxyz525
 """
 import argparse
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -229,18 +232,37 @@ def build_slam_command(root: Path, impl: str, video: Path, seconds: float, timeo
 
 
 def run_slam(root: Path, impl: str, video: Path, seconds: float, timeout: float,
-             extra_args: list, out_json: Path, script_name: str = 'simple_slam.py') -> bool:
+             extra_args: list, out_json: Path, script_name: str = 'simple_slam.py',
+             env: dict | None = None, log: io.StringIO | None = None) -> bool:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_slam_command(root, impl, video, seconds, timeout, extra_args, out_json, script_name)
-    print(f"  $ {' '.join(cmd)}")
-    t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    elapsed = time.time() - t0
+    out = log if log is not None else sys.stdout
+    print(f"  $ {' '.join(cmd)}", file=out)
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
     if r.stdout.strip():
-        print(r.stdout.strip())
+        print(r.stdout.strip(), file=out)
     if r.returncode != 0 and r.stderr.strip():
-        print(r.stderr.strip(), file=sys.stderr)
+        print(r.stderr.strip(), file=out)
     return r.returncode == 0 and out_json.exists()
+
+
+PURE_C_BINARIES = {
+    'pure_c': ('simple_slam_c.c', 'simple_slam_pure_c'),
+    'pure_c_brief': ('simple_slam_c_brief.c', 'simple_slam_pure_c_brief'),
+    'pure_c_orb': ('simple_slam_c_orb.c', 'simple_slam_pure_c_orb'),
+    'pure_c_plus': ('simple_slam_c_plus.c', 'simple_slam_pure_c_plus'),
+}
+
+
+def prebuild_binaries(root: Path, impls: list[str]) -> None:
+    """Build every native binary serially before launching parallel runs, so
+    concurrent workers don't race on `gcc -o <binary>`."""
+    for impl in impls:
+        if impl in {'cpp', 'c'}:
+            ensure_native_binary(root, impl)
+        elif impl in PURE_C_BINARIES:
+            src, bin_name = PURE_C_BINARIES[impl]
+            ensure_pure_c_binary(root, source_name=src, binary_name=bin_name)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +378,8 @@ def main():
     parser.add_argument('--force', action='store_true', help='Re-run even if output already exists')
     parser.add_argument('--script', type=str, default='simple_slam.py', help='Python script to use for "python" impl')
     parser.add_argument('--extra_args', type=str, default='', help='Extra arguments to pass to the SLAM script')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel SLAM jobs (default 1 = serial). Sets OMP_NUM_THREADS=1 in children when >1.')
     args = parser.parse_args()
 
     root = Path('.')
@@ -375,74 +399,122 @@ def main():
     print(f"Benchmarking {len(videos)} videos x {len(impls)} impls  ({args.seconds}s each)")
     print(f"{'='*60}\n")
 
+    # Build flat job list
+    jobs = []
     for video in videos:
-        stem = video.stem
-        gt_npz = video.with_suffix('.npz')
-
-        print(f"[{stem}]")
         for impl in impls:
-            out_json = benchmark_json_path(out_dir, stem, args.seconds, impl)
-            print(f"  ({impl})")
-            if out_json.exists() and not args.force:
-                print(f"    cached → {out_json}")
-                m = json.loads(out_json.read_text())
-            else:
-                ok = run_slam(root, impl, video, args.seconds, args.timeout, extra_args_list, out_json, args.script)
-                if not ok:
-                    print(f"    FAILED")
-                    results.append({'video': stem, 'impl': impl, 'error': 'slam failed'})
-                    continue
-                m = json.loads(out_json.read_text())
+            out_json = benchmark_json_path(out_dir, video.stem, args.seconds, impl)
+            jobs.append({'video': video, 'impl': impl, 'out_json': out_json,
+                         'gt_npz': video.with_suffix('.npz'),
+                         'cached': out_json.exists() and not args.force})
 
-            row = {
-                'video': stem,
-                'impl': impl,
-                'frames': m.get('frames', 0),
-                'points': m.get('points', 0),
-                'keyframes': m.get('keyframes', 0),
-                'avg_inliers': round(m.get('avg_inliers_after_first', 0.0), 2),
-                'pnp_frames': m.get('pnp_frames', 0),
-                'ba_runs': m.get('ba_runs', 0),
-                'duration_sec': m.get('duration_sec', 0.0),
-                'heuristic_score': round(heuristic_score(m), 1),
-                'out_json': str(out_json),
-            }
+    # Pre-build binaries up front so parallel runs don't race on `gcc -o`.
+    if args.workers > 1:
+        prebuild_binaries(root, impls)
 
-            if gt_npz.exists():
-                timeline = m.get('timeline', [])
-                est_xyz = [f['xyz'] for f in timeline if 'xyz' in f]
-                if len(est_xyz) >= 3:
-                    est = np.array(est_xyz, dtype=np.float64)
-                    gt_all = load_gt_centers(str(gt_npz))
-                    frame_ids = [f['frame_id'] for f in timeline if 'xyz' in f]
-                    valid = [i for i, fid in enumerate(frame_ids) if fid < len(gt_all)]
-                    if len(valid) >= 3:
-                        est_matched = est[valid]
-                        gt_matched = gt_all[[frame_ids[i] for i in valid]]
-                        ate = ate_rmse(est_matched, gt_matched)
-                        row.update({
-                            'ate_rmse': round(ate['ate_rmse'], 4),
-                            'ate_median': round(ate['ate_median'], 4),
-                            'ate_max': round(ate['ate_max'], 4),
-                            'ate_scale': float(ate['scale']),
-                            'ate_scale_display': format_scale(ate['scale']),
-                            'ate_n': ate['n_frames'],
-                        })
-                    else:
-                        row['ate_note'] = 'not enough matched frames'
+    child_env = None
+    effective_timeout = args.timeout
+    if args.workers > 1:
+        child_env = os.environ.copy()
+        # Cap each child's OpenMP thread count so workers don't oversubscribe
+        # on heavy OpenMP impls (pure_c_plus). Bump per-run timeout to absorb
+        # the resulting per-binary slowdown so runs still finish all frames.
+        cores = os.cpu_count() or 1
+        child_env['OMP_NUM_THREADS'] = str(max(1, cores // args.workers))
+        effective_timeout = max(args.timeout, args.timeout * args.workers / 2)
+        print(f"[parallel] workers={args.workers} OMP_NUM_THREADS={child_env['OMP_NUM_THREADS']} "
+              f"timeout={effective_timeout:.0f}s")
+
+    def execute(job):
+        out_json = job['out_json']
+        log = io.StringIO()
+        print(f"[{job['video'].stem}] ({job['impl']})", file=log)
+        if job['cached']:
+            print(f"    cached → {out_json}", file=log)
+            return job, True, log.getvalue()
+        ok = run_slam(root, job['impl'], job['video'], args.seconds, effective_timeout,
+                      extra_args_list, out_json, args.script, env=child_env, log=log)
+        if not ok:
+            print(f"    FAILED", file=log)
+        return job, ok, log.getvalue()
+
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(execute, j) for j in jobs]
+            outcomes = []
+            for fut in as_completed(futures):
+                job, ok, log_text = fut.result()
+                sys.stdout.write(log_text)
+                sys.stdout.flush()
+                outcomes.append((job, ok))
+        # Re-order by original job order so results table is stable.
+        order = {id(j): i for i, j in enumerate(jobs)}
+        outcomes.sort(key=lambda jb: order[id(jb[0])])
+    else:
+        outcomes = []
+        for job in jobs:
+            _, ok, log_text = execute(job)
+            sys.stdout.write(log_text)
+            sys.stdout.flush()
+            outcomes.append((job, ok))
+
+    # Aggregate sequentially from saved JSONs.
+    for job, ok in outcomes:
+        stem = job['video'].stem
+        impl = job['impl']
+        out_json = job['out_json']
+        gt_npz = job['gt_npz']
+        if not ok:
+            results.append({'video': stem, 'impl': impl, 'error': 'slam failed'})
+            continue
+        m = json.loads(out_json.read_text())
+        row = {
+            'video': stem,
+            'impl': impl,
+            'frames': m.get('frames', 0),
+            'points': m.get('points', 0),
+            'keyframes': m.get('keyframes', 0),
+            'avg_inliers': round(m.get('avg_inliers_after_first', 0.0), 2),
+            'pnp_frames': m.get('pnp_frames', 0),
+            'ba_runs': m.get('ba_runs', 0),
+            'duration_sec': m.get('duration_sec', 0.0),
+            'heuristic_score': round(heuristic_score(m), 1),
+            'out_json': str(out_json),
+        }
+        if gt_npz.exists():
+            timeline = m.get('timeline', [])
+            est_xyz = [f['xyz'] for f in timeline if 'xyz' in f]
+            if len(est_xyz) >= 3:
+                est = np.array(est_xyz, dtype=np.float64)
+                gt_all = load_gt_centers(str(gt_npz))
+                frame_ids = [f['frame_id'] for f in timeline if 'xyz' in f]
+                valid = [i for i, fid in enumerate(frame_ids) if fid < len(gt_all)]
+                if len(valid) >= 3:
+                    est_matched = est[valid]
+                    gt_matched = gt_all[[frame_ids[i] for i in valid]]
+                    ate = ate_rmse(est_matched, gt_matched)
+                    row.update({
+                        'ate_rmse': round(ate['ate_rmse'], 4),
+                        'ate_median': round(ate['ate_median'], 4),
+                        'ate_max': round(ate['ate_max'], 4),
+                        'ate_scale': float(ate['scale']),
+                        'ate_scale_display': format_scale(ate['scale']),
+                        'ate_n': ate['n_frames'],
+                    })
                 else:
-                    row['ate_note'] = 'no xyz in timeline (re-run to update)'
+                    row['ate_note'] = 'not enough matched frames'
             else:
-                row['ate_note'] = 'no GT'
-
-            results.append(row)
-            print(f"    frames={row['frames']}  points={row['points']}  kf={row['keyframes']}  "
-                  f"avg_inl={row['avg_inliers']}  score={row['heuristic_score']}")
-            if 'ate_rmse' in row:
-                print(f"    ATE  rmse={row['ate_rmse']}  median={row['ate_median']}  "
-                      f"max={row['ate_max']}  scale={row['ate_scale_display']}  n={row['ate_n']}")
-            elif 'ate_note' in row:
-                print(f"    ATE  {row['ate_note']}")
+                row['ate_note'] = 'no xyz in timeline (re-run to update)'
+        else:
+            row['ate_note'] = 'no GT'
+        results.append(row)
+        print(f"  [{stem}] ({impl}) frames={row['frames']}  points={row['points']}  "
+              f"kf={row['keyframes']}  avg_inl={row['avg_inliers']}  score={row['heuristic_score']}")
+        if 'ate_rmse' in row:
+            print(f"    ATE  rmse={row['ate_rmse']}  median={row['ate_median']}  "
+                  f"max={row['ate_max']}  scale={row['ate_scale_display']}  n={row['ate_n']}")
+        elif 'ate_note' in row:
+            print(f"    ATE  {row['ate_note']}")
         print()
 
     # Summary table

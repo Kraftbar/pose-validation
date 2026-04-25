@@ -443,3 +443,21 @@ That targets the observed map-growth plateau directly while avoiding another bro
     - Point counts grow substantially (e.g. xyz 13429 → 19616, room 21261 → 30745, rpy 27637 → 34101, desk 18874 → 23273) and runtime grows ~1.5x on every sequence.
   - Conclusion: rejected. Per the AGENTS.md promotion rule, desk's +0.0317 m regression is well outside the ~0.01 m noise floor and disqualifies promotion; the room improvement is only marginally above noise and does not compensate. Map-density growth is expected (more BA iterations lock in more triangulations) but is not a goal. Scratch sources `simple_slam_c_plus.c` and binary `simple_slam_pure_c_plus` are not promoted into the in-tree benchmark roster.
   - Takeaway: a naive "global BA every N keyframes" at full-map scope is not ATE-positive here. A future variant worth trying would be a windowed BA (last K keyframes + their co-visible map points) rather than all-keyframes/all-points, so the denser map edits do not drag desk away from its current fit.
+
+- Trial: E-fallback translation rescaling in `simple_slam_c_plus.c` (2026-04-25)
+  - Diagnosis: `pure_c_plus` lags `cpp` on room (1.7591 vs 1.5452, +0.2139). Per-frame instrumentation revealed PnP fails on 282/470 frames on room — between frames 160–319 it's 100% E-fallback (159 consecutive frames). Each `estimate_pose_E` returns a unit-length translation; composing 159 unit-translations onto the camera path collapses Umeyama scale to 0.0000 and explains the per-frame error spike at frame ~100.
+  - Hypotheses tested:
+    1. **Disable global_ba** — DISPROVEN. Room got worse (1.7591 → 1.8518) and scale=0.0000 unchanged. global_ba is helping, not hurting.
+    2. **A1: rescale rel.t by ||last_rel.t||** — single-step magnitude. Single-GT timeout artifact made this look great (room 1.7591 → 1.0542 at 30s wall-clock cap). Compounds noise multiplicatively → trajectory magnitudes blow up to 1e15+.
+    3. **A2: rescale rel.t by median of last 8 PnP step magnitudes** — added 8-element ring buffer. Single-GT (30s wall-clock) showed dramatic mean ATE win (0.6914 → 0.5204). Trajectory magnitudes bounded at 1e5–1e6.
+    4. **A3: replace rel.t with last_rel.t directly (E rotation + predicted translation)** — DISPROVEN. Worse than A2 on 3 of 4 sequences; magnitudes explode to 1e40 due to direct positive feedback loop.
+    5. **A4: streak-gated A2 (rescale only on 2nd+ consecutive E-fallback)** — marginally worse mean than A2 (0.5285 vs 0.5204).
+  - **A2 full canonical sweep (`benchmark_native.py --all_gt --force`, 750 frames on room with `--timeout 120`):**
+    - `test_freiburgdesk525`: 0.7307 → 0.7534 (**+0.0227**, clear regression)
+    - `test_freiburgroom525`: 1.7591 → 1.7475 (−0.0116, marginal)
+    - `test_freiburgrpy525`:  0.0990 → 0.0992 (~0.0000)
+    - `test_freiburgxyz525`:  0.1768 → 0.1784 (+0.0016)
+    - Mean: 0.6914 → 0.6696 (−0.0218)
+  - Conclusion: rejected. The dramatic 5–10s wins in single-GT testing were a `--timeout 30` (default wall-clock cap) artifact — the binary terminated room at frame 445 of 750 before divergence had time to accumulate. With the canonical 750-frame run, A2 is essentially ATE-neutral with a desk regression (+0.023 m) outside the 0.01 m band, and a marginal room improvement (−0.012 m) just outside the band the other way. Classic "trades one failure mode for another."
+  - **Methodological lesson:** any `simple_slam_pure_c_plus` direct invocation MUST pass `--timeout 120` (or higher) to match canonical benchmark conditions. Default `--timeout 30` is wall-clock, not video-clock, and silently truncates pure_c_plus runs on room (it processes ~14 fps, so 30s wall-clock = ~445 frames of video). **Single-GT diagnostic results from runs that terminate early are not transferable to canonical conditions.**
+  - Takeaway: scale-from-PnP-history alone doesn't fix the underlying issue — that PnP itself fails for 160 consecutive frames on room. Future work should target the PnP failure root cause (e.g. inlier threshold, RANSAC iterations, or relink behaviour mid-streak) rather than papering over the E-fallback's unit-translation. Or, accept that monocular sequences with insufficient parallax structurally need scale priors (IMU, known depth, etc.) — beyond the scope of a pure SLAM port.

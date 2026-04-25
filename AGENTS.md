@@ -16,6 +16,7 @@ This repo benchmarks multiple SLAM implementations across local monocular datase
 - All GT-backed datasets: `python3 benchmark_native.py --all_gt --force`
 - Single GT dataset: `python3 benchmark_native.py --all_gt --video test_freiburgxyz525 --force`
 - **Fast regression check:** `python3 check_regressions.py` (Runs 5s of all GT sequences)
+- **Parallel mode (~2× faster):** add `--workers 4` to a `benchmark.py --all_gt --impl all` invocation. Each worker gets `nproc / workers` OpenMP threads and the per-run timeout is auto-bumped so OpenMP-heavy impls (e.g. `pure_c_plus`) still finish all frames. Deterministic impls (`cpp`, `c`, `pure_c`, `pure_c_brief`, `pure_c_plus`) reproduce canonical ATE within ±0.0002; `python` and `pure_c_orb` retain their natural run-to-run variance.
 
 ## GT Dataset Discovery
 Benchmark discovery includes:
