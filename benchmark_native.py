@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,13 @@ def summary_json_path(out_dir: Path, seconds: float) -> Path:
     if float(seconds) == DEFAULT_BENCHMARK_SECONDS:
         return out_dir / 'summary_all.json'
     return out_dir / f'summary_all_{seconds_tag(seconds)}.json'
+
+
+def infer_seconds_from_summary_path(path: Path) -> float | None:
+    match = re.fullmatch(r'summary_all_(\d+(?:p\d+)?)s\.json', path.name)
+    if not match:
+        return DEFAULT_BENCHMARK_SECONDS if path.name == 'summary_all.json' else None
+    return float(match.group(1).replace('p', '.'))
 
 
 def run_benchmark(args: argparse.Namespace) -> Path:
@@ -375,6 +383,10 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     source_summary = Path(args.summary_json) if args.summary_json else summary_json_path(out_dir, args.seconds)
+    if args.skip_run and args.summary_json:
+        inferred_seconds = infer_seconds_from_summary_path(source_summary)
+        if inferred_seconds is not None:
+            args.seconds = inferred_seconds
     if not args.skip_run:
         source_summary = run_benchmark(args)
 
