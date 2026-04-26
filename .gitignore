@@ -18,6 +18,7 @@ runs_summary.csv
 
 # System
 .DS_Store
+.codex
 **/CMakeCacheFiles/
 **/build_latex/
 **/CMakeFiles/
