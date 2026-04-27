@@ -34,6 +34,42 @@ The generated tracking artifacts live in `runs/benchmark/`:
 
 For the full tables and LOC-aware comparison, see [BENCHMARKS.md](BENCHMARKS.md).
 
+## Development Philosophy
+
+This repo is built in stages. The goal is not to beat ORB-SLAM2 or RTAB-Map
+directly — those are 30K-LOC production systems, with depth sensors, DBoW
+vocabularies, and years of tuning. The goal is to build a small monocular
+SLAM stack from scratch, in plain C with no external dependencies, where
+every algorithmic step is visible and modifiable.
+
+The project favors:
+
+- **Small, readable implementations.** Math should look like the math on paper:
+  matrices laid out as grids, one equation per line, references to the source
+  texts (Hartley & Zisserman, etc.) where appropriate.
+- **Correctness before performance.** A formatting pass or refactor is
+  acceptable churn if it leaves behavior unchanged (verified by `--all_gt`).
+  Speed work comes after the algorithm is right.
+- **Benchmarks on real GT, not synthetic toys.** All claims are anchored to
+  the four TUM Freiburg sequences with absolute trajectory error — see
+  `BENCHMARKS.md`.
+- **Gradual expansion.** Feature ladder is documented in
+  `BENCHMARKS.md` "Improvement roadmap": local BA → global BA → loop closure
+  → pose-graph optimization. Pick one structural change at a time, validate,
+  promote.
+
+The project does **not** optimize only for lowest line count. After a brief
+"truly pure C" phase that produced unreadable single-statement files, the
+codebase was reformatted to math-on-paper style; LOC roughly tripled and the
+algorithms became much easier to reason about. Code-golf wins are welcome
+once a feature works, never as a substitute for clarity.
+
+Benchmarks are guidance, not a scoreboard. We do not chase ATE numbers by
+hiding behavior behind tuned thresholds, dataset-specific magic constants, or
+silently skipping frames. The roadmap targets — like ~0.09 m on `fr1/xyz`
+with global BA — are stated up-front so the cost (in LOC and complexity) is
+honest.
+
 ## Quick Start
 ```bash
 # Rebuild and benchmark all GT-backed datasets
