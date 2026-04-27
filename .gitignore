@@ -19,6 +19,7 @@ runs_summary.csv
 # System
 .DS_Store
 .codex
+.claude/
 **/CMakeCacheFiles/
 **/build_latex/
 **/CMakeFiles/
