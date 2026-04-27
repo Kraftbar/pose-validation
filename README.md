@@ -5,10 +5,14 @@ A lightweight SLAM benchmark repo comparing Python, C++, OpenCV-linked C, and li
 ## Key Implementations
 - **`simple_slam.py`**: Python baseline using OpenCV and SciPy.
 - **`simple_slam_opt.cpp`**: Optimized C++ port using OpenCV.
-- **`simple_slam_c.c`**: Current standalone pure C implementation (`~424 LOC`).
-- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (`~409 LOC`).
-- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (`~466 LOC`) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA.
-- **`simple_slam_c_plus.c`**: Pure C with local BA + loop closure (`~453 LOC`) — currently the best pure-C by mean ATE.
+- **`simple_slam_c.c`**: Current standalone pure C implementation (~1,300 LOC, ~1,260 code-only).
+- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (~1,300 LOC, ~1,260 code-only).
+- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (~1,440 LOC, ~1,400 code-only) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA.
+- **`simple_slam_c_plus.c`**: Pure C with local BA + loop closure (~1,420 LOC, ~1,365 code-only) — currently the best pure-C by mean ATE.
+
+LOC counts above reflect the current "math-on-paper" layout (one statement per line,
+matrices laid out as grids). Earlier history notes reference the pre-format compact
+counts (~1/3 the current size) — those are not directly comparable.
 
 ## Current GT Tracking
 The benchmark suite tracks the full **4 GT datasets × 7 implementations = 28 runs** across:

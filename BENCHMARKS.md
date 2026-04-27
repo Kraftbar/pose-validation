@@ -45,17 +45,18 @@ The generated tracking artifacts are:
 
 This section tracks the full **4 GT datasets × 7 implementations = 28 measured runs**.
 
-Approx implementation size reference:
+Approx implementation size reference (clang-format / PEP8 normalized;
+`code-only` excludes blanks and comments):
 
-| Impl | Approx LOC | Counting rule |
-|------|------------|---------------|
-| `python` | ~618 | `simple_slam.py` |
-| `cpp` | ~797 | `simple_slam_opt.cpp` |
-| `c` | ~424 core (+274 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
-| `pure_c` | ~424 | standalone `simple_slam_c.c` only |
-| `pure_c_brief` | ~409 | standalone `simple_slam_c_brief.c` |
-| `pure_c_orb` | ~466 | standalone `simple_slam_c_orb.c`, full ORB-SLAM pipeline |
-| `pure_c_plus` | ~453 | standalone `simple_slam_c_plus.c`, adds local BA + loop closure |
+| Impl | Total LOC | Code-only LOC | Counting rule |
+|------|-----------|---------------|---------------|
+| `python` | 618 | 484 | `simple_slam.py` |
+| `cpp` | 797 | 709 | `simple_slam_opt.cpp` |
+| `c` | 1,289 core (+262 shim) | 1,260 (+226 shim) | `simple_slam_c.c` plus `simple_slam_c_shim.cpp/.h` for the OpenCV bridge |
+| `pure_c` | 1,289 | 1,260 | standalone `simple_slam_c.c` only |
+| `pure_c_brief` | 1,288 | 1,260 | standalone `simple_slam_c_brief.c` |
+| `pure_c_orb` | 1,424 | 1,401 | standalone `simple_slam_c_orb.c`, full ORB-SLAM pipeline |
+| `pure_c_plus` | 1,400 | 1,369 | standalone `simple_slam_c_plus.c`, adds local BA + loop closure |
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE | Notes |
 |----------|-----------|---------------|-----------|--------------------|-------|
@@ -73,21 +74,22 @@ Full 4×7 ATE matrix for the current 30-second run:
 | `test_freiburgrpy525` | 0.0984 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0997 | 0.0990 |
 | `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1768 |
 
-Cross-dataset tradeoff summary (mean over the 4 GT datasets):
+Cross-dataset tradeoff summary (mean over the 4 GT datasets); LOC is
+formatted code-only:
 
-| Impl | Approx LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
-|------|------------|---------------|---------|--------------|
-| `cpp` | ~797 | **0.6338** | **3** | 1 |
-| `pure_c_plus` | ~453 | **0.6914** | 0 | **2** |
-| `python` | ~618 | 0.7047 | 1 | 1 |
-| `pure_c_brief` | ~409 | 0.7123 | 0 | 0 |
-| `pure_c_orb` | ~466 | 0.7250 | 0 | 0 |
-| `c` | ~424 core (+274 shim) | 0.7258 | 0 | 0 |
-| `pure_c` | ~424 | 0.7258 | 0 | 0 |
+| Impl | Code-only LOC | Mean ATE RMSE | GT Wins | GT Runner-up |
+|------|---------------|---------------|---------|--------------|
+| `cpp` | 709 | **0.6338** | **3** | 1 |
+| `pure_c_plus` | 1,369 | **0.6914** | 0 | **2** |
+| `python` | 484 | 0.7047 | 1 | 1 |
+| `pure_c_brief` | 1,260 | 0.7123 | 0 | 0 |
+| `pure_c_orb` | 1,401 | 0.7250 | 0 | 0 |
+| `c` | 1,260 (+226 shim) | 0.7258 | 0 | 0 |
+| `pure_c` | 1,260 | 0.7258 | 0 | 0 |
 
 Promoted historical pure C snapshot comparison (fresh 30s canonical run):
 
-| Sequence | `pure_c` (~424 LOC) | `pure_c_brief` (~409 LOC) | Δ `pure_c` - `brief` |
+| Sequence | `pure_c` (1,260 code-only) | `pure_c_brief` (1,260 code-only) | Δ `pure_c` - `brief` |
 |----------|--------------------|-----------------------------|------------------------|
 | `test_freiburgdesk525` | 0.7569 | **0.7198** | +0.0371 |
 | `test_freiburgroom525` | 1.8689 | **1.8518** | +0.0171 |
@@ -95,8 +97,8 @@ Promoted historical pure C snapshot comparison (fresh 30s canonical run):
 | `test_freiburgxyz525` | **0.1777** | 0.1782 | -0.0005 |
 
 `pure_c_brief` lives in the active repo as `simple_slam_c_brief.c`.
-The original promoted snapshot (~363 LOC) matched the pure C source from `6f7fda6` and `2b688ed`.
-Current size (~398 LOC) adds an in-tree BRIEF-256 relocalization path:
+The original promoted snapshot (~363 LOC compact / pre-format) matched the pure C source from `6f7fda6` and `2b688ed`.
+Current size adds an in-tree BRIEF-256 relocalization path:
 on frames where fewer than 50 tracked corners carry a map-point link, the
 unmatched tracked corners are described with a 256-bit BRIEF pattern and
 matched by Hamming distance against the per-point descriptors stored at
@@ -242,20 +244,22 @@ benchmarks multiple systems on TUM but its PDF also didn't parse here.
 ## Improvement roadmap — rough LOC vs. accuracy estimates
 
 Pure-C style, no g2o/ceres. Anchors expectations when planning SLAM work.
+LOC costs below are **clang-format normalized** (one statement per line); roughly
+3× the compact pre-format counts that earlier history notes use.
 
-| Feature | LOC cost | Expected ATE on fr1/xyz (from 0.173 m) |
-|---------|----------|----------------------------------------|
-| Expand local BA window (3 KF → all KFs) | +30–60 | → ~0.15 m |
-| Global BA (full map, sparse LM) | +200–350 | → ~0.11 m |
-| Loop closure detection (BRIEF/DBoW-lite + geometric verify) | +150–250 | xyz: ~0 (no loops); room: 1.79 → ~1.0 |
-| Pose-graph optimization (SE(3) LM) | +100–200 | Only useful with loops |
-| Better init (homography fallback, more RANSAC iters) | +40–80 | Robustness, not RMSE |
-| Keyframe culling + better selection | +30–60 | ~0.01 m |
+| Feature | LOC cost (formatted) | Expected ATE on fr1/xyz (from 0.173 m) |
+|---------|----------------------|----------------------------------------|
+| Expand local BA window (3 KF → all KFs) | +90–180 | → ~0.15 m |
+| Global BA (full map, sparse LM) | +600–1,050 | → ~0.11 m |
+| Loop closure detection (BRIEF/DBoW-lite + geometric verify) | +450–750 | xyz: ~0 (no loops); room: 1.79 → ~1.0 |
+| Pose-graph optimization (SE(3) LM) | +300–600 | Only useful with loops |
+| Better init (homography fallback, more RANSAC iters) | +120–240 | Robustness, not RMSE |
+| Keyframe culling + better selection | +90–180 | ~0.01 m |
 
-**Realistic target:** +~400 LOC (global BA + loop closure) roughly halves error
-to ~0.09 m on xyz, matching *measured* ORB-SLAM2 (0.0752 m). Matching
-*published* 0.009 m would need full DBoW + essential graph + extensive tuning —
-that is the ORB-SLAM2 codebase itself (~30K LOC), not an incremental
+**Realistic target:** +~1,200 LOC formatted (global BA + loop closure) roughly
+halves error to ~0.09 m on xyz, matching *measured* ORB-SLAM2 (0.0752 m).
+Matching *published* 0.009 m would need full DBoW + essential graph + extensive
+tuning — that is the ORB-SLAM2 codebase itself (~30K LOC), not an incremental
 improvement.
 
 Recent frontier has shifted from "lower RMSE" to robustness / don't-regress
@@ -275,19 +279,20 @@ Framing to use when planning future SLAM work in this repo:
    robustness/recovery — keep that direction unless one of the structural
    features below is being added.
 
-2. **Pick one structural feature, commit fully.** Biggest bang-for-LOC:
-   - Global BA (+200–350 LOC) → improves every sequence uniformly,
+2. **Pick one structural feature, commit fully.** Biggest bang-for-LOC
+   (formatted LOC):
+   - Global BA (+600–1,050 LOC) → improves every sequence uniformly,
      ~0.17 → ~0.11 on xyz.
-   - Loop closure (+150–250 LOC) → near-zero gain on xyz, but could crush
+   - Loop closure (+450–750 LOC) → near-zero gain on xyz, but could crush
      Room (1.79 → ~1.0). Room is the worst outlier AND has no published mono
      reference, so landing at ~1.0 m would be the first credible monocular
      number for fr1/room in the literature. That is a more interesting
      contribution than shaving 0.02 m off xyz.
 
-3. **Do not frame this as "catching ORB-SLAM".** 19–40× gap at ~1/75th the
-   LOC is the real story. Match-`twitchslam`-at-400-LOC is the honest
-   framing. Published ORB-SLAM is a 30K-LOC production system — not an
-   incremental target.
+3. **Do not frame this as "catching ORB-SLAM".** 19–40× gap at ~1/20th the
+   LOC is the real story. `pure_c_plus` at ~1.4K formatted lines vs
+   ORB-SLAM2's ~30K is the honest framing. Published ORB-SLAM is a 30K-LOC
+   production system — not an incremental target.
 
 4. **Treat fr1/rpy numbers with care.** No published mono reference exists
    and the sequence is rotation-heavy (degenerate for mono init). Keep as a

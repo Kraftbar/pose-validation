@@ -81,6 +81,7 @@ Use these first when summarizing benchmark state:
 ### Phase 2 — Compress (gated)
 - **Gate:** activate phase 2 once `pure_c_orb` has mean ATE within 0.02 m of `cpp` across the GT sequences.
 - **LOC is High Priority:** Once gated in, golfing the implementation while maintaining accuracy is the next step.
+- **Code style is "math-on-paper":** matrices laid out as grids, one equation per line, no `clang-format`. See `BENCHMARKS.md` for current LOC tables (post-format counts are ~3× the historical compact figures).
 
 ## Important Notes
 - `pure_c_brief` is the promoted BRIEF-relocalization snapshot kept in-tree.
