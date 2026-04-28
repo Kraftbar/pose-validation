@@ -521,3 +521,33 @@ That targets the observed map-growth plateau directly while avoiding another bro
        (a) After RANSAC selects best hypothesis, re-fit DLT using **all inliers** (overdetermined, currently missing — RANSAC just picks the 6-sample best and SO(3)-projects).
        (b) Replace `rand() % n` *with-replacement* sampling with without-replacement (currently a 6-sample can pick the same point twice, degrading geometry).
     2. **Then** revisit `refine_pose_lm` hardening — once PnP rarely outputs explosive starts, an acceptance gate becomes safe to add.
+
+- **2026-04-28 — PnP without-replacement sampling (rejected).** Implemented (b) from the previous entry: replaced `ids[rand() % n]` × 6 with a duplicate-rejecting loop, making every minimal sample 6 *distinct* correspondences. **Sweep was a regression on all 4 sequences:**
+    | Seq | Baseline | Without-replacement | Δ |
+    |---|---|---|---|
+    | desk | 0.7307 | 0.7432 | +0.0125 |
+    | room | 1.7591 | 1.7917 | +0.0326 |
+    | rpy  | 0.0990 | 0.0992 | +0.0002 (noise) |
+    | xyz  | 0.1768 | 0.1783 | +0.0015 (noise) |
+  - Diagnostic: with-replacement was acting as an *implicit degeneracy filter*. When the same point landed twice in the 6-sample, AtA became rank-deficient, the smallest-eigenvalue eigenvector was in the nullspace, P was garbage, the inlier count was ~random, and the hypothesis got discarded. Without-replacement makes 100% of the 500 RANSAC hypotheses solve cleanly, but adds **near-coplanar** 6-samples (common in `room`'s structured indoor geometry) that now produce numerically valid but *geometrically wrong* poses. Those near-degenerate hypotheses sometimes pass the inlier-count gate by luck and become `best_P`, polluting downstream tracking.
+  - Conclusion: rejected, reverted before commit. The "strictly geometric improvement" framing was wrong — the quirks of the existing code are load-bearing.
+  - **Pattern across three failed attempts (trust-region LM, catastrophic-step gate, without-replacement sampling): every "principled fix" to pure_c_plus regresses ATE on at least desk and room.** This strongly suggests the current ATE numbers reflect a fragile fixed point where multiple sub-pathologies cancel each other. Likely fixes that would actually move the needle:
+    - **Replace minimal-sample DLT entirely with P3P (4 points)** — different math, different conditioning regime, doesn't have the rank-deficiency-as-filter property.
+    - **Add geometric degeneracy detection inside RANSAC** — explicit collinearity/coplanarity test on the 6-sample, retry if det(scatter) < threshold. Pairs naturally with without-replacement.
+    - **Or stop tweaking PnP and pivot to a different algorithmic component** (BA hyperparameters, keyframe selection, the 5-pt initial bootstrap) — the room regression isn't necessarily PnP-localized.
+  - **Recommendation: pause `pure_c_plus` algorithm work** and treat the current 0.6914-mean-ATE as the local fixed point. Resuming requires either P3P or a more radical re-architecture, neither of which is a session-sized change.
+
+- **2026-04-28 — Overdetermined-DLT re-fit on RANSAC inlier set (rejected).** Implemented (a) from the previous entry: after RANSAC selects `best_P` from its 6-correspondence minimal-sample search, rebuild `AtA` from all `best_inl` correspondences (typically 30–200+ rows for 12 unknowns), solve the overdetermined DLT, and replace `best_P` if the refined hypothesis retains ≥ 90% of the original inlier count (safety guard against numerically degenerate refits). RANSAC's hypothesis-selection logic untouched. **Sweep was a regression on every sequence:**
+    | Seq | Baseline | Refit | Δ |
+    |---|---|---|---|
+    | desk | 0.7307 | 0.7362 | +0.0055 |
+    | room | 1.7591 | 1.8506 | +0.0915 |
+    | rpy  | 0.0990 | 0.0990 | 0.0000 |
+    | xyz  | 0.1768 | 0.1787 | +0.0019 (noise) |
+  - Diagnostic: the textbook RANSAC + LSQ-refinement pattern made room dramatically *worse* (+9.15 cm). The most plausible explanation: room's inlier set is itself near-coplanar (structured indoor walls), so the overdetermined AtA is just as ill-conditioned as the minimal one — but with more rows, the smallest-eigenvalue eigenvector is now dominated by the noisy directions of the planar configuration rather than reflecting the actual minimal-sample's lucky alignment. The 90% safety guard fired sometimes but not enough to prevent the regression.
+  - Conclusion: rejected, reverted before commit. **Fourth consecutive ATE-regressing attempt** confirms decisively that the current `pure_c_plus` ATE numbers reflect a fragile fixed point: every principled fix — trust-region LM, catastrophic-step gate, without-replacement sampling, overdetermined re-fit — regresses on at least desk and room, with room being the most sensitive.
+  - **Final recommendation: lay it dead at this layer of the abstraction.** No further surgical change to either `estimate_pose_PnP` or `refine_pose_lm` should be attempted. Real movement requires structurally different math:
+    - **P3P (4-correspondence minimal solver, Kneip / Gao / Lambda Twist).** Different math, different conditioning regime, no rank-deficiency-as-filter property.
+    - **Or non-linear pose-only BA from scratch with proper Levenberg-Marquardt + Cauchy/Tukey weights and step-trust-region**, replacing `refine_pose_lm` outright (not patching it).
+    - **Or move the ATE bottleneck investigation upstream**: the room sequence may be limited by the 5-pt initial bootstrap or by keyframe selection, not by the per-frame PnP/LM pipeline.
+  - All four attempts are recorded with numbers above and reverted before commit; only the documentation in this file landed. The commit log shows two doc-only commits (`b56691f` for the first three, plus a follow-up for this fourth entry) and no source-code changes to `simple_slam_c_plus.c`.
