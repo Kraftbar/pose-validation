@@ -73,15 +73,43 @@ Use these first when summarizing benchmark state:
 ## Design Philosophy
 
 ### Phase 1 — Close the ATE gap (active)
-- **Pure C Focus:** The primary goal is a library-free C implementation. The new `simple_slam_c_orb.c` provides a standard ORB-style pipeline (Scale Pyramid, FAST-9, ORB descriptors, Hamming distance, PnP, and Motion-only BA).
+- **Pure C Focus:** The primary goal is a library-free C implementation. `pure_c_plus` (`simple_slam_c_plus.c`) is the current best pure-C variant by mean ATE and the active focus — it adds local BA and loop closure on top of the ORB pipeline established in `simple_slam_c_orb.c` (Scale Pyramid, FAST-9, ORB descriptors, Hamming distance, PnP, Motion-only BA).
 - **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries.
-- **Benchmark Driven:** Accuracy (ATE RMSE) is the primary goal. `pure_c_orb` has achieved parity with other pure C implementations across all GT sequences.
-- **LOC is a tiebreaker, not first-class.** Currently suspended while refining `pure_c_orb`.
+- **Benchmark Driven:** Accuracy (ATE RMSE) is the primary goal. The active blocker is the room-sequence divergence in `pure_c_plus` — see "Current Blockers" below.
+- **LOC is a tiebreaker, not first-class.** Currently suspended while closing the `pure_c_plus` ATE gap.
 
 ### Phase 2 — Compress (gated)
-- **Gate:** activate phase 2 once `pure_c_orb` has mean ATE within 0.02 m of `cpp` across the GT sequences.
+- **Gate:** activate phase 2 once `pure_c_plus` has mean ATE within 0.02 m of `cpp` across the GT sequences.
 - **LOC is High Priority:** Once gated in, golfing the implementation while maintaining accuracy is the next step.
 - **Code style is "math-on-paper":** matrices laid out as grids, one equation per line, no `clang-format`. See `BENCHMARKS.md` for current LOC tables (post-format counts are ~3× the historical compact figures).
+
+## Current Blockers (`pure_c_plus`)
+
+Continuity note for whoever picks up the `pure_c_plus` room-ATE work next.
+
+- **The actual blocker is PnP/`refine_pose_lm` divergence, not loop closure.**
+  On `test_freiburgroom525`, the trajectory explodes long before any loop fires:
+  per-step trace shows `|cur_t|` reaching ~16 m by frame 17 (inliers ~18) and
+  ~44 km by the time the loop detector first triggers. Loop closure on a
+  diverged trajectory cannot recover meaningful ATE.
+- **Naive safety nets break other sequences.** Clamping the LM step in
+  `refine_pose_lm` regressed `rpy` to `xyz=7.9e122` (JSON parse failure).
+  `refine_pose_lm`'s unbounded iterations were acting as an *implicit* safety
+  net; removing their correction power without replacing it with a real
+  trust-region tanks the well-behaved sequences.
+- **Required prereq order before retrying loop closure on `room`:**
+  1. Trust-region LM in `refine_pose_lm` (proper step bounding with reduction-ratio acceptance).
+  2. P3P or overdetermined-DLT PnP (current minimal PnP is the divergence source).
+  3. **Then** loop closure — at that point `verify_loop` can use a metric-consistent PnP-based recovery instead of 5-pt RANSAC.
+- **Phase-1 detector work is parked on `feat/brief-loop-detector`.** The BRIEF
+  256-bit detector (threshold 2700, ~29 fires on room) is implemented and
+  shelved until the prereqs above land. It is *not* a dead end — just gated.
+- **Investigation log:** see `PURE_C_RECOVERY.md` (commit `c1242c7`) for the
+  full diagnostic trace, distribution numbers, and rejected fixes.
+- **Methodological note:** for ad-hoc ATE checks always reuse
+  `benchmark.ate_rmse`. A standalone Umeyama re-implementation produced a
+  spurious 1.0043 m vs the sweep's 1.7767 m on room — that was a bug in the
+  ad-hoc code, not a real improvement.
 
 ## Important Notes
 - `pure_c_brief` is the promoted BRIEF-relocalization snapshot kept in-tree.
