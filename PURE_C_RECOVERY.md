@@ -493,3 +493,31 @@ That targets the observed map-growth plateau directly while avoiding another bro
     - Always re-use `benchmark.ate_rmse` for ad-hoc ATE checks; my standalone Umeyama produced a 0.77 m phantom delta.
     - When investigating divergence, instrument each pipeline stage's output independently before assuming the obvious culprit (BA was the wrong suspect; PnP+refine were the actual ones).
     - "Add a clamp" is rarely a safe one-liner in iterative numerical code: the clamp removes the implicit-correction property that the unclamped iterations relied on.
+
+- **2026-04-28 — Trust-region LM attempt in `refine_pose_lm` (rejected).** Implemented the takeaway from the previous entry: real reduction-ratio LM with `(H + λ·diag(H)) dx = b`, predicted reduction `dx·b − ½ dx^T H dx`, accept on ρ > 0 / shrink λ on ρ > 0.75 / grow λ on ρ ≤ 0.25, reject and retry on ρ ≤ 0, early-exit after 3 consecutive rejected steps or λ > 1e6. 5-second smoke on `room` looked clean (ATE 0.1699 vs prior 0.1641, comparable to other pure-C). **Full 30s `--all_gt` was a strict regression on every sequence:**
+    | Seq | Old | Trust-region LM | Δ |
+    |---|---|---|---|
+    | desk | 0.7307 | 0.7429 | +0.0122 |
+    | room | 1.7591 | 1.8571 | +0.0980 |
+    | rpy  | 0.0990 | 0.0991 | +0.0001 |
+    | xyz  | 0.1768 | 0.1789 | +0.0021 |
+  Map-point counts dropped ~3× (desk 19429→5635, room 26666→7817), runtime dropped ~50% (xyz 53s→27s) — the solver is bailing too early and per-call pose refinement is less complete than under the old unconditional-accept loop. The downstream effect (less-refined pose → fewer matches → fewer triangulations → sparser map) is consistent across all 4 sequences.
+  - Diagnostic: the `chi2 = Σ wᵢ·err2ᵢ` used for ρ is the **Huber M-estimator loss**, but the Hessian/gradient `(H, b) = (Σ wᵢ JᵀJ, Σ wᵢ Jᵀr)` are the Gauss-Newton normal equations for the **squared** loss with weights as constants. The quadratic model `pred = dx·b − ½ dx^T H dx` therefore approximates a *different* loss than what `chi2` measures. Steps that decrease the squared-loss (the model's currency) but slightly raise the M-estimator loss (because a residual crossed the Huber threshold) get spuriously rejected; combined with `stuck >= 3` early-exit, the optimizer leaves accuracy on the table at every call.
+  - Conclusion: rejected, reverted before commit. A correct trust-region LM here needs **either** (a) drop Huber weighting and use plain squared loss with quadratic model, accepting outlier sensitivity, **or** (b) keep Huber but compute `chi2` and `pred` against the same M-estimator loss (replace `H, b` with the IRLS-equivalent or use a saddle-free Huber Hessian). Neither is a small change.
+  - Takeaway: the LM acceptance test must use the same loss the linear model approximates. The current `refine_pose_lm` mixes Huber chi2 with Gauss-Newton normal equations and gets away with it only because steps are accepted unconditionally; adding ρ-gating exposes the inconsistency.
+  - **Next attempt should explore the simpler "chi2 without Huber transformation" path first** — i.e. accept on `Σ err2_i` reduction even though `H, b` use Huber-weighted accumulation. This treats Huber purely as a robust *gradient/Hessian reweighting* (which it is, in IRLS) and lets the acceptance test track the underlying squared loss.
+
+- **2026-04-28 — Catastrophic-step gate in `refine_pose_lm` (rejected).** Much milder follow-up: keep the original unconditional-accept loop intact, only revert a step (and grow λ ×10) if `chi2_new > 10·chi2`, otherwise behave identically to the previous code. Hypothesis: this catches the room frame-17 explosions (where `|t|` jumps from O(1) to O(16) and chi2 grows orders of magnitude) without disturbing legitimate large pull-back corrections. **Sweep was a regression on every sequence:**
+    | Seq | Baseline | Catastrophic gate | Δ |
+    |---|---|---|---|
+    | desk | 0.7307 | 0.7389 | +0.0082 |
+    | room | 1.7591 | 1.8232 | +0.0641 |
+    | rpy  | 0.0990 | 0.0990 | 0.0000 |
+    | xyz  | 0.1768 | 0.1788 | +0.0020 |
+  - Diagnostic: the room regression is the surprising one — that's the sequence the gate was *targeted at*. Tightening to 100× or loosening to 5× will not save this approach. The unconditional-accept iteration appears to genuinely *require* transient chi2 jumps to traverse from a noisy PnP starting pose toward a good local minimum — gating any of those jumps cuts off the implicit-correction property the loop relies on. No fixed `chi2_new/chi2` threshold can distinguish "transient jump on the way to a better basin" from "step into a worse basin."
+  - Conclusion: rejected, reverted before commit. Two consecutive ATE-regressing attempts at modifying `refine_pose_lm` reinforce the order-of-operations claim from the previous entry: **`refine_pose_lm` cannot be hardened in isolation; the upstream PnP starting pose must first be improved**, otherwise any acceptance gating will block the implicit-correction work that's currently masking PnP fragility.
+  - Updated next-step ordering:
+    1. **Improve `estimate_pose_PnP` first.** Two cheap candidates:
+       (a) After RANSAC selects best hypothesis, re-fit DLT using **all inliers** (overdetermined, currently missing — RANSAC just picks the 6-sample best and SO(3)-projects).
+       (b) Replace `rand() % n` *with-replacement* sampling with without-replacement (currently a 6-sample can pick the same point twice, degrading geometry).
+    2. **Then** revisit `refine_pose_lm` hardening — once PnP rarely outputs explosive starts, an acceptance gate becomes safe to add.
