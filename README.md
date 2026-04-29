@@ -161,6 +161,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | Thumbnail-SAD loop threshold tweaks | Loop fires after trajectory is already divergent; no real ATE win. |
 | IC-angle random BRIEF / projected BRIEF / prev-frame BRIEF | Rejected due to desk or room regressions. |
 | PnP-failure BRIEF relink retry | ATE-neutral, room worsened slightly, and rpy timed out at 713/723 frames. |
+| Candidate pose scoring over PnP/E/predicted | Fast 5s looked good, but full sweep collapsed map density and regressed room to 1.8653. |
 
 Likely useful future work requires structurally different math: a real P3P
 solver, a replacement pose-only BA path with consistent robust loss and trust
