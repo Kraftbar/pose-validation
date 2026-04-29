@@ -179,6 +179,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | PnP using only points with `obs >= 2` | Shifted room into E earlier; 8s room ATE worsened to 0.6005 despite higher point count. |
 | Row-normalized PnP DLT equations | Changed map growth shape but worsened 8s room ATE to 0.6424. |
 | BRIEF stale-link pruning before PnP | Thresholds 96 and 128 worsened 8s room ATE to 0.5855 and 0.5942; threshold 160 improved 8s to 0.5349 but regressed full room to 1.8035. |
+| 3px PnP RANSAC inlier radius | Looser candidate scoring starved early map growth and worsened 8s room ATE to 0.6513 with 1756 points. |
 
 Next useful work should start on the PnP side: add a real P3P or
 overdetermined PnP candidate generator and only then feed the result into pose
