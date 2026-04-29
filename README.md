@@ -168,6 +168,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | IC-angle random BRIEF / projected BRIEF / prev-frame BRIEF | Rejected due to desk or room regressions. |
 | PnP-failure BRIEF relink retry | ATE-neutral, room worsened slightly, and rpy timed out at 713/723 frames. |
 | Candidate pose scoring over PnP/E/predicted | Fast 5s looked good, but full sweep collapsed map density and regressed room to 1.8653. |
+| Predicted fallback when PnP fails with many links | Collapsed map density; room moved to 1.8631 and desk to 0.7537. |
 
 Next useful work should start on the PnP side: add a real P3P or
 overdetermined PnP candidate generator and only then feed the result into pose
