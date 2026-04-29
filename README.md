@@ -15,7 +15,7 @@ easy to inspect and change.
 | `pure_c` | `simple_slam_c.c` | Standalone library-free C baseline. |
 | `pure_c_brief` | `simple_slam_c_brief.c` | Promoted pure-C snapshot with BRIEF relocalization. |
 | `pure_c_orb` | `simple_slam_c_orb.c` | Library-free ORB-style pipeline. |
-| `pure_c_plus` | `simple_slam_c_plus.c` | Pure-C local BA / loop-closure variant; active architectural focus, though current generated numbers put `pure_c_brief` ahead by mean ATE. |
+| `pure_c_plus` | `simple_slam_c_plus.c` | Pure-C local BA / loop-closure variant; current best pure-C by mean ATE and active architectural focus. |
 
 ## Quick Start
 
@@ -66,29 +66,29 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `python` | **0.6734 m** | `cpp` | 0.7194 m |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.8506 m |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0982 m |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `python` | 0.1746 m |
+| `test_freiburgdesk525` | `python` | **0.6784 m** | `cpp` | 0.7194 m |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7591 m |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0984 m |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_plus` | 0.1768 m |
 
 Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | **0.6734** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7564 | 0.7362 |
-| `test_freiburgroom525` | 1.8660 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8667 | 1.8506 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0997 | 0.0990 |
-| `test_freiburgxyz525` | 0.1746 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1791 | 0.1787 |
+| `test_freiburgdesk525` | **0.6784** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7567 | 0.7307 |
+| `test_freiburgroom525` | 1.8654 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8677 | 1.7591 |
+| `test_freiburgrpy525` | 0.0984 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0998 | 0.0990 |
+| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1788 | 0.1768 |
 
 Mean ATE over the four GT datasets:
 
 | Impl | Mean ATE RMSE | GT Wins | Runner-up |
 |------|---------------|---------|-----------|
 | `cpp` | **0.6338** | **3** | 1 |
-| `python` | 0.7030 | 1 | 2 |
+| `pure_c_plus` | 0.6914 | 0 | 2 |
+| `python` | 0.7052 | 1 | 1 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
-| `pure_c_plus` | 0.7161 | 0 | 1 |
-| `pure_c_orb` | 0.7255 | 0 | 0 |
+| `pure_c_orb` | 0.7258 | 0 | 0 |
 | `c` | 0.7258 | 0 | 0 |
 | `pure_c` | 0.7258 | 0 | 0 |
 
@@ -135,8 +135,8 @@ on the benchmark utility path.
 
 ## Active Pure-C Blocker
 
-`pure_c_plus` is the active architectural focus, but the current generated
-benchmark table puts `pure_c_brief` ahead by mean ATE. The major blocker is
+`pure_c_plus` is the active architectural focus and current best pure-C variant
+by mean ATE. The major blocker is
 `test_freiburgroom525`: the trajectory diverges before loop closure can help.
 Diagnostics showed `|cur_t|` reaching roughly 16 m by frame 17 and tens of
 kilometers before the first loop candidate.
@@ -160,6 +160,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | E-fallback translation rescaling | Looked good in truncated runs; full sweep regressed desk. |
 | Thumbnail-SAD loop threshold tweaks | Loop fires after trajectory is already divergent; no real ATE win. |
 | IC-angle random BRIEF / projected BRIEF / prev-frame BRIEF | Rejected due to desk or room regressions. |
+| PnP-failure BRIEF relink retry | ATE-neutral, room worsened slightly, and rpy timed out at 713/723 frames. |
 
 Likely useful future work requires structurally different math: a real P3P
 solver, a replacement pose-only BA path with consistent robust loss and trust
@@ -168,8 +169,7 @@ region, or an upstream investigation of initialization/keyframe selection.
 ## Design Direction
 
 Phase 1 is accuracy and robustness. `pure_c_plus` should close the mean ATE gap
-to `cpp` and first regain the pure-C lead over `pure_c_brief`; LOC is only a
-tiebreaker during this phase.
+to `cpp`; LOC is only a tiebreaker during this phase.
 
 Phase 2 starts once `pure_c_plus` is within about `0.02 m` mean ATE of `cpp`.
 At that point, reduce and simplify the implementation while preserving the
@@ -218,7 +218,7 @@ Published monocular ORB-SLAM numbers are available for `fr1/xyz` and
 | Sequence | Published mono reference | This repo current best |
 |----------|--------------------------|------------------------|
 | `fr1/xyz` | ORB-SLAM 2015: 0.009 m | `cpp`: 0.1729 m |
-| `fr1/desk` | ORB-SLAM 2015: 0.017 m | `python`: 0.6734 m |
+| `fr1/desk` | ORB-SLAM 2015: 0.017 m | `python`: 0.6784 m |
 | `fr1/room` | No credible mono reference found | `cpp`: 1.5452 m |
 | `fr1/rpy` | No credible mono reference found | `cpp`: 0.0977 m |
 

@@ -70,9 +70,8 @@ their natural run-to-run variance.
 
 ## Design Constraints
 
-- Phase 1: close the ATE gap. `pure_c_plus` is the active architectural focus,
-  but current generated tables put `pure_c_brief` ahead by mean ATE, so
-  `pure_c_plus` first needs to regain the pure-C lead. LOC is only a tiebreaker.
+- Phase 1: close the ATE gap. `pure_c_plus` is the active architectural focus
+  and current best pure-C variant by mean ATE. LOC is only a tiebreaker.
 - Phase 2: once `pure_c_plus` is within about `0.02 m` mean ATE of `cpp`, reduce
   and simplify the implementation while preserving validated accuracy.
 - Code style is "math on paper": matrices laid out as grids, one equation per
