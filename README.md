@@ -172,6 +172,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | Predicted fallback when PnP fails with many links | Collapsed map density; room moved to 1.8631 and desk to 0.7537. |
 | Reprojection gate on new E triangulations | Starved early room map growth even at loose thresholds; abandoned before full sweep. |
 | Late E-frame new-point caps | Cap 40 moved room to 1.8190 with 16824 points; cap 80 moved room to 1.7833 with 22390 points. |
+| Predicted-pose LM as gated PnP fallback | Gate 40 preserved early growth but moved full room to 1.7774 with 24599 points; gate 80 was a no-op. |
 
 Next useful work should start on the PnP side: add a real P3P or
 overdetermined PnP candidate generator and only then feed the result into pose
