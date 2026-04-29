@@ -1,107 +1,240 @@
 # Pose Validation & SLAM Shootout
 
-A lightweight SLAM benchmark repo comparing Python, C++, OpenCV-linked C, and library-free pure C variants on local monocular sequences.
+This repo benchmarks several monocular SLAM implementations on local video
+datasets, with accuracy measured against TUM-style ground truth when available.
+The active goal is a small, readable, library-free C pipeline whose behavior is
+easy to inspect and change.
 
-## Key Implementations
-- **`simple_slam.py`**: Python baseline using OpenCV and SciPy.
-- **`simple_slam_opt.cpp`**: Optimized C++ port using OpenCV.
-- **`simple_slam_c.c`**: Current standalone pure C implementation (~1,300 LOC, ~1,260 code-only).
-- **`simple_slam_c_brief.c`**: Promoted BRIEF pure C snapshot (~1,300 LOC, ~1,260 code-only).
-- **`simple_slam_c_orb.c`**: Full library-free ORB pipeline (~1,440 LOC, ~1,400 code-only) with scale pyramids, FAST-9, ORB descriptors, PnP, and Motion-only BA.
-- **`simple_slam_c_plus.c`**: Pure C with local BA + loop closure (~1,420 LOC, ~1,365 code-only) — currently the best pure-C by mean ATE.
+## Implementations
 
-LOC counts above reflect the current "math-on-paper" layout (one statement per line,
-matrices laid out as grids). Earlier history notes reference the pre-format compact
-counts (~1/3 the current size) — those are not directly comparable.
-
-## Current GT Tracking
-The benchmark suite tracks the full **4 GT datasets × 7 implementations = 28 runs** across:
-- `test_freiburgxyz525`
-- `test_freiburgrpy525`
-- `test_freiburgroom525`
-- `test_freiburgdesk525`
-
-Current highlights (30s canonical run):
-- **`cpp`**: Best overall, **3 / 4 GT wins** (room, rpy, xyz).
-- **`python`**: Best on `test_freiburgdesk525`.
-- **`pure_c_plus`**: Best pure-C by mean ATE (0.691 m), runner-up on room and xyz. Beats `pure_c_brief` on 3 / 4 sequences.
-- **`pure_c_brief`**: Best pure-C on desk only (0.720 m); otherwise ranks 3rd–4th among pure-C variants.
-
-The generated tracking artifacts live in `runs/benchmark/`:
-- `gt_tracking.json`
-- `gt_tracking.csv`
-- `gt_tracking.md`
-
-For the full tables and LOC-aware comparison, see [BENCHMARKS.md](BENCHMARKS.md).
-
-## Development Philosophy
-
-This repo is built in stages. The goal is not to beat ORB-SLAM2 or RTAB-Map
-directly — those are 30K-LOC production systems, with depth sensors, DBoW
-vocabularies, and years of tuning. The goal is to build a small monocular
-SLAM stack from scratch, in plain C with no external dependencies, where
-every algorithmic step is visible and modifiable.
-
-The project favors:
-
-- **Small, readable implementations.** Math should look like the math on paper:
-  matrices laid out as grids, one equation per line, references to the source
-  texts (Hartley & Zisserman, etc.) where appropriate.
-- **Correctness before performance.** A formatting pass or refactor is
-  acceptable churn if it leaves behavior unchanged (verified by `--all_gt`).
-  Speed work comes after the algorithm is right.
-- **Benchmarks on real GT, not synthetic toys.** All claims are anchored to
-  the four TUM Freiburg sequences with absolute trajectory error — see
-  `BENCHMARKS.md`.
-- **Gradual expansion.** Feature ladder is documented in
-  `BENCHMARKS.md` "Improvement roadmap": local BA → global BA → loop closure
-  → pose-graph optimization. Pick one structural change at a time, validate,
-  promote.
-
-The project does **not** optimize only for lowest line count. After a brief
-"truly pure C" phase that produced unreadable single-statement files, the
-codebase was reformatted to math-on-paper style; LOC roughly tripled and the
-algorithms became much easier to reason about. Code-golf wins are welcome
-once a feature works, never as a substitute for clarity.
-
-Benchmarks are guidance, not a scoreboard. We do not chase ATE numbers by
-hiding behavior behind tuned thresholds, dataset-specific magic constants, or
-silently skipping frames. The roadmap targets — like ~0.09 m on `fr1/xyz`
-with global BA — are stated up-front so the cost (in LOC and complexity) is
-honest.
+| Impl | Source | Notes |
+|------|--------|-------|
+| `python` | `simple_slam.py` | OpenCV/SciPy baseline. |
+| `cpp` | `simple_slam_opt.cpp` | OpenCV C++ baseline and current best mean ATE. |
+| `c` | `simple_slam_c.c` + `simple_slam_c_shim.*` | C core with OpenCV bridge. |
+| `pure_c` | `simple_slam_c.c` | Standalone library-free C baseline. |
+| `pure_c_brief` | `simple_slam_c_brief.c` | Promoted pure-C snapshot with BRIEF relocalization. |
+| `pure_c_orb` | `simple_slam_c_orb.c` | Library-free ORB-style pipeline. |
+| `pure_c_plus` | `simple_slam_c_plus.c` | Pure-C local BA / loop-closure variant; active architectural focus, though current generated numbers put `pure_c_brief` ahead by mean ATE. |
 
 ## Quick Start
+
 ```bash
-# Rebuild and benchmark all GT-backed datasets
+# Fast 5-second regression check across GT-backed sequences
+python3 check_regressions.py
+
+# Canonical full GT benchmark
+python3 benchmark_native.py --all_gt --force
+
+# Single GT dataset while diagnosing
+python3 benchmark_native.py --all_gt --video test_freiburgxyz525 --force
+
+# Native build
+cmake -S . -B build-native
+cmake --build build-native -j
+```
+
+Use `--workers 4` with full benchmark invocations when you want parallel runs.
+The generated benchmark artifacts live under `runs/benchmark/`.
+
+## Ground Truth Datasets
+
+Benchmark discovery includes top-level `test_*.mp4` files with adjacent `.npz`
+ground truth and `external/twitchslam/videos/test_*.mp4` with adjacent `.npz`.
+
+Currently tracked GT sequences:
+
+| Sequence | Notes |
+|----------|-------|
+| `test_freiburgxyz525` | Linear motion, top-level dataset. |
+| `test_freiburgrpy525` | Rotation-heavy sequence. |
+| `test_freiburgroom525` | Wide room sequence and current hard case. |
+| `test_freiburgdesk525` | Fast close-up desk motion. |
+
+`test_kitti984`, `test_countryroad`, and `test_drone` do not currently have GT
+in this repo and are scored only by heuristic metrics.
+
+## Current Benchmark State
+
+Source of truth for generated numbers:
+
+- `runs/benchmark/gt_tracking.csv`
+- `runs/benchmark/gt_tracking.md`
+- `runs/benchmark/summary_all.json`
+
+Latest canonical 30-second GT sweep:
+
+| Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
+|----------|-----------|---------------|-----------|--------------------|
+| `test_freiburgdesk525` | `python` | **0.6734 m** | `cpp` | 0.7194 m |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.8506 m |
+| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0982 m |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `python` | 0.1746 m |
+
+Full 4x7 ATE matrix:
+
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
+|----------|----------|-------|-----|----------|-----------------|--------------|---------------|
+| `test_freiburgdesk525` | **0.6734** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7564 | 0.7362 |
+| `test_freiburgroom525` | 1.8660 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8667 | 1.8506 |
+| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0997 | 0.0990 |
+| `test_freiburgxyz525` | 0.1746 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1791 | 0.1787 |
+
+Mean ATE over the four GT datasets:
+
+| Impl | Mean ATE RMSE | GT Wins | Runner-up |
+|------|---------------|---------|-----------|
+| `cpp` | **0.6338** | **3** | 1 |
+| `python` | 0.7030 | 1 | 2 |
+| `pure_c_brief` | 0.7123 | 0 | 0 |
+| `pure_c_plus` | 0.7161 | 0 | 1 |
+| `pure_c_orb` | 0.7255 | 0 | 0 |
+| `c` | 0.7258 | 0 | 0 |
+| `pure_c` | 0.7258 | 0 | 0 |
+
+## Benchmark Discipline
+
+Any change to SLAM algorithm code or benchmark plumbing must be validated with:
+
+```bash
 python3 benchmark_native.py --all_gt --force
 ```
 
-## Frame-by-Frame GT Plots
-For paper-style error curves, use the saved per-run metrics JSON plus the GT `.npz`.
+Single-dataset runs are for diagnosis only. Do not claim an improvement from a
+single-GT run, a short suffixed run, or an instrumented build. If benchmark
+behavior changes, regenerate the saved outputs before documenting the result.
+
+ATE RMSE is the primary metric. Map density, keyframe count, runtime, and LOC
+are diagnostics. Do not promote ATE-neutral changes across all GT sequences
+just because they improve a secondary metric.
+
+## Diagnostics
+
+Plot per-frame error:
 
 ```bash
-# Compare a few implementations on the xyz sequence
 python3 tools/plot_frame_errors.py \
   --gt test_freiburgxyz525.npz \
-  --output runs/plots/test_freiburgxyz525_compare.svg \
-  --csv runs/plots/test_freiburgxyz525_compare.csv \
-  python=runs/benchmark/test_freiburgxyz525.json \
-  cpp=runs/benchmark/test_freiburgxyz525_cpp.json \
-  pure_c_orb=runs/benchmark/test_freiburgxyz525_pure_c_orb.json
+  --output runs/plots/diag.svg \
+  python=runs/benchmark/test_freiburgxyz525_5s.json \
+  pure_c_plus=runs/benchmark/test_freiburgxyz525_pure_c_plus_5s.json
 ```
 
-This produces an SVG with per-frame translation error, plus rotation error when the trace contains rotations. Keep generated plots under `runs/plots/`. For single-run diagnosis and worst-frame inspection, keep using `tools/diagnose_trace.py`.
+Inspect a saved run against GT:
 
-## Pure C Binaries
 ```bash
-# Current pure C
+python3 tools/diagnose_trace.py \
+  runs/benchmark/test_freiburgxyz525_pure_c_plus_5s.json \
+  test_freiburgxyz525.npz \
+  --top_k 20
+```
+
+Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
+implementation produced a false room improvement, so keep all ATE calculations
+on the benchmark utility path.
+
+## Active Pure-C Blocker
+
+`pure_c_plus` is the active architectural focus, but the current generated
+benchmark table puts `pure_c_brief` ahead by mean ATE. The major blocker is
+`test_freiburgroom525`: the trajectory diverges before loop closure can help.
+Diagnostics showed `|cur_t|` reaching roughly 16 m by frame 17 and tens of
+kilometers before the first loop candidate.
+
+Current conclusion:
+
+- The room failure is rooted in PnP / `refine_pose_lm`, not loop closure.
+- Naive LM clamps, catastrophic-step gates, without-replacement RANSAC sampling,
+  and overdetermined DLT refits all regressed the canonical GT sweep.
+- The current numbers appear to be a fragile fixed point where several
+  sub-pathologies cancel each other.
+
+Do not retry these rejected surgical fixes without a materially new hypothesis:
+
+| Trial | Result |
+|-------|--------|
+| Trust-region LM in `refine_pose_lm` | Regressed all sequences; room +0.098 m. |
+| Catastrophic-step gate in `refine_pose_lm` | Regressed all sequences; room +0.064 m. |
+| PnP without-replacement 6-point samples | Regressed all sequences; room +0.033 m. |
+| RANSAC inlier-set overdetermined DLT refit | Regressed all sequences; room +0.092 m. |
+| E-fallback translation rescaling | Looked good in truncated runs; full sweep regressed desk. |
+| Thumbnail-SAD loop threshold tweaks | Loop fires after trajectory is already divergent; no real ATE win. |
+| IC-angle random BRIEF / projected BRIEF / prev-frame BRIEF | Rejected due to desk or room regressions. |
+
+Likely useful future work requires structurally different math: a real P3P
+solver, a replacement pose-only BA path with consistent robust loss and trust
+region, or an upstream investigation of initialization/keyframe selection.
+
+## Design Direction
+
+Phase 1 is accuracy and robustness. `pure_c_plus` should close the mean ATE gap
+to `cpp` and first regain the pure-C lead over `pure_c_brief`; LOC is only a
+tiebreaker during this phase.
+
+Phase 2 starts once `pure_c_plus` is within about `0.02 m` mean ATE of `cpp`.
+At that point, reduce and simplify the implementation while preserving the
+validated GT numbers.
+
+Code style is deliberately "math on paper": matrices laid out as grids, one
+equation per line, sparse comments where they clarify non-obvious numerical
+steps. Avoid dataset-specific magic constants and hidden frame skipping.
+
+## Native and Pure-C Build Notes
+
+Native OpenCV-backed binaries:
+
+```bash
+cmake -S . -B build-native
+cmake --build build-native -j
+
+./build-native/simple_slam_opt \
+  --video_path test_freiburgxyz525.mp4 \
+  --seconds 1 \
+  --timeout 20 \
+  --metrics_out runs/_smoke_simple_slam_opt.json
+```
+
+Standalone pure C:
+
+```bash
 gcc -O3 -march=native -fopenmp simple_slam_c.c -o simple_slam_pure_c -lm
 
-# BRIEF pure C snapshot
-gcc -O3 -march=native -fopenmp simple_slam_c_brief.c -o simple_slam_pure_c_brief -lm
+./simple_slam_pure_c \
+  --video_path test_freiburgxyz525.mp4 \
+  --seconds 30 \
+  --timeout 120 \
+  --metrics_out runs/pure_c_metrics.json
 ```
 
-## Dataset Notes
-Top-level videos cover the standard local datasets. The extra Freiburg GT-backed sequences are discovered from a local checkout under `external/twitchslam/videos/` when present.
+`simple_slam_c.c` is shared by the OpenCV-shimmed `c` implementation and the
+standalone `pure_c` binary. Do not assume those benchmark entries are identical:
+one uses the shim path, the other is fully standalone.
 
-For technical details on the library-free implementations, see [PURE_C.md](PURE_C.md). For benchmark tables and historical comparisons, see [BENCHMARKS.md](BENCHMARKS.md).
+## Published Reference Context
+
+Published monocular ORB-SLAM numbers are available for `fr1/xyz` and
+`fr1/desk`, but not for `fr1/room` or `fr1/rpy`.
+
+| Sequence | Published mono reference | This repo current best |
+|----------|--------------------------|------------------------|
+| `fr1/xyz` | ORB-SLAM 2015: 0.009 m | `cpp`: 0.1729 m |
+| `fr1/desk` | ORB-SLAM 2015: 0.017 m | `python`: 0.6734 m |
+| `fr1/room` | No credible mono reference found | `cpp`: 1.5452 m |
+| `fr1/rpy` | No credible mono reference found | `cpp`: 0.0977 m |
+
+RGB-D ORB-SLAM2 and RTAB-Map results are useful lower bounds, but they are not
+apples-to-apples comparisons because they use depth.
+
+Reference links:
+
+- ORB-SLAM: https://ar5iv.labs.arxiv.org/html/1502.00956
+- ORB-SLAM2: https://ar5iv.labs.arxiv.org/html/1610.06475
+- ORB-SLAM3: https://ar5iv.labs.arxiv.org/html/2007.11898
+- RTAB-Map 2024 update: https://arxiv.org/html/2403.06341v1
+
+## Repository Hygiene
+
+This README is the canonical human-facing project guide. Generated benchmark
+tables remain under `runs/benchmark/`. Keep one-off experiments in suffixed
+files or dedicated folders such as `runs/pure_c_iter/`,
+`runs/benchmark_history/`, or `runs/archive/`.

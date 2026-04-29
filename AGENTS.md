@@ -1,119 +1,99 @@
 # AGENTS.md
 
-## Repo Purpose
-This repo benchmarks multiple SLAM implementations across local monocular datasets and compares their accuracy, runtime, and code size.
-
-## Implementations
-- `python`: `simple_slam.py`
-- `cpp`: `simple_slam_opt.cpp`
-- `c`: OpenCV-linked `simple_slam_c.c` via `simple_slam_c_shim.cpp/.h`
-- `pure_c`: standalone `simple_slam_c.c`
-- `pure_c_brief`: standalone `simple_slam_c_brief.c`
-- `pure_c_orb`: standalone `simple_slam_c_orb.c` (ORB pipeline)
-- `pure_c_plus`: standalone `simple_slam_c_plus.c` (Adds BA and Loop Closure)
-
-## Canonical Benchmark Commands
-- All GT-backed datasets: `python3 benchmark_native.py --all_gt --force`
-- Single GT dataset: `python3 benchmark_native.py --all_gt --video test_freiburgxyz525 --force`
-- **Fast regression check:** `python3 check_regressions.py` (Runs 5s of all GT sequences)
-- **Parallel mode (~2× faster):** add `--workers 4` to a `benchmark.py --all_gt --impl all` invocation. Each worker gets `nproc / workers` OpenMP threads and the per-run timeout is auto-bumped so OpenMP-heavy impls (e.g. `pure_c_plus`) still finish all frames. Deterministic impls (`cpp`, `c`, `pure_c`, `pure_c_brief`, `pure_c_plus`) reproduce canonical ATE within ±0.0002; `python` and `pure_c_orb` retain their natural run-to-run variance.
-
-## GT Dataset Discovery
-Benchmark discovery includes:
-- top-level `test_*.mp4` files with adjacent `.npz`
-- `external/twitchslam/videos/test_*.mp4` files with adjacent `.npz`
-
-Current GT-backed datasets:
-- `test_freiburgxyz525`
-- `test_freiburgrpy525`
-- `test_freiburgroom525`
-- `test_freiburgdesk525`
-
-## Diagnostic Workflow
-1. **Identify Failure:** Run `python3 check_regressions.py`. If ATE regresses vs the stored baseline, proceed to diagnosis.
-2. **Visualize Error:** Generate a plot for the regressing sequence:
-   `python3 tools/plot_frame_errors.py --gt test_freiburgxyz525.npz --output runs/plots/diag.svg python=runs/benchmark/test_freiburgxyz525_5s.json pure_c_plus=runs/benchmark/test_freiburgxyz525_pure_c_plus_5s.json`
-3. **Inspect Spikes:** Open the SVG. Find the Frame ID where the error curve spikes or drifts sharply.
-4. **Deep Dive:** Use the per-frame tool on that specific frame:
-   `python3 tools/diagnose_trace.py runs/benchmark/test_freiburgxyz525_pure_c_plus_5s.json test_freiburgxyz525.npz --top_k 20`
-   Look for drops in inlier counts or "Method" switches (e.g., from PnP to E) at the drift point.
+Agent-facing rules for this repo. Read `README.md` first for the project guide:
+implementations, benchmark commands, GT dataset list, diagnostics, current
+blockers, rejected trials, and build notes.
 
 ## Source of Truth
+
 Use these first when summarizing benchmark state:
+
 - `runs/benchmark/gt_tracking.csv`
 - `runs/benchmark/gt_tracking.md`
 - `runs/benchmark/summary_all.json`
-- `BENCHMARKS.md`
-
-## Promotion Rule
-- ATE RMSE is the primary accuracy metric. If a candidate change is ATE-neutral across all GT sequences (all deltas within ~0.01 m), do **not** promote it, even if it fixes a diagnosed sub-pathology (e.g. a map-growth plateau) or improves point/keyframe counts. Map density is a diagnostic, not a goal.
-- Watch for silent regressions on sequences other than the one you diagnosed. A neutral ATE with a large map-density drop on another GT sequence is a signal the change trades one failure mode for another.
-- Record rejected trials in `PURE_C_RECOVERY.md` with numbers, so future agents don't retry the same change.
+- `README.md`
 
 ## Benchmark Discipline
-- **Hard rule:** any change to SLAM algorithm code (`simple_slam_c.c`, `pure_c_math.h`, `simple_slam_c_brief.c`, `simple_slam_opt.cpp`, `simple_slam.py`, `simple_slam_c_shim.cpp/.h`) or to benchmark plumbing must be validated with **all GT-backed datasets** before reporting results or committing. Run `python3 benchmark_native.py --all_gt --force`. This covers every `test_*.mp4` that has an adjacent `.npz` GT file (currently the four Freiburg sequences; new GT datasets added later are picked up automatically).
-- A single-GT run (e.g. `benchmark.py --video test_freiburgxyz525 --seconds 30`) is allowed only for diagnosis and iteration while shaping a hypothesis. Do not use a single-GT result as the basis for a promotion decision or for claiming an improvement.
-- Do not describe benchmark improvements in docs unless the saved outputs from `--all_gt` have been regenerated on a clean (non-instrumented) build.
+
+- **Hard rule:** any change to SLAM algorithm code (`simple_slam_c.c`,
+  `pure_c_math.h`, `simple_slam_c_brief.c`, `simple_slam_c_orb.c`,
+  `simple_slam_c_plus.c`, `simple_slam_opt.cpp`, `simple_slam.py`,
+  `simple_slam_c_shim.cpp/.h`) or benchmark plumbing must be validated with:
+
+  ```bash
+  python3 benchmark_native.py --all_gt --force
+  ```
+
+- A single-GT run is allowed only for diagnosis and iteration. Do not claim an
+  improvement from one dataset, short suffixed runs, truncated timeouts, or
+  instrumented builds.
+- Do not describe benchmark improvements in docs unless generated outputs from
+  the full clean `--all_gt` run have been refreshed.
+- For ad-hoc ATE checks, reuse `benchmark.ate_rmse`; do not reimplement Umeyama.
+
+## Promotion Rule
+
+- ATE RMSE is the primary accuracy metric.
+- If a candidate is ATE-neutral across all GT sequences (all deltas within about
+  `0.01 m`), do **not** promote it just because it improves map density,
+  keyframe count, runtime, or code size.
+- Watch for silent regressions on other sequences. A neutral ATE with a large
+  map-density drop elsewhere is a signal the change trades one failure mode for
+  another.
+- Record rejected trials with numbers in `README.md`.
+
+## Parallel Benchmarks
+
+Parallel mode is acceptable for full sweeps:
+
+```bash
+python3 benchmark.py --all_gt --impl all --workers 4
+```
+
+Each worker gets `nproc / workers` OpenMP threads and the per-run timeout is
+auto-bumped so OpenMP-heavy implementations still finish all frames.
+Deterministic impls (`cpp`, `c`, `pure_c`, `pure_c_brief`, `pure_c_plus`)
+reproduce canonical ATE within +/- `0.0002`; `python` and `pure_c_orb` retain
+their natural run-to-run variance.
 
 ## Experiment Versioning
-- Do not overwrite canonical benchmark summaries for one-off experiments unless the experiment is intended to become the new baseline.
+
+- Do not overwrite canonical benchmark summaries for one-off experiments unless
+  the experiment is intended to become the new baseline.
 - Save exploratory runs with explicit suffixes or dedicated folders, for example:
-  - `runs/benchmark/*_1s.json`
-  - `runs/benchmark/*_5s.json`
-  - `runs/benchmark_history/`
-  - `runs/pure_c_iter/`
-- If you promote an old experiment into the active repo, give it a stable in-tree name (like `simple_slam_c_brief.c`) and add it to the benchmark tables.
-- When changing benchmark-visible behavior, keep naming/versioning clear enough that a later agent can tell which results are canonical and which are exploratory.
+  `runs/benchmark/*_1s.json`, `runs/benchmark/*_5s.json`,
+  `runs/benchmark_history/`, or `runs/pure_c_iter/`.
+- If an old experiment is promoted into the active repo, give it a stable
+  in-tree name and add it to the benchmark tables.
+- Keep naming/versioning clear enough that later agents can tell canonical
+  results from exploratory artifacts.
+
+## Design Constraints
+
+- Phase 1: close the ATE gap. `pure_c_plus` is the active architectural focus,
+  but current generated tables put `pure_c_brief` ahead by mean ATE, so
+  `pure_c_plus` first needs to regain the pure-C lead. LOC is only a tiebreaker.
+- Phase 2: once `pure_c_plus` is within about `0.02 m` mean ATE of `cpp`, reduce
+  and simplify the implementation while preserving validated accuracy.
+- Code style is "math on paper": matrices laid out as grids, one equation per
+  line, no broad `clang-format` churn.
+- Do not retry rejected `pure_c_plus` room fixes without a materially new
+  hypothesis. README lists the current blocker and rejected attempts.
+- The BRIEF loop-detector work is parked on branch `feat/brief-loop-detector`.
 
 ## Git Workflow
-- Do not create a new branch by default. Work on the current branch unless the user explicitly asks for a branch or there is a clear repo-specific reason to isolate the work.
+
+- Work on the current branch by default. Do not create a branch unless the user
+  asks or there is a clear repo-specific reason.
 - Do not commit or push unless the user explicitly asks.
-- If a commit is requested, use the repo's existing Git identity. Do not set or override `git config user.name` / `user.email` to an agent-specific name.
-
-## Design Philosophy
-
-### Phase 1 — Close the ATE gap (active)
-- **Pure C Focus:** The primary goal is a library-free C implementation. `pure_c_plus` (`simple_slam_c_plus.c`) is the current best pure-C variant by mean ATE and the active focus — it adds local BA and loop closure on top of the ORB pipeline established in `simple_slam_c_orb.c` (Scale Pyramid, FAST-9, ORB descriptors, Hamming distance, PnP, Motion-only BA).
-- **Simplicity & Separation of Concerns:** Maintain clean, modular code and clear architectural boundaries.
-- **Benchmark Driven:** Accuracy (ATE RMSE) is the primary goal. The active blocker is the room-sequence divergence in `pure_c_plus` — see "Current Blockers" below.
-- **LOC is a tiebreaker, not first-class.** Currently suspended while closing the `pure_c_plus` ATE gap.
-
-### Phase 2 — Compress (gated)
-- **Gate:** activate phase 2 once `pure_c_plus` has mean ATE within 0.02 m of `cpp` across the GT sequences.
-- **LOC is High Priority:** Once gated in, golfing the implementation while maintaining accuracy is the next step.
-- **Code style is "math-on-paper":** matrices laid out as grids, one equation per line, no `clang-format`. See `BENCHMARKS.md` for current LOC tables (post-format counts are ~3× the historical compact figures).
-
-## Current Blockers (`pure_c_plus`)
-
-Continuity note for whoever picks up the `pure_c_plus` room-ATE work next.
-
-- **The actual blocker is PnP/`refine_pose_lm` divergence, not loop closure.**
-  On `test_freiburgroom525`, the trajectory explodes long before any loop fires:
-  per-step trace shows `|cur_t|` reaching ~16 m by frame 17 (inliers ~18) and
-  ~44 km by the time the loop detector first triggers. Loop closure on a
-  diverged trajectory cannot recover meaningful ATE.
-- **Naive safety nets break other sequences.** Clamping the LM step in
-  `refine_pose_lm` regressed `rpy` to `xyz=7.9e122` (JSON parse failure).
-  `refine_pose_lm`'s unbounded iterations were acting as an *implicit* safety
-  net; removing their correction power without replacing it with a real
-  trust-region tanks the well-behaved sequences.
-- **Required prereq order before retrying loop closure on `room`:**
-  1. Trust-region LM in `refine_pose_lm` (proper step bounding with reduction-ratio acceptance).
-  2. P3P or overdetermined-DLT PnP (current minimal PnP is the divergence source).
-  3. **Then** loop closure — at that point `verify_loop` can use a metric-consistent PnP-based recovery instead of 5-pt RANSAC.
-- **Phase-1 detector work is parked on `feat/brief-loop-detector`.** The BRIEF
-  256-bit detector (threshold 2700, ~29 fires on room) is implemented and
-  shelved until the prereqs above land. It is *not* a dead end — just gated.
-- **Investigation log:** see `PURE_C_RECOVERY.md` (commit `c1242c7`) for the
-  full diagnostic trace, distribution numbers, and rejected fixes.
-- **Methodological note:** for ad-hoc ATE checks always reuse
-  `benchmark.ate_rmse`. A standalone Umeyama re-implementation produced a
-  spurious 1.0043 m vs the sweep's 1.7767 m on room — that was a bug in the
-  ad-hoc code, not a real improvement.
+- If a commit is requested, use the repo's existing Git identity. Do not set or
+  override `git config user.name` / `user.email`.
 
 ## Important Notes
+
 - `pure_c_brief` is the promoted BRIEF-relocalization snapshot kept in-tree.
-- The old BRIEF branch was deleted after promotion.
-- Do not assume `c` and `pure_c` are equivalent; `c` uses the OpenCV shim and is tracked separately.
+- Do not assume `c` and `pure_c` are equivalent; `c` uses the OpenCV shim and is
+  tracked separately.
 - Do not assume only one GT dataset exists.
-- If benchmark results change, update generated outputs first, then sync `BENCHMARKS.md` / `README.md`.
+- If benchmark results change, update generated outputs first, then sync
+  `README.md`.
