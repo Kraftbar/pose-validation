@@ -10,6 +10,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=10, help="Number of worst frames to show")
     parser.add_argument("--spikes", action="store_true", help="Also show largest frame-to-frame error jumps")
     parser.add_argument("--by_method", action="store_true", help="Also summarize error grouped by pose method")
+    parser.add_argument("--window", help="Also show an inclusive frame window, formatted START:END")
     args = parser.parse_args()
 
     result = analyze_metrics_against_gt(args.metrics_json, args.gt_npz)
@@ -31,7 +32,8 @@ def main():
     worst_idx = np.argsort([frame["translation_error_m"] for frame in per_frame])[::-1][:args.top_k]
     print(
         f"{'Frame':>6} {'Error(m)':>10} {'RotErr(deg)':>12} {'Inliers':>8} {'Method':>8} "
-        f"{'Tracked':>8} {'Linked':>8} {'Relink':>7} {'Added':>7} {'KF':>4}"
+        f"{'Tracked':>8} {'Linked':>8} {'PnP':>5} {'PredLM':>6} {'E':>5} "
+        f"{'Jump':>8} {'Added':>7} {'KF':>4}"
     )
     for idx in worst_idx:
         frame = per_frame[idx]
@@ -39,9 +41,31 @@ def main():
         print(
             f"{frame['frame_id']:6d} {frame['translation_error_m']:10.4f} {rot_error:12.4f} "
             f"{frame['inliers']:8d} {frame['method']:8s} {frame['tracked_count']:8d} "
-            f"{frame['linked_points']:8d} {frame['relinked_points']:7d} {frame['points_added']:7d} "
+            f"{frame['linked_points']:8d} {frame['pnp_inliers']:5d} "
+            f"{frame['pred_lm_inliers']:6d} {frame['e_inliers']:5d} "
+            f"{frame['trans_jump']:8.3f} {frame['points_added']:7d} "
             f"{'YES' if frame['is_keyframe'] else 'no':>4}"
         )
+
+    if args.window:
+        start_text, end_text = args.window.split(":", 1)
+        start, end = int(start_text), int(end_text)
+        print(f"\nFrame window {start}:{end}:")
+        print(
+            f"{'Frame':>6} {'Error(m)':>10} {'Inliers':>8} {'Method':>8} {'Tracked':>8} "
+            f"{'Link0':>6} {'Linked':>8} {'Relink':>7} {'PnP':>5} {'PredLM':>6} "
+            f"{'E':>5} {'Jump':>8} {'Added':>7}"
+        )
+        for frame in per_frame:
+            if start <= frame["frame_id"] <= end:
+                print(
+                    f"{frame['frame_id']:6d} {frame['translation_error_m']:10.4f} "
+                    f"{frame['inliers']:8d} {frame['method']:8s} {frame['tracked_count']:8d} "
+                    f"{frame['linked_before_relink']:6d} {frame['linked_points']:8d} "
+                    f"{frame['relinked_points']:7d} {frame['pnp_inliers']:5d} "
+                    f"{frame['pred_lm_inliers']:6d} {frame['e_inliers']:5d} "
+                    f"{frame['trans_jump']:8.3f} {frame['points_added']:7d}"
+                )
 
     if args.spikes:
         jumps = []
@@ -54,14 +78,16 @@ def main():
         print(f"\nTop {args.top_k} positive frame-to-frame error jumps:")
         print(
             f"{'Frame':>6} {'Delta(m)':>10} {'Error(m)':>10} {'Inliers':>8} {'Method':>8} "
-            f"{'Tracked':>8} {'Linked':>8} {'Relink':>7} {'Added':>7} {'Transition':>12}"
+            f"{'Tracked':>8} {'Linked':>8} {'PnP':>5} {'PredLM':>6} {'E':>5} "
+            f"{'Jump':>8} {'Added':>7} {'Transition':>12}"
         )
         for delta, transition, frame in sorted(jumps, key=lambda item: item[0], reverse=True)[:args.top_k]:
             print(
                 f"{frame['frame_id']:6d} {delta:10.4f} {frame['translation_error_m']:10.4f} "
                 f"{frame['inliers']:8d} {frame['method']:8s} {frame['tracked_count']:8d} "
-                f"{frame['linked_points']:8d} {frame['relinked_points']:7d} "
-                f"{frame['points_added']:7d} {transition:>12}"
+                f"{frame['linked_points']:8d} {frame['pnp_inliers']:5d} "
+                f"{frame['pred_lm_inliers']:6d} {frame['e_inliers']:5d} "
+                f"{frame['trans_jump']:8.3f} {frame['points_added']:7d} {transition:>12}"
             )
 
     if args.by_method:

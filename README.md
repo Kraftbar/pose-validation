@@ -135,6 +135,9 @@ python3 tools/diagnose_trace.py \
 `2` PnP, `3` predicted fallback. They also include tracked feature count,
 linked map-point count, BRIEF relinks, and points added, so room spikes can be
 separated into pose-estimation, link-loss, and map-growth failures.
+Use `--window START:END` to inspect a specific frame range; `pure_c_plus`
+also reports PnP candidate inliers, predicted-LM inliers, E inliers,
+pre/post-relink counts, and raw inter-frame translation jump.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations

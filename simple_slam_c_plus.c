@@ -39,7 +39,9 @@ typedef struct {
 } Match;
 typedef struct {
     int frame_id, inliers, is_keyframe, points_added, points_total, method;
-    int tracked_count, linked_points, relinked_points;
+    int tracked_count, linked_points, linked_before_relink, relinked_points;
+    int pnp_inliers, pred_lm_inliers, e_inliers;
+    double trans_jump;
     double xyz[3];
 } FrameStat;
 typedef struct {
@@ -584,6 +586,8 @@ static int estimate_pose_E(const CornerVec *p_pts, const CornerVec *c_pts, const
 
 static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx, double fy,
                              double cx, double cy, Pose *out_pose, int *out_inl) {
+    if (out_inl)
+        *out_inl = 0;
     int n = 0;
     for (int i = 0; i < corners->size; i++)
         if (corners->data[i].pt_idx != -1)
@@ -654,6 +658,8 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
         if (inl > n * 0.8)
             break;
     }
+    if (out_inl)
+        *out_inl = best_inl;
     if (best_inl >= 12) {
         double R[9] = {best_P[0], best_P[1], best_P[2], best_P[4], best_P[5],
                        best_P[6], best_P[8], best_P[9], best_P[10]},
@@ -676,12 +682,34 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
             for (int j = 0; j < 9; j++)
                 Ro[j] = -Ro[j];
         pose_from_rt(Ro, t, out_pose);
-        *out_inl = best_inl;
         free(ids);
         return 1;
     }
     free(ids);
     return 0;
+}
+
+static int count_pose_inliers(const Map *map, const CornerVec *corners, double fx, double fy,
+                              double cx, double cy, const Pose *pose) {
+    double R[9], t[3];
+    pose_get_rotation(pose, R);
+    pose_get_translation(pose, t);
+    int inl = 0;
+    for (int i = 0; i < corners->size; i++) {
+        if (corners->data[i].pt_idx == -1 || map->data[corners->data[i].pt_idx].obs == 0)
+            continue;
+        MapPoint p = map->data[corners->data[i].pt_idx];
+        double px = R[0] * p.x + R[1] * p.y + R[2] * p.z + t[0];
+        double py = R[3] * p.x + R[4] * p.y + R[5] * p.z + t[1];
+        double pz = R[6] * p.x + R[7] * p.y + R[8] * p.z + t[2];
+        if (pz < 0.1)
+            continue;
+        double u = fx * px / pz + cx, v = fy * py / pz + cy;
+        double dx = u - corners->data[i].x, dy = v - corners->data[i].y;
+        if (dx * dx + dy * dy < 4.0)
+            inl++;
+    }
+    return inl;
 }
 
 static void refine_pose_lm(const Map *map, const CornerVec *corners, double fx, double fy,
@@ -1250,11 +1278,15 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
         fprintf(f,
                 "    {\"frame_id\": %d, \"inliers\": %d, \"is_keyframe\": %s, \"points_added\": "
                 "%d, \"points_total\": %d, \"method\": %d, \"tracked_count\": %d, "
-                "\"linked_points\": %d, \"relinked_points\": %d, \"xyz\": [%f,%f,%f]}%s\n",
+                "\"linked_points\": %d, \"linked_before_relink\": %d, \"relinked_points\": %d, "
+                "\"pnp_inliers\": %d, \"pred_lm_inliers\": %d, \"e_inliers\": %d, "
+                "\"trans_jump\": %f, \"xyz\": [%f,%f,%f]}%s\n",
                 s->data[i].frame_id, s->data[i].inliers, s->data[i].is_keyframe ? "true" : "false",
                 s->data[i].points_added, s->data[i].points_total, s->data[i].method,
-                s->data[i].tracked_count, s->data[i].linked_points, s->data[i].relinked_points,
-                s->data[i].xyz[0], s->data[i].xyz[1], s->data[i].xyz[2],
+                s->data[i].tracked_count, s->data[i].linked_points, s->data[i].linked_before_relink,
+                s->data[i].relinked_points, s->data[i].pnp_inliers, s->data[i].pred_lm_inliers,
+                s->data[i].e_inliers, s->data[i].trans_jump, s->data[i].xyz[0], s->data[i].xyz[1],
+                s->data[i].xyz[2],
                 (i + 1 < s->size) ? "," : "");
     fprintf(f, "  ]\n}\n");
 }
@@ -1312,7 +1344,9 @@ int main(int argc, char **argv) {
         Pose pose, rel;
         unsigned char *mask = NULL;
         int inl = 0, mkf = 0, added = 0, method = 0;
-        int tracked_count = 0, linked_points = 0, relinked_points = 0;
+        int tracked_count = 0, linked_points = 0, linked_before_relink = 0, relinked_points = 0;
+        int pnp_inliers = 0, pred_lm_inliers = 0, e_inliers = 0;
+        double trans_jump = 0.0;
         if (frame_id == 0) {
             extract_corners_pure(cblur, w, h, &curr.corners, 1000);
             mkf = 1;
@@ -1327,15 +1361,23 @@ int main(int argc, char **argv) {
             for (int _i = 0; _i < tracked.size; _i++)
                 if (tracked.data[_i].pt_idx != -1)
                     _nlink++;
+            linked_before_relink = _nlink;
             linked_points = _nlink;
             if (_nlink < 50 && map.size > 100)
                 relinked_points = brief_relink(cblur, w, h, &tracked, &map);
             linked_points += relinked_points;
-            if (estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, &pose, &inl)) {
+            if (map.size > 1000 && linked_points >= 12) {
+                Pose pred_lm = predicted;
+                refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pred_lm);
+                pred_lm_inliers = count_pose_inliers(&map, &tracked, fx, fy, cx, cy, &pred_lm);
+            }
+            if (estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, &pose, &pnp_inliers)) {
+                inl = pnp_inliers;
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
                 method = 2;
             } else if (estimate_pose_E(&prev.corners, &tracked, &matches, fx, fy, cx, cy, &rel,
                                        &mask, &inl)) {
+                e_inliers = inl;
                 pose_compose_relative(&rel, &prev.pose, &pose);
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
                 method = 1;
@@ -1404,6 +1446,13 @@ int main(int argc, char **argv) {
         }
         curr.pose = pose;
         if (frame_id > 0) {
+            double pc[3], cc[3];
+            camera_center_from_pose(&prev.pose, pc);
+            camera_center_from_pose(&pose, cc);
+            double dx = cc[0] - pc[0], dy = cc[1] - pc[1], dz = cc[2] - pc[2];
+            trans_jump = sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        if (frame_id > 0) {
             Pose inv_prev;
             pose_inverse(&prev.pose, &inv_prev);
             pose_compose_relative(&pose, &inv_prev, &last_rel);
@@ -1418,7 +1467,12 @@ int main(int argc, char **argv) {
                                                 method,
                                                 tracked_count,
                                                 linked_points,
+                                                linked_before_relink,
                                                 relinked_points,
+                                                pnp_inliers,
+                                                pred_lm_inliers,
+                                                e_inliers,
+                                                trans_jump,
                                                 {c[0], c[1], c[2]}});
         if ((frame_id + 1) % 10 == 0)
             printf("Frames=%d Pts=%d KF=%d Map=%d\n", frame_id + 1, pts, kf_db.size, map.size);

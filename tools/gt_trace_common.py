@@ -128,7 +128,12 @@ def analyze_metrics_against_gt(metrics_json, gt_npz, label=None):
                 "points_added": int(frame.get("points_added", 0)),
                 "tracked_count": int(frame.get("tracked_count", 0)),
                 "linked_points": int(frame.get("linked_points", 0)),
+                "linked_before_relink": int(frame.get("linked_before_relink", frame.get("linked_points", 0))),
                 "relinked_points": int(frame.get("relinked_points", 0)),
+                "pnp_inliers": int(frame.get("pnp_inliers", 0)),
+                "pred_lm_inliers": int(frame.get("pred_lm_inliers", 0)),
+                "e_inliers": int(frame.get("e_inliers", 0)),
+                "trans_jump": float(frame.get("trans_jump", 0.0)),
             }
         )
 
