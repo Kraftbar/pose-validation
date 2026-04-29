@@ -153,7 +153,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 
 | Trial | Result |
 |-------|--------|
-| Trust-region LM in `refine_pose_lm` | Regressed all sequences; room +0.098 m. |
+| Trust-region LM in `refine_pose_lm` | Regressed all sequences; reduction-ratio retry collapsed map density and moved room to 1.8676. |
 | Catastrophic-step gate in `refine_pose_lm` | Regressed all sequences; room +0.064 m. |
 | PnP without-replacement 6-point samples | Regressed all sequences; room +0.033 m. |
 | RANSAC inlier-set overdetermined DLT refit | Regressed all sequences; room +0.092 m. |
