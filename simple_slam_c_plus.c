@@ -38,7 +38,7 @@ typedef struct {
     float score;
 } Match;
 typedef struct {
-    int frame_id, inliers, is_keyframe, points_added, points_total;
+    int frame_id, inliers, is_keyframe, points_added, points_total, method;
     double xyz[3];
 } FrameStat;
 typedef struct {
@@ -1248,9 +1248,9 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
     for (int i = 0; i < s->size; i++)
         fprintf(f,
                 "    {\"frame_id\": %d, \"inliers\": %d, \"is_keyframe\": %s, \"points_added\": "
-                "%d, \"points_total\": %d, \"xyz\": [%f,%f,%f]}%s\n",
+                "%d, \"points_total\": %d, \"method\": %d, \"xyz\": [%f,%f,%f]}%s\n",
                 s->data[i].frame_id, s->data[i].inliers, s->data[i].is_keyframe ? "true" : "false",
-                s->data[i].points_added, s->data[i].points_total, s->data[i].xyz[0],
+                s->data[i].points_added, s->data[i].points_total, s->data[i].method, s->data[i].xyz[0],
                 s->data[i].xyz[1], s->data[i].xyz[2], (i + 1 < s->size) ? "," : "");
     fprintf(f, "  ]\n}\n");
 }
@@ -1307,7 +1307,7 @@ int main(int argc, char **argv) {
         CornerVec tracked = {0};
         Pose pose, rel;
         unsigned char *mask = NULL;
-        int inl = 0, mkf = 0, added = 0;
+        int inl = 0, mkf = 0, added = 0, method = 0;
         if (frame_id == 0) {
             extract_corners_pure(cblur, w, h, &curr.corners, 1000);
             mkf = 1;
@@ -1325,13 +1325,16 @@ int main(int argc, char **argv) {
                 brief_relink(cblur, w, h, &tracked, &map);
             if (estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, &pose, &inl)) {
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
+                method = 2;
             } else if (estimate_pose_E(&prev.corners, &tracked, &matches, fx, fy, cx, cy, &rel,
                                        &mask, &inl)) {
                 pose_compose_relative(&rel, &prev.pose, &pose);
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
+                method = 1;
             } else {
                 pose = predicted;
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
+                method = 3;
             }
             if (inl < 40 || rotation_degrees_between(&lkf_pose, &pose) > cfg.kf_max_rot_deg ||
                 frame_id % 10 == 0)
@@ -1400,7 +1403,7 @@ int main(int argc, char **argv) {
         double c[3];
         camera_center_from_pose(&pose, c);
         frame_stat_vec_push(&stats,
-                            (FrameStat){frame_id, inl, mkf, added, pts, {c[0], c[1], c[2]}});
+                            (FrameStat){frame_id, inl, mkf, added, pts, method, {c[0], c[1], c[2]}});
         if ((frame_id + 1) % 10 == 0)
             printf("Frames=%d Pts=%d KF=%d Map=%d\n", frame_id + 1, pts, kf_db.size, map.size);
         memcpy(pgray, cblur, w * h);

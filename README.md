@@ -129,6 +129,10 @@ python3 tools/diagnose_trace.py \
   --top_k 20
 ```
 
+`pure_c_plus` traces include `method` per frame: `0` init, `1` essential,
+`2` PnP, `3` predicted fallback. Use that to separate PnP failures from
+fallback drift when working on the room blocker.
+
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
 on the benchmark utility path.
@@ -163,9 +167,13 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | PnP-failure BRIEF relink retry | ATE-neutral, room worsened slightly, and rpy timed out at 713/723 frames. |
 | Candidate pose scoring over PnP/E/predicted | Fast 5s looked good, but full sweep collapsed map density and regressed room to 1.8653. |
 
-Likely useful future work requires structurally different math: a real P3P
-solver, a replacement pose-only BA path with consistent robust loss and trust
-region, or an upstream investigation of initialization/keyframe selection.
+Next useful work should start on the PnP side: add a real P3P or
+overdetermined PnP candidate generator and only then feed the result into pose
+refinement. Do not start by wrapping `refine_pose_lm` with another clamp,
+step gate, or reduction-ratio trust region; those variants repeatedly preserve
+short-run behavior while collapsing full-sweep map density. If PnP candidate
+quality still fails, investigate initialization/keyframe selection before
+retrying loop closure.
 
 ## Design Direction
 
