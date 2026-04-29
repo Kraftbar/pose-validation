@@ -39,6 +39,7 @@ typedef struct {
 } Match;
 typedef struct {
     int frame_id, inliers, is_keyframe, points_added, points_total, method;
+    int tracked_count, linked_points, relinked_points;
     double xyz[3];
 } FrameStat;
 typedef struct {
@@ -1248,10 +1249,13 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
     for (int i = 0; i < s->size; i++)
         fprintf(f,
                 "    {\"frame_id\": %d, \"inliers\": %d, \"is_keyframe\": %s, \"points_added\": "
-                "%d, \"points_total\": %d, \"method\": %d, \"xyz\": [%f,%f,%f]}%s\n",
+                "%d, \"points_total\": %d, \"method\": %d, \"tracked_count\": %d, "
+                "\"linked_points\": %d, \"relinked_points\": %d, \"xyz\": [%f,%f,%f]}%s\n",
                 s->data[i].frame_id, s->data[i].inliers, s->data[i].is_keyframe ? "true" : "false",
-                s->data[i].points_added, s->data[i].points_total, s->data[i].method, s->data[i].xyz[0],
-                s->data[i].xyz[1], s->data[i].xyz[2], (i + 1 < s->size) ? "," : "");
+                s->data[i].points_added, s->data[i].points_total, s->data[i].method,
+                s->data[i].tracked_count, s->data[i].linked_points, s->data[i].relinked_points,
+                s->data[i].xyz[0], s->data[i].xyz[1], s->data[i].xyz[2],
+                (i + 1 < s->size) ? "," : "");
     fprintf(f, "  ]\n}\n");
 }
 
@@ -1308,6 +1312,7 @@ int main(int argc, char **argv) {
         Pose pose, rel;
         unsigned char *mask = NULL;
         int inl = 0, mkf = 0, added = 0, method = 0;
+        int tracked_count = 0, linked_points = 0, relinked_points = 0;
         if (frame_id == 0) {
             extract_corners_pure(cblur, w, h, &curr.corners, 1000);
             mkf = 1;
@@ -1316,13 +1321,16 @@ int main(int argc, char **argv) {
             Pose predicted;
             pose_compose_relative(&last_rel, &prev.pose, &predicted);
             track_corners_pure_lk(pgray, cblur, w, h, &prev.corners, &tracked, &matches);
+            tracked_count = tracked.size;
 
             int _nlink = 0;
             for (int _i = 0; _i < tracked.size; _i++)
                 if (tracked.data[_i].pt_idx != -1)
                     _nlink++;
+            linked_points = _nlink;
             if (_nlink < 50 && map.size > 100)
-                brief_relink(cblur, w, h, &tracked, &map);
+                relinked_points = brief_relink(cblur, w, h, &tracked, &map);
+            linked_points += relinked_points;
             if (estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, &pose, &inl)) {
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
                 method = 2;
@@ -1402,8 +1410,16 @@ int main(int argc, char **argv) {
         }
         double c[3];
         camera_center_from_pose(&pose, c);
-        frame_stat_vec_push(&stats,
-                            (FrameStat){frame_id, inl, mkf, added, pts, method, {c[0], c[1], c[2]}});
+        frame_stat_vec_push(&stats, (FrameStat){frame_id,
+                                                inl,
+                                                mkf,
+                                                added,
+                                                pts,
+                                                method,
+                                                tracked_count,
+                                                linked_points,
+                                                relinked_points,
+                                                {c[0], c[1], c[2]}});
         if ((frame_id + 1) % 10 == 0)
             printf("Frames=%d Pts=%d KF=%d Map=%d\n", frame_id + 1, pts, kf_db.size, map.size);
         memcpy(pgray, cblur, w * h);

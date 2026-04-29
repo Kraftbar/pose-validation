@@ -29,13 +29,18 @@ def main():
     # Worst frames
     print(f"\nTop {args.top_k} worst frames by translation error:")
     worst_idx = np.argsort([frame["translation_error_m"] for frame in per_frame])[::-1][:args.top_k]
-    print(f"{'Frame':>6} {'Error(m)':>10} {'RotErr(deg)':>12} {'Inliers':>8} {'Method':>8} {'KF':>4}")
+    print(
+        f"{'Frame':>6} {'Error(m)':>10} {'RotErr(deg)':>12} {'Inliers':>8} {'Method':>8} "
+        f"{'Tracked':>8} {'Linked':>8} {'Relink':>7} {'Added':>7} {'KF':>4}"
+    )
     for idx in worst_idx:
         frame = per_frame[idx]
         rot_error = 0.0 if frame["rotation_error_deg"] is None else frame["rotation_error_deg"]
         print(
             f"{frame['frame_id']:6d} {frame['translation_error_m']:10.4f} {rot_error:12.4f} "
-            f"{frame['inliers']:8d} {frame['method']:8s} {'YES' if frame['is_keyframe'] else 'no':>4}"
+            f"{frame['inliers']:8d} {frame['method']:8s} {frame['tracked_count']:8d} "
+            f"{frame['linked_points']:8d} {frame['relinked_points']:7d} {frame['points_added']:7d} "
+            f"{'YES' if frame['is_keyframe'] else 'no':>4}"
         )
 
     if args.spikes:
@@ -47,24 +52,37 @@ def main():
                 jumps.append((frame["translation_error_m"] - prev["translation_error_m"], transition, frame))
             prev = frame
         print(f"\nTop {args.top_k} positive frame-to-frame error jumps:")
-        print(f"{'Frame':>6} {'Delta(m)':>10} {'Error(m)':>10} {'Inliers':>8} {'Method':>8} {'Transition':>12}")
+        print(
+            f"{'Frame':>6} {'Delta(m)':>10} {'Error(m)':>10} {'Inliers':>8} {'Method':>8} "
+            f"{'Tracked':>8} {'Linked':>8} {'Relink':>7} {'Added':>7} {'Transition':>12}"
+        )
         for delta, transition, frame in sorted(jumps, key=lambda item: item[0], reverse=True)[:args.top_k]:
             print(
                 f"{frame['frame_id']:6d} {delta:10.4f} {frame['translation_error_m']:10.4f} "
-                f"{frame['inliers']:8d} {frame['method']:8s} {transition:>12}"
+                f"{frame['inliers']:8d} {frame['method']:8s} {frame['tracked_count']:8d} "
+                f"{frame['linked_points']:8d} {frame['relinked_points']:7d} "
+                f"{frame['points_added']:7d} {transition:>12}"
             )
 
     if args.by_method:
         groups = {}
         for frame in per_frame:
-            groups.setdefault(frame["method"], []).append(frame["translation_error_m"])
+            groups.setdefault(frame["method"], []).append(frame)
         print("\nError by method:")
-        print(f"{'Method':>8} {'Frames':>8} {'Mean(m)':>10} {'Median(m)':>10} {'Max(m)':>10}")
+        print(
+            f"{'Method':>8} {'Frames':>8} {'Mean(m)':>10} {'Median(m)':>10} {'Max(m)':>10} "
+            f"{'TrkMean':>8} {'LnkMean':>8} {'RelMean':>8} {'AddMean':>8}"
+        )
         for method in sorted(groups):
-            values = np.asarray(groups[method], dtype=float)
+            values = np.asarray([frame["translation_error_m"] for frame in groups[method]], dtype=float)
+            tracked = np.asarray([frame["tracked_count"] for frame in groups[method]], dtype=float)
+            linked = np.asarray([frame["linked_points"] for frame in groups[method]], dtype=float)
+            relinked = np.asarray([frame["relinked_points"] for frame in groups[method]], dtype=float)
+            added = np.asarray([frame["points_added"] for frame in groups[method]], dtype=float)
             print(
                 f"{method:>8} {values.size:8d} {values.mean():10.4f} "
-                f"{np.median(values):10.4f} {values.max():10.4f}"
+                f"{np.median(values):10.4f} {values.max():10.4f} "
+                f"{tracked.mean():8.1f} {linked.mean():8.1f} {relinked.mean():8.1f} {added.mean():8.1f}"
             )
 
 if __name__ == "__main__":

@@ -126,6 +126,9 @@ def analyze_metrics_against_gt(metrics_json, gt_npz, label=None):
                 "is_keyframe": bool(frame.get("is_keyframe", False)),
                 "points_total": int(frame.get("points_total", 0)),
                 "points_added": int(frame.get("points_added", 0)),
+                "tracked_count": int(frame.get("tracked_count", 0)),
+                "linked_points": int(frame.get("linked_points", 0)),
+                "relinked_points": int(frame.get("relinked_points", 0)),
             }
         )
 
