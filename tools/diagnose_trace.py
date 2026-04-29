@@ -8,6 +8,8 @@ def main():
     parser.add_argument("metrics_json", help="Path to metrics JSON from SLAM")
     parser.add_argument("gt_npz", help="Path to ground truth NPZ")
     parser.add_argument("--top_k", type=int, default=10, help="Number of worst frames to show")
+    parser.add_argument("--spikes", action="store_true", help="Also show largest frame-to-frame error jumps")
+    parser.add_argument("--by_method", action="store_true", help="Also summarize error grouped by pose method")
     args = parser.parse_args()
 
     result = analyze_metrics_against_gt(args.metrics_json, args.gt_npz)
@@ -35,6 +37,35 @@ def main():
             f"{frame['frame_id']:6d} {frame['translation_error_m']:10.4f} {rot_error:12.4f} "
             f"{frame['inliers']:8d} {frame['method']:8s} {'YES' if frame['is_keyframe'] else 'no':>4}"
         )
+
+    if args.spikes:
+        jumps = []
+        prev = None
+        for frame in per_frame:
+            if prev is not None:
+                transition = "" if prev["method"] == frame["method"] else f"{prev['method']}->{frame['method']}"
+                jumps.append((frame["translation_error_m"] - prev["translation_error_m"], transition, frame))
+            prev = frame
+        print(f"\nTop {args.top_k} positive frame-to-frame error jumps:")
+        print(f"{'Frame':>6} {'Delta(m)':>10} {'Error(m)':>10} {'Inliers':>8} {'Method':>8} {'Transition':>12}")
+        for delta, transition, frame in sorted(jumps, key=lambda item: item[0], reverse=True)[:args.top_k]:
+            print(
+                f"{frame['frame_id']:6d} {delta:10.4f} {frame['translation_error_m']:10.4f} "
+                f"{frame['inliers']:8d} {frame['method']:8s} {transition:>12}"
+            )
+
+    if args.by_method:
+        groups = {}
+        for frame in per_frame:
+            groups.setdefault(frame["method"], []).append(frame["translation_error_m"])
+        print("\nError by method:")
+        print(f"{'Method':>8} {'Frames':>8} {'Mean(m)':>10} {'Median(m)':>10} {'Max(m)':>10}")
+        for method in sorted(groups):
+            values = np.asarray(groups[method], dtype=float)
+            print(
+                f"{method:>8} {values.size:8d} {values.mean():10.4f} "
+                f"{np.median(values):10.4f} {values.max():10.4f}"
+            )
 
 if __name__ == "__main__":
     main()

@@ -126,7 +126,9 @@ Inspect a saved run against GT:
 python3 tools/diagnose_trace.py \
   runs/benchmark/test_freiburgxyz525_pure_c_plus_5s.json \
   test_freiburgxyz525.npz \
-  --top_k 20
+  --top_k 20 \
+  --spikes \
+  --by_method
 ```
 
 `pure_c_plus` traces include `method` per frame: `0` init, `1` essential,
