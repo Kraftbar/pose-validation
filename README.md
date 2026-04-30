@@ -148,10 +148,16 @@ python3 benchmark.py --all_gt --video test_freiburgroom525 --impl pure_c_plus --
 cmake -S . -B build-native
 cmake --build build-native --target pnp_replay_opencv
 build-native/pnp_replay_opencv --dump runs/pure_c_iter/pnp_dump/room_8s.pnp --window 120:170
+build-native/pnp_replay_opencv --dump runs/pure_c_iter/pnp_dump/room_8s.pnp --window 120:170 --summary
 ```
 
-This is an offline diagnostic harness. Do not make `pure_c_plus` depend on
-OpenCV at runtime.
+This is an offline diagnostic harness. It reports strict 2px/3px/5px inliers,
+median reprojection error, positive-depth ratio, translation jump, and a
+conservative `portable` flag. Do not make `pure_c_plus` depend on OpenCV at
+runtime. On the current room 8s dump, frames 120:170 show AP3P beating DLT at
+2px inliers on 28/51 frames, but only 17/51 pass the portable rule and only
+3/51 are portable when pure DLT failed; this argues for selective scored
+replacement, not wholesale AP3P substitution.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations

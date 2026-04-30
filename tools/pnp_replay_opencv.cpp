@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,78 @@ static double reprojection_rmse(const std::vector<Candidate> &candidates, const 
     return std::sqrt(sum / static_cast<double>(projected.size()));
 }
 
+struct PoseScore {
+    int inliers2 = 0;
+    int inliers3 = 0;
+    int inliers5 = 0;
+    double median_error = 0.0;
+    double positive_depth_ratio = 0.0;
+    double stability_score = -1e18;
+};
+
+static PoseScore score_pose(const std::vector<Candidate> &candidates, const cv::Mat &rvec,
+                            const cv::Mat &tvec, const cv::Matx33d &K,
+                            const cv::Vec3d &predicted_t) {
+    PoseScore score;
+    if (candidates.empty()) {
+        return score;
+    }
+
+    std::vector<cv::Point3f> world;
+    std::vector<cv::Point2f> expected;
+    world.reserve(candidates.size());
+    expected.reserve(candidates.size());
+    for (const Candidate &candidate : candidates) {
+        world.push_back(candidate.world);
+        expected.push_back(candidate.image);
+    }
+
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(world, rvec, tvec, cv::Mat(K), cv::noArray(), projected);
+
+    cv::Mat R;
+    cv::Rodrigues(rvec, R);
+    std::vector<double> errors;
+    errors.reserve(projected.size());
+    int positive_depth = 0;
+    for (size_t i = 0; i < projected.size(); ++i) {
+        const double dx = projected[i].x - expected[i].x;
+        const double dy = projected[i].y - expected[i].y;
+        const double err = std::sqrt(dx * dx + dy * dy);
+        errors.push_back(err);
+        if (err < 2.0) {
+            ++score.inliers2;
+        }
+        if (err < 3.0) {
+            ++score.inliers3;
+        }
+        if (err < 5.0) {
+            ++score.inliers5;
+        }
+
+        const cv::Point3f &p = world[i];
+        const double z = R.at<double>(2, 0) * p.x + R.at<double>(2, 1) * p.y +
+                         R.at<double>(2, 2) * p.z + tvec.at<double>(2);
+        if (z > 0.1) {
+            ++positive_depth;
+        }
+    }
+
+    std::nth_element(errors.begin(), errors.begin() + errors.size() / 2, errors.end());
+    score.median_error = errors[errors.size() / 2];
+    score.positive_depth_ratio = static_cast<double>(positive_depth) /
+                                 static_cast<double>(candidates.size());
+
+    const cv::Vec3d t(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
+    const double jump = dist3(t, predicted_t);
+    score.stability_score = static_cast<double>(score.inliers2) +
+                            0.25 * static_cast<double>(score.inliers3 - score.inliers2) -
+                            0.02 * score.median_error -
+                            0.00002 * jump +
+                            5.0 * score.positive_depth_ratio;
+    return score;
+}
+
 static int parse_window(const std::string &text, int &start, int &end) {
     const size_t pos = text.find(':');
     if (pos == std::string::npos) {
@@ -69,13 +142,14 @@ static int parse_window(const std::string &text, int &start, int &end) {
 }
 
 static void usage(const char *argv0) {
-    std::cerr << "Usage: " << argv0 << " --dump PATH [--window START:END]\n";
+    std::cerr << "Usage: " << argv0 << " --dump PATH [--window START:END] [--summary]\n";
 }
 
 int main(int argc, char **argv) {
     std::string dump_path;
     int window_start = -1;
     int window_end = -1;
+    bool summary = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--dump" && i + 1 < argc) {
@@ -85,6 +159,8 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 2;
             }
+        } else if (arg == "--summary") {
+            summary = true;
         } else {
             usage(argv[0]);
             return 2;
@@ -102,8 +178,18 @@ int main(int argc, char **argv) {
     }
 
     std::cout << std::fixed << std::setprecision(4);
-    std::cout << "frame cand pure_ok pure_inl pure_rmse pure_jump lm_rmse lm_jump cv_ok cv_inl "
-                 "cv_rmse cv_jump\n";
+    if (!summary) {
+        std::cout << "frame cand pure_ok pure_inl pure_rmse pure_jump lm_rmse lm_jump cv_ok cv_inl "
+                     "cv_rmse cv_jump cv_inl2 cv_inl3 cv_inl5 cv_mederr cv_posz cv_score "
+                     "portable\n";
+    }
+
+    int frames_seen = 0;
+    int cv_ok_count = 0;
+    int cv_better_2px = 0;
+    int portable_count = 0;
+    int pure_fail_portable = 0;
+    int pure_ok_portable = 0;
 
     std::string tag;
     while (in >> tag) {
@@ -142,6 +228,7 @@ int main(int argc, char **argv) {
         int cv_inliers = 0;
         double cv_rmse = 0.0;
         double cv_jump = 0.0;
+        PoseScore cv_score;
         if (frame.candidates.size() >= 6) {
             std::vector<cv::Point3f> world;
             std::vector<cv::Point2f> image;
@@ -162,14 +249,50 @@ int main(int argc, char **argv) {
                 cv_rmse = reprojection_rmse(frame.candidates, rvec, tvec, K);
                 cv::Vec3d cv_t(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
                 cv_jump = dist3(cv_t, frame.predicted_t);
+                cv_score = score_pose(frame.candidates, rvec, tvec, K, frame.predicted_t);
             }
         }
 
-        std::cout << frame.frame_id << ' ' << frame.candidates.size() << ' ' << frame.pure_ok
-                  << ' ' << frame.pure_inliers << ' ' << frame.pure_rmse << ' '
-                  << dist3(frame.pure_t, frame.predicted_t) << ' ' << frame.lm_rmse << ' '
-                  << dist3(frame.lm_t, frame.predicted_t) << ' ' << cv_ok << ' ' << cv_inliers
-                  << ' ' << cv_rmse << ' ' << cv_jump << "\n";
+        const bool portable = cv_ok && cv_score.inliers2 >= 12 &&
+                              cv_score.inliers2 >= frame.pure_inliers &&
+                              cv_score.median_error < 15.0 &&
+                              cv_score.positive_depth_ratio >= 0.8 &&
+                              cv_jump < 50000.0;
+        ++frames_seen;
+        if (cv_ok) {
+            ++cv_ok_count;
+        }
+        if (cv_ok && cv_score.inliers2 > frame.pure_inliers) {
+            ++cv_better_2px;
+        }
+        if (portable) {
+            ++portable_count;
+            if (frame.pure_ok) {
+                ++pure_ok_portable;
+            } else {
+                ++pure_fail_portable;
+            }
+        }
+
+        if (!summary) {
+            std::cout << frame.frame_id << ' ' << frame.candidates.size() << ' ' << frame.pure_ok
+                      << ' ' << frame.pure_inliers << ' ' << frame.pure_rmse << ' '
+                      << dist3(frame.pure_t, frame.predicted_t) << ' ' << frame.lm_rmse << ' '
+                      << dist3(frame.lm_t, frame.predicted_t) << ' ' << cv_ok << ' '
+                      << cv_inliers << ' ' << cv_rmse << ' ' << cv_jump << ' '
+                      << cv_score.inliers2 << ' ' << cv_score.inliers3 << ' '
+                      << cv_score.inliers5 << ' ' << cv_score.median_error << ' '
+                      << cv_score.positive_depth_ratio << ' ' << cv_score.stability_score << ' '
+                      << portable << "\n";
+        }
+    }
+    if (summary) {
+        std::cout << "frames " << frames_seen << "\n";
+        std::cout << "cv_ok " << cv_ok_count << "\n";
+        std::cout << "cv_better_2px " << cv_better_2px << "\n";
+        std::cout << "portable " << portable_count << "\n";
+        std::cout << "portable_when_pure_ok " << pure_ok_portable << "\n";
+        std::cout << "portable_when_pure_failed " << pure_fail_portable << "\n";
     }
     return 0;
 }
