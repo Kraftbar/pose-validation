@@ -149,6 +149,11 @@ cmake -S . -B build-native
 cmake --build build-native --target pnp_replay_opencv
 build-native/pnp_replay_opencv --dump runs/pure_c_iter/pnp_dump/room_8s.pnp --window 120:170
 build-native/pnp_replay_opencv --dump runs/pure_c_iter/pnp_dump/room_8s.pnp --window 120:170 --summary
+python3 tools/analyze_pnp_replacements.py \
+  --dump runs/pure_c_iter/pnp_dump/room_8s.pnp \
+  --metrics runs/pure_c_iter/pnp_dump/test_freiburgroom525_pure_c_plus_8s.json \
+  --gt external/twitchslam/videos/test_freiburgroom525.npz \
+  --window 120:170
 ```
 
 This is an offline diagnostic harness. It reports strict 2px/3px/5px inliers,
@@ -157,7 +162,12 @@ conservative `portable` flag. Do not make `pure_c_plus` depend on OpenCV at
 runtime. On the current room 8s dump, frames 120:170 show AP3P beating DLT at
 2px inliers on 28/51 frames, but only 17/51 pass the portable rule and only
 3/51 are portable when pure DLT failed; this argues for selective scored
-replacement, not wholesale AP3P substitution.
+replacement, not wholesale AP3P substitution. The replacement analyzer labels
+candidate frames by actual post-alignment ATE delta. On the same window,
+26/51 single-frame AP3P replacements improve RMSE, but the biggest winners
+include high-jump/high-median-error candidates while similar-looking frames are
+catastrophic losers. Do not use a simple jump cap or local reprojection proxy as
+the final scorer.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
