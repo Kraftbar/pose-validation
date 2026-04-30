@@ -202,6 +202,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | 3px PnP RANSAC inlier radius | Looser candidate scoring starved early map growth and worsened 8s room ATE to 0.6513 with 1756 points. |
 | Linear EPnP-style sampled candidate | Improved 8s room to 0.5295 but regressed full room to 1.8168; requiring +10 inlier advantage worsened 8s to 0.6486. |
 | Numeric P3P depth-solver candidate | Direct competition worsened 8s room to 0.5582; fallback-only use worsened 8s to 0.6522 and starved map growth. |
+| PnP post-LM stability gate with E fallback | Exploded map growth to 8687 points but worsened 8s room ATE to 0.6420; more points/inliers were not an accuracy win. |
 
 Next useful work should still start on the PnP side, but do not retry another
 quick numeric P3P approximation. The next candidate generator should be a
