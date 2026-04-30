@@ -194,13 +194,16 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | Row-normalized PnP DLT equations | Changed map growth shape but worsened 8s room ATE to 0.6424. |
 | BRIEF stale-link pruning before PnP | Thresholds 96 and 128 worsened 8s room ATE to 0.5855 and 0.5942; threshold 160 improved 8s to 0.5349 but regressed full room to 1.8035. |
 | 3px PnP RANSAC inlier radius | Looser candidate scoring starved early map growth and worsened 8s room ATE to 0.6513 with 1756 points. |
+| Linear EPnP-style sampled candidate | Improved 8s room to 0.5295 but regressed full room to 1.8168; requiring +10 inlier advantage worsened 8s to 0.6486. |
 
 Next useful work should start on the PnP side: add a real P3P or
-overdetermined PnP candidate generator and only then feed the result into pose
+minimal P3P/AP3P candidate generator and only then feed the result into pose
 refinement. Do not start by wrapping `refine_pose_lm` with another clamp,
 step gate, or reduction-ratio trust region; those variants repeatedly preserve
-short-run behavior while collapsing full-sweep map density. If PnP candidate
-quality still fails, investigate initialization/keyframe selection before
+short-run behavior while collapsing full-sweep map density. The failed linear
+EPnP-style trial shows that higher short-run inlier count is not sufficient;
+candidate scoring needs pose stability and depth/cheirality sanity too. If PnP
+candidate quality still fails, investigate initialization/keyframe selection before
 retrying loop closure.
 
 ## Design Direction
