@@ -25,6 +25,7 @@ typedef struct {
     const char *video_path;
     double seconds, timeout;
     const char *metrics_out;
+    const char *pnp_dump;
     int kf_min_inliers;
     double kf_max_rot_deg;
     int max_points;
@@ -712,6 +713,65 @@ static int count_pose_inliers(const Map *map, const CornerVec *corners, double f
     return inl;
 }
 
+static double pose_reprojection_rmse(const Map *map, const CornerVec *corners, double fx,
+                                     double fy, double cx, double cy, const Pose *pose) {
+    double R[9], t[3];
+    pose_get_rotation(pose, R);
+    pose_get_translation(pose, t);
+    double sum = 0.0;
+    int n = 0;
+    for (int i = 0; i < corners->size; i++) {
+        if (corners->data[i].pt_idx == -1 || map->data[corners->data[i].pt_idx].obs == 0)
+            continue;
+        MapPoint p = map->data[corners->data[i].pt_idx];
+        double px = R[0] * p.x + R[1] * p.y + R[2] * p.z + t[0];
+        double py = R[3] * p.x + R[4] * p.y + R[5] * p.z + t[1];
+        double pz = R[6] * p.x + R[7] * p.y + R[8] * p.z + t[2];
+        if (pz < 0.1)
+            continue;
+        double u = fx * px / pz + cx, v = fy * py / pz + cy;
+        double dx = u - corners->data[i].x, dy = v - corners->data[i].y;
+        sum += dx * dx + dy * dy;
+        n++;
+    }
+    return n ? sqrt(sum / n) : 0.0;
+}
+
+static void dump_pnp_frame(FILE *f, int frame_id, const Map *map, const CornerVec *corners,
+                           double fx, double fy, double cx, double cy, const Pose *predicted,
+                           const Pose *pnp_pose, int pnp_inliers, const Pose *lm_pose) {
+    if (!f)
+        return;
+    int n = 0;
+    for (int i = 0; i < corners->size; i++)
+        if (corners->data[i].pt_idx != -1 && map->data[corners->data[i].pt_idx].obs > 0)
+            n++;
+
+    double pred_t[3], pnp_t[3] = {0}, lm_t[3] = {0};
+    pose_get_translation(predicted, pred_t);
+    if (pnp_pose)
+        pose_get_translation(pnp_pose, pnp_t);
+    if (lm_pose)
+        pose_get_translation(lm_pose, lm_t);
+    double pnp_rmse = pnp_pose ? pose_reprojection_rmse(map, corners, fx, fy, cx, cy, pnp_pose) : 0.0;
+    double lm_rmse = lm_pose ? pose_reprojection_rmse(map, corners, fx, fy, cx, cy, lm_pose) : 0.0;
+
+    fprintf(f,
+            "FRAME %d %.17g %.17g %.17g %.17g %d %.17g %.17g %.17g %d %d %.17g %.17g %.17g %.17g "
+            "%.17g %.17g %.17g %.17g\n",
+            frame_id, fx, fy, cx, cy, n, pred_t[0], pred_t[1], pred_t[2], pnp_pose ? 1 : 0,
+            pnp_inliers, pnp_t[0], pnp_t[1], pnp_t[2], pnp_rmse, lm_t[0], lm_t[1], lm_t[2],
+            lm_rmse);
+    for (int i = 0; i < corners->size; i++) {
+        if (corners->data[i].pt_idx == -1 || map->data[corners->data[i].pt_idx].obs <= 0)
+            continue;
+        MapPoint p = map->data[corners->data[i].pt_idx];
+        fprintf(f, "C %.9g %.9g %.17g %.17g %.17g %d\n", corners->data[i].x,
+                corners->data[i].y, p.x, p.y, p.z, p.obs);
+    }
+    fprintf(f, "END\n");
+}
+
 static void refine_pose_lm(const Map *map, const CornerVec *corners, double fx, double fy,
                            double cx, double cy, Pose *pose) {
     double R[9], t[3];
@@ -1297,7 +1357,7 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 static Config parse_args(int argc, char **argv) {
-    Config c = {"test_kitti984.mp4", 5.0, 30.0, NULL, 20, 5.0, 15000};
+    Config c = {"test_kitti984.mp4", 5.0, 30.0, NULL, NULL, 20, 5.0, 15000};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--video_path") && i + 1 < argc)
             c.video_path = argv[++i];
@@ -1307,6 +1367,8 @@ static Config parse_args(int argc, char **argv) {
             c.timeout = atof(argv[++i]);
         else if (!strcmp(argv[i], "--metrics_out") && i + 1 < argc)
             c.metrics_out = argv[++i];
+        else if (!strcmp(argv[i], "--pnp_dump") && i + 1 < argc)
+            c.pnp_dump = argv[++i];
         else if (argv[i][0] != '-')
             c.video_path = argv[i];
     }
@@ -1334,6 +1396,15 @@ int main(int argc, char **argv) {
     int frame_id = 0, pts = 0, tri = 0;
     double start = now_seconds();
     double fx = 525.0, fy = 525.0, cx = 319.5, cy = 239.5;
+    FILE *pnp_dump = NULL;
+    if (cfg.pnp_dump) {
+        ensure_parent_dir(cfg.pnp_dump);
+        pnp_dump = fopen(cfg.pnp_dump, "w");
+        if (!pnp_dump) {
+            fprintf(stderr, "Failed to open PnP dump: %s\n", cfg.pnp_dump);
+            return 1;
+        }
+    }
     while (frame_id < (int)(25.0 * cfg.seconds) && ffmpeg_read(cap, raw)) {
         if (now_seconds() - start > cfg.timeout)
             break;
@@ -1371,8 +1442,12 @@ int main(int argc, char **argv) {
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pred_lm);
                 pred_lm_inliers = count_pose_inliers(&map, &tracked, fx, fy, cx, cy, &pred_lm);
             }
+            Pose pnp_pose_for_dump;
+            int has_pnp_pose_for_dump = 0;
             if (estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, &pose, &pnp_inliers)) {
                 inl = pnp_inliers;
+                pnp_pose_for_dump = pose;
+                has_pnp_pose_for_dump = 1;
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
                 method = 2;
             } else if (estimate_pose_E(&prev.corners, &tracked, &matches, fx, fy, cx, cy, &rel,
@@ -1386,6 +1461,9 @@ int main(int argc, char **argv) {
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, &pose);
                 method = 3;
             }
+            dump_pnp_frame(pnp_dump, frame_id, &map, &tracked, fx, fy, cx, cy, &predicted,
+                           has_pnp_pose_for_dump ? &pnp_pose_for_dump : NULL, pnp_inliers,
+                           has_pnp_pose_for_dump ? &pose : NULL);
             if (inl < 40 || rotation_degrees_between(&lkf_pose, &pose) > cfg.kf_max_rot_deg ||
                 frame_id % 10 == 0)
                 mkf = 1;
@@ -1491,6 +1569,8 @@ int main(int argc, char **argv) {
         write_metrics_json(f, &cfg, &stats, pts, tri, now_seconds() - start);
         fclose(f);
     }
+    if (pnp_dump)
+        fclose(pnp_dump);
     ffmpeg_close(cap);
     free(raw);
     free(pgray);

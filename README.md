@@ -139,6 +139,20 @@ Use `--window START:END` to inspect a specific frame range; `pure_c_plus`
 also reports PnP candidate inliers, predicted-LM inliers, E inliers,
 pre/post-relink counts, and raw inter-frame translation jump.
 
+For PnP solver diagnosis only, dump the exact `pure_c_plus` 2D/3D
+correspondences and replay them through OpenCV:
+
+```bash
+python3 benchmark.py --all_gt --video test_freiburgroom525 --impl pure_c_plus --seconds 8 --force \
+  --out_dir runs/pure_c_iter/pnp_dump --extra_args "--pnp_dump runs/pure_c_iter/pnp_dump/room_8s.pnp"
+cmake -S . -B build-native
+cmake --build build-native --target pnp_replay_opencv
+build-native/pnp_replay_opencv --dump runs/pure_c_iter/pnp_dump/room_8s.pnp --window 120:170
+```
+
+This is an offline diagnostic harness. Do not make `pure_c_plus` depend on
+OpenCV at runtime.
+
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
 on the benchmark utility path.

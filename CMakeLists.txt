@@ -14,13 +14,17 @@ pkg_check_modules(OpenCV REQUIRED opencv4)
 
 add_executable(simple_slam_opt simple_slam_opt.cpp)
 add_executable(simple_slam_c simple_slam_c.c simple_slam_c_shim.cpp)
+add_executable(pnp_replay_opencv tools/pnp_replay_opencv.cpp)
 
 target_include_directories(simple_slam_opt PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_include_directories(simple_slam_c PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_include_directories(pnp_replay_opencv PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_directories(simple_slam_opt PRIVATE ${OpenCV_LIBRARY_DIRS})
 target_link_directories(simple_slam_c PRIVATE ${OpenCV_LIBRARY_DIRS})
+target_link_directories(pnp_replay_opencv PRIVATE ${OpenCV_LIBRARY_DIRS})
 target_link_libraries(simple_slam_opt PRIVATE ${OpenCV_LIBRARIES})
 target_link_libraries(simple_slam_c PRIVATE ${OpenCV_LIBRARIES})
+target_link_libraries(pnp_replay_opencv PRIVATE ${OpenCV_LIBRARIES})
 set_property(TARGET simple_slam_c PROPERTY LINKER_LANGUAGE CXX)
 
 target_compile_options(simple_slam_opt PRIVATE
@@ -39,7 +43,16 @@ target_compile_options(simple_slam_c PRIVATE
   -DNDEBUG
 )
 
+target_compile_options(pnp_replay_opencv PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -O3
+  -DNDEBUG
+)
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
   target_compile_options(simple_slam_opt PRIVATE -march=native)
   target_compile_options(simple_slam_c PRIVATE -march=native)
+  target_compile_options(pnp_replay_opencv PRIVATE -march=native)
 endif()
