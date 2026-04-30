@@ -177,7 +177,10 @@ replace only pure-PnP-failed frames where AP3P has at least +5 strict 2px
 inliers over pure, median reprojection error is <= 60 px, and translation jump
 is <= 500k. That rule replaces frames `159,161,166,168,198,199` and improves
 offline 8s RMSE from 0.545953 to 0.525753. Treat this as a candidate to test
-with a real pure-C AP3P implementation, not as a proven in-pipeline result.
+with a real pure-C AP3P implementation, not as a proven in-pipeline result. On
+the full 30s room dump, the best swept offline rule only improves RMSE from
+1.759123 to 1.757817 (+0.001306), which is below the practical promotion
+threshold; do not port this rule directly without a stronger full-room signal.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
