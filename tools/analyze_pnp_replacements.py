@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--window", default=None, help="Optional START:END frame filter")
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--bottom", type=int, default=10)
+    parser.add_argument("--sweep_rules", action="store_true", help="Rank multi-frame replacement rules")
     args = parser.parse_args()
 
     start = end = None
@@ -178,9 +179,69 @@ def main():
                 "repl_rmse": repl_rmse,
                 "pure_ok": frame.pure_ok,
                 "pure_inl": frame.pure_inliers,
+                "idx": idx,
                 **{key: value for key, value in score.items() if key != "cv_center"},
+                "cv_center": score["cv_center"],
             }
         )
+
+    if args.sweep_rules:
+        rules = []
+        for pure_mode in ("any", "pure_failed", "pure_ok"):
+            for min_inl2 in (0, 3, 6, 9, 12, 16, 24, 32):
+                for min_gain in (-20, -10, -5, 0, 5, 10, 20):
+                    for max_mederr in (5, 10, 15, 30, 60, 120, 300, math.inf):
+                        for min_posz in (0.0, 0.5, 0.8, 0.95):
+                            for max_jump in (5000, 20000, 50000, 150000, 500000, math.inf):
+                                selected = []
+                                for row in rows:
+                                    if pure_mode == "pure_failed" and row["pure_ok"]:
+                                        continue
+                                    if pure_mode == "pure_ok" and not row["pure_ok"]:
+                                        continue
+                                    if row["cv_inl2"] < min_inl2:
+                                        continue
+                                    if row["cv_inl2"] - row["pure_inl"] < min_gain:
+                                        continue
+                                    if row["cv_mederr"] > max_mederr:
+                                        continue
+                                    if row["cv_posz"] < min_posz:
+                                        continue
+                                    if row["cv_jump"] > max_jump:
+                                        continue
+                                    selected.append(row)
+                                if not selected:
+                                    continue
+                                replaced = est_valid.copy()
+                                for row in selected:
+                                    replaced[row["idx"]] = row["cv_center"]
+                                _errors, rmse = ate_errors(replaced, gt_valid)
+                                rules.append(
+                                    {
+                                        "delta": base_rmse - rmse,
+                                        "rmse": rmse,
+                                        "count": len(selected),
+                                        "pure_mode": pure_mode,
+                                        "min_inl2": min_inl2,
+                                        "min_gain": min_gain,
+                                        "max_mederr": max_mederr,
+                                        "min_posz": min_posz,
+                                        "max_jump": max_jump,
+                                        "frames": ",".join(str(row["frame"]) for row in selected[:20]),
+                                    }
+                                )
+        rules.sort(key=lambda rule: rule["delta"], reverse=True)
+        print(f"base_rmse {base_rmse:.6f}")
+        print("rank delta rmse count pure_mode min_inl2 min_gain max_mederr min_posz max_jump frames")
+        for rank, rule in enumerate(rules[: args.top], start=1):
+            max_mederr = "inf" if math.isinf(rule["max_mederr"]) else f"{rule['max_mederr']:.0f}"
+            max_jump = "inf" if math.isinf(rule["max_jump"]) else f"{rule['max_jump']:.0f}"
+            print(
+                f"{rank:4d} {rule['delta']:.6f} {rule['rmse']:.6f} {rule['count']:5d} "
+                f"{rule['pure_mode']} {rule['min_inl2']:8d} {rule['min_gain']:8d} "
+                f"{max_mederr:>10} {rule['min_posz']:.2f} {max_jump:>8} {rule['frames']}"
+            )
+        return
 
     rows.sort(key=lambda row: row["rmse_delta"], reverse=True)
     winners = [row for row in rows if row["rmse_delta"] > 0.0]

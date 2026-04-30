@@ -154,6 +154,11 @@ python3 tools/analyze_pnp_replacements.py \
   --metrics runs/pure_c_iter/pnp_dump/test_freiburgroom525_pure_c_plus_8s.json \
   --gt external/twitchslam/videos/test_freiburgroom525.npz \
   --window 120:170
+python3 tools/analyze_pnp_replacements.py \
+  --dump runs/pure_c_iter/pnp_dump/room_8s.pnp \
+  --metrics runs/pure_c_iter/pnp_dump/test_freiburgroom525_pure_c_plus_8s.json \
+  --gt external/twitchslam/videos/test_freiburgroom525.npz \
+  --sweep_rules
 ```
 
 This is an offline diagnostic harness. It reports strict 2px/3px/5px inliers,
@@ -167,7 +172,12 @@ candidate frames by actual post-alignment ATE delta. On the same window,
 26/51 single-frame AP3P replacements improve RMSE, but the biggest winners
 include high-jump/high-median-error candidates while similar-looking frames are
 catastrophic losers. Do not use a simple jump cap or local reprojection proxy as
-the final scorer.
+the final scorer. The first offline rule-sweep winner on the 8s dump is:
+replace only pure-PnP-failed frames where AP3P has at least +5 strict 2px
+inliers over pure, median reprojection error is <= 60 px, and translation jump
+is <= 500k. That rule replaces frames `159,161,166,168,198,199` and improves
+offline 8s RMSE from 0.545953 to 0.525753. Treat this as a candidate to test
+with a real pure-C AP3P implementation, not as a proven in-pipeline result.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
