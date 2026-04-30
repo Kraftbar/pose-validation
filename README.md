@@ -159,6 +159,12 @@ python3 tools/analyze_pnp_replacements.py \
   --metrics runs/pure_c_iter/pnp_dump/test_freiburgroom525_pure_c_plus_8s.json \
   --gt external/twitchslam/videos/test_freiburgroom525.npz \
   --sweep_rules
+python3 tools/compare_traces.py \
+  --gt external/twitchslam/videos/test_freiburgroom525.npz \
+  --window 120:180 \
+  --run plus=runs/benchmark/test_freiburgroom525_pure_c_plus.json \
+  --run cpp=runs/benchmark/test_freiburgroom525_cpp.json \
+  --sort_by_delta
 ```
 
 This is an offline diagnostic harness. It reports strict 2px/3px/5px inliers,
@@ -181,6 +187,12 @@ with a real pure-C AP3P implementation, not as a proven in-pipeline result. On
 the full 30s room dump, the best swept offline rule only improves RMSE from
 1.759123 to 1.757817 (+0.001306), which is below the practical promotion
 threshold; do not port this rule directly without a stronger full-room signal.
+Use `tools/compare_traces.py` for cross-implementation diffs. Initial room
+diffs show `pure_c_plus` already beats `pure_c_orb` through most of frames
+120:180, but trails `cpp` badly after roughly frame 129; `cpp` has about
+2x-3x as many map points in that window, so the next comparison should inspect
+why C++ builds/keeps that early map structure instead of trying more ORB
+threshold tweaks blindly.
 
 Use `benchmark.ate_rmse` for ad-hoc ATE checks. A prior standalone Umeyama
 implementation produced a false room improvement, so keep all ATE calculations
