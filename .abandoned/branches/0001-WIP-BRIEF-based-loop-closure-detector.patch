@@ -1,0 +1,160 @@
+From 7e110ecea9273f508391f81a7d6303ea3288317a Mon Sep 17 00:00:00 2001
+From: Gaute <gautenybo@gmail.com>
+Date: Mon, 27 Apr 2026 23:26:30 +0200
+Subject: [PATCH] WIP: BRIEF-based loop closure detector
+
+Replaces the thumbnail-SAD detector (which empirically never fires on the
+canonical sequences) with per-KF BRIEF signatures + Hamming-sum scoring.
+
+State of this branch:
+- KFEntry carries up to 64 Brief256 descriptors (KF_SIG_MAX) sampled by
+  stride from tracked corners on insertion
+- find_loop_candidate replaced: for each query BRIEF, find min Hamming to
+  any candidate-KF BRIEF, sum across the query signature
+- Threshold 2700 (tuned to top ~5% of pairs after measuring distribution
+  on room: min=2385 p10=2861 p50=3372 p90=3874 max=4375)
+
+Why this is WIP and not on master: detection works (29 fires per 30s on
+room) but the trajectory is already exploding before any loop fires
+(|cur_t|=44km at first fire). The verify_loop pose recovery is also not
+metric-scale-consistent. See PURE_C_RECOVERY.md (commit c1242c7) for the
+full investigation. Real fix needs trust-region LM + P3P + PnP-based loop
+recovery before this branch becomes useful.
+
+---
+ simple_slam_c_plus.c | 79 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 67 insertions(+), 12 deletions(-)
+
+diff --git a/simple_slam_c_plus.c b/simple_slam_c_plus.c
+index c447ba2..38ae06a 100644
+--- a/simple_slam_c_plus.c
++++ b/simple_slam_c_plus.c
+@@ -997,12 +997,15 @@ static void track_corners_pure_lk(const unsigned char *p_g, const unsigned char
+     free(ok);
+ }
+ 
++#define KF_SIG_MAX 64
+ typedef struct {
+     unsigned char thumb[256];
+     int frame_id;
+     Pose pose;
+     CornerVec corners;
+     unsigned char *gray;
++    Brief256 sig[KF_SIG_MAX];
++    int sig_size;
+ } KFEntry;
+ typedef struct {
+     KFEntry *data;
+@@ -1020,19 +1023,49 @@ static void gen_thumbnail(const unsigned char *g, int w, int h, unsigned char *o
+         for (int x = 0; x < 16; x++)
+             out[y * 16 + x] = g[(y * h / 16) * w + (x * w / 16)];
+ }
+-static int find_loop_candidate(KFDB *db, const unsigned char *thumb, int current_id) {
++// Compute a per-KF "bag" of BRIEF descriptors from up to KF_SIG_MAX tracked
++// corners. More viewpoint-tolerant than the 16x16 thumbnail SAD it replaces.
++static void kf_compute_signature(KFEntry *kf, int w, int h) {
++    kf->sig_size = 0;
++    int stride = (kf->corners.size > KF_SIG_MAX) ? kf->corners.size / KF_SIG_MAX : 1;
++    for (int i = 0; i < kf->corners.size && kf->sig_size < KF_SIG_MAX; i += stride) {
++        Brief256 d;
++        if (compute_brief(kf->gray, w, h, kf->corners.data[i].x, kf->corners.data[i].y, &d))
++            kf->sig[kf->sig_size++] = d;
++    }
++}
++
++// Loop candidate scoring: for each BRIEF in the current signature, find the
++// minimum Hamming distance to any BRIEF in the candidate's signature. Sum
++// across the current signature → low total = visually similar keyframes.
++// Returns the best candidate KF index, or -1 if none below the threshold.
++static int find_loop_candidate(KFDB *db, const Brief256 *cur_sig, int cur_size, int current_id) {
++    (void)current_id;
+     int bi = -1;
+     uint32_t bs = 0xFFFFFFFF;
+     for (int i = 0; i < db->size - 50; i++) {
+-        uint32_t s = 0;
+-        for (int j = 0; j < 256; j++)
+-            s += abs(thumb[j] - db->data[i].thumb[j]);
+-        if (s < bs) {
+-            bs = s;
++        const KFEntry *kf = &db->data[i];
++        if (kf->sig_size == 0)
++            continue;
++        uint32_t total = 0;
++        for (int q = 0; q < cur_size; q++) {
++            int best = 256;
++            for (int t = 0; t < kf->sig_size; t++) {
++                int d = brief_hamming(&cur_sig[q], &kf->sig[t]);
++                if (d < best)
++                    best = d;
++            }
++            total += (uint32_t)best;
++        }
++        if (total < bs) {
++            bs = total;
+             bi = i;
+         }
+     }
+-    return (bs < 3500) ? bi : -1;
++    // Diagnostic: distribution on fr1/room with 64-desc signatures showed
++    //   min=2385 p10=2861 p50=3372 p90=3874 max=4375
++    // so 2700 keeps only the top ~5% of pairs.
++    return (bs < 2700) ? bi : -1;
+ }
+ 
+ static int verify_loop(KFDB *db, int lidx, const unsigned char *cgray, int w, int h, double fx,
+@@ -1363,18 +1396,38 @@ int main(int argc, char **argv) {
+                 }
+                 if (tracked.size < 600)
+                     extract_corners_pure(cblur, w, h, &tracked, 1000);
+-                unsigned char thumb[256];
+-                gen_thumbnail(cgray, w, h, thumb);
+-                int lidx = find_loop_candidate(&kf_db, thumb, frame_id);
++                // Compute the current frame's BRIEF signature (sample of up to
++                // KF_SIG_MAX tracked corners) for loop-closure detection.
++                Brief256 cur_sig[KF_SIG_MAX];
++                int cur_sig_size = 0;
++                {
++                    int stride = (tracked.size > KF_SIG_MAX) ? tracked.size / KF_SIG_MAX : 1;
++                    for (int i = 0; i < tracked.size && cur_sig_size < KF_SIG_MAX; i += stride) {
++                        Brief256 d;
++                        if (compute_brief(cgray, w, h, tracked.data[i].x, tracked.data[i].y, &d))
++                            cur_sig[cur_sig_size++] = d;
++                    }
++                }
++                int lidx = find_loop_candidate(&kf_db, cur_sig, cur_sig_size, frame_id);
+                 if (lidx >= 0) {
+                     Pose loop_pose;
+                     if (verify_loop(&kf_db, lidx, cgray, w, h, fx, fy, cx, cy, &loop_pose)) {
+-                        printf("LOOP CLOSED: %d with %d\n", frame_id, kf_db.data[lidx].frame_id);
++                        double tc[3], tl[3], tk[3];
++                        pose_get_translation(&pose, tc);
++                        pose_get_translation(&loop_pose, tl);
++                        pose_get_translation(&kf_db.data[lidx].pose, tk);
++                        double dc = sqrt(tc[0]*tc[0] + tc[1]*tc[1] + tc[2]*tc[2]);
++                        double dl = sqrt(tl[0]*tl[0] + tl[1]*tl[1] + tl[2]*tl[2]);
++                        double dk = sqrt(tk[0]*tk[0] + tk[1]*tk[1] + tk[2]*tk[2]);
++                        fprintf(stderr,
++                                "LOOP CLOSED: %d with %d  |cur_t|=%.3f  |loop_t|=%.3f  |kf_t|=%.3f\n",
++                                frame_id, kf_db.data[lidx].frame_id, dc, dl, dk);
+                         pose = loop_pose;
+                     }
+                 }
++
+                 KFEntry e;
+-                memcpy(e.thumb, thumb, 256);
++                memset(&e, 0, sizeof(e));
+                 e.frame_id = frame_id;
+                 e.pose = pose;
+                 e.corners.size = tracked.size;
+@@ -1382,6 +1435,8 @@ int main(int argc, char **argv) {
+                 memcpy(e.corners.data, tracked.data, tracked.size * sizeof(Corner));
+                 e.gray = malloc(w * h);
+                 memcpy(e.gray, cgray, w * h);
++                memcpy(e.sig, cur_sig, cur_sig_size * sizeof(Brief256));
++                e.sig_size = cur_sig_size;
+                 kfdb_push(&kf_db, e);
+                 local_ba(&kf_db, &map, fx, fy, cx, cy);
+                 if (kf_db.size > 0 && kf_db.size % 10 == 0)
+-- 
+2.34.1
+
