@@ -912,6 +912,73 @@ static int solve_3x3(double A[9], double b[3], double x[3]) {
     x[2] = M[11];
     return 1;
 }
+
+static int mat3_inverse(const double A[9], double inv[9]) {
+    double det = mat3_det(A);
+    if (fabs(det) < 1e-12)
+        return 0;
+    double s = 1.0 / det;
+    inv[0] =  (A[4] * A[8] - A[5] * A[7]) * s;
+    inv[1] = -(A[1] * A[8] - A[2] * A[7]) * s;
+    inv[2] =  (A[1] * A[5] - A[2] * A[4]) * s;
+    inv[3] = -(A[3] * A[8] - A[5] * A[6]) * s;
+    inv[4] =  (A[0] * A[8] - A[2] * A[6]) * s;
+    inv[5] = -(A[0] * A[5] - A[2] * A[3]) * s;
+    inv[6] =  (A[3] * A[7] - A[4] * A[6]) * s;
+    inv[7] = -(A[0] * A[7] - A[1] * A[6]) * s;
+    inv[8] =  (A[0] * A[4] - A[1] * A[3]) * s;
+    return 1;
+}
+
+static int solve_dense_n(double *A, double *b, double *x, int n) {
+    if (n <= 0)
+        return 0;
+    double *M = (double *)malloc((size_t)n * (size_t)(n + 1) * sizeof(double));
+    if (!M)
+        return 0;
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++)
+            M[r * (n + 1) + c] = A[r * n + c];
+        M[r * (n + 1) + n] = b[r];
+    }
+    for (int k = 0; k < n; k++) {
+        int piv = k;
+        double best = fabs(M[k * (n + 1) + k]);
+        for (int r = k + 1; r < n; r++) {
+            double v = fabs(M[r * (n + 1) + k]);
+            if (v > best) {
+                best = v;
+                piv = r;
+            }
+        }
+        if (best < 1e-12) {
+            free(M);
+            return 0;
+        }
+        if (piv != k) {
+            for (int c = k; c <= n; c++) {
+                double tmp = M[k * (n + 1) + c];
+                M[k * (n + 1) + c] = M[piv * (n + 1) + c];
+                M[piv * (n + 1) + c] = tmp;
+            }
+        }
+        double inv_piv = 1.0 / M[k * (n + 1) + k];
+        for (int c = k; c <= n; c++)
+            M[k * (n + 1) + c] *= inv_piv;
+        for (int r = 0; r < n; r++) {
+            if (r == k)
+                continue;
+            double f = M[r * (n + 1) + k];
+            for (int c = k; c <= n; c++)
+                M[r * (n + 1) + c] -= f * M[k * (n + 1) + c];
+        }
+    }
+    for (int i = 0; i < n; i++)
+        x[i] = M[i * (n + 1) + n];
+    free(M);
+    return 1;
+}
+
 static void pose_compose_relative(const Pose *rel, const Pose *prev, Pose *out) {
     double Rrel[9], Rprev[9], Rout[9], trel[3], tprev[3], tout[3];
     pose_get_rotation(rel, Rrel);
