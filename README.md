@@ -26,6 +26,9 @@ python3 check_regressions.py
 # Canonical full GT benchmark
 python3 benchmark_native.py --all_gt --force
 
+# Experimental parallel full GT benchmark
+python3 benchmark_native.py --all_gt --force --workers 4
+
 # Single GT dataset while diagnosing
 python3 benchmark_native.py --all_gt --video test_freiburgxyz525 --force
 
@@ -34,7 +37,9 @@ cmake -S . -B build-native
 cmake --build build-native -j
 ```
 
-Use `--workers 4` with full benchmark invocations when you want parallel runs.
+Use `--workers 4` only for exploratory wall-clock checks unless you intend to
+promote the parallel sweep as the new baseline. The timeout bump can let
+`pure_c_plus` process more frames than the serial 120-second canonical command.
 The generated benchmark artifacts live under `runs/benchmark/`.
 
 ## Ground Truth Datasets
@@ -66,30 +71,39 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `python` | **0.6793 m** | `cpp` | 0.7194 m |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7591 m |
-| `test_freiburgrpy525` | `cpp` | **0.0977 m** | `python` | 0.0982 m |
-| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_plus` | 0.1768 m |
+| `test_freiburgdesk525` | `python` | **0.6745 m** | `cpp` | 0.7194 m |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7283 m |
+| `test_freiburgrpy525` | `pure_c_plus` | **0.0959 m** | `cpp` | 0.0977 m |
+| `test_freiburgxyz525` | `cpp` | **0.1729 m** | `c` | 0.1777 m |
 
 Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | **0.6793** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7567 | 0.7307 |
-| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8673 | 1.7591 |
-| `test_freiburgrpy525` | 0.0982 | **0.0977** | 0.0998 | 0.0998 | 0.0992 | 0.0996 | 0.0990 |
-| `test_freiburgxyz525` | 0.1786 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1768 |
+| `test_freiburgdesk525` | **0.6745** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7562 | 0.7363 |
+| `test_freiburgroom525` | 1.8656 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8692 | 1.7283 |
+| `test_freiburgrpy525` | 0.0982 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0959** |
+| `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1817 |
+
+Runtime matrix from the same sweep, in seconds:
+
+| Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
+|----------|----------|-------|-----|----------|-----------------|--------------|---------------|
+| `test_freiburgdesk525` | 16.666 | 7.235 | 31.113 | 33.024 | 41.776 | 31.384 | 102.237 |
+| `test_freiburgroom525` | 16.039 | 7.917 | 32.775 | 25.092 | 42.869 | 40.008 | 120.890 |
+| `test_freiburgrpy525` | 18.841 | 8.906 | 25.776 | 15.965 | 57.170 | 37.062 | 124.564 |
+| `test_freiburgxyz525` | 19.931 | 9.719 | 51.192 | 65.927 | 36.745 | 36.549 | 124.380 |
 
 Mean ATE over the four GT datasets:
 
 | Impl | Mean ATE RMSE | GT Wins | Runner-up |
 |------|---------------|---------|-----------|
-| `cpp` | **0.6338** | **3** | 1 |
-| `pure_c_plus` | 0.6914 | 0 | 2 |
-| `python` | 0.7055 | 1 | 1 |
+| `cpp` | **0.6338** | **2** | 2 |
+| `pure_c_plus` | 0.6856 | 1 | 1 |
+| `python` | 0.7043 | 1 | 0 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
-| `pure_c_orb` | 0.7257 | 0 | 0 |
-| `c` | 0.7258 | 0 | 0 |
+| `pure_c_orb` | 0.7260 | 0 | 0 |
+| `c` | 0.7258 | 0 | 1 |
 | `pure_c` | 0.7258 | 0 | 0 |
 
 ## Benchmark Discipline
@@ -118,14 +132,17 @@ secondary metric. Watch for silent regressions: neutral ATE with a large
 map-density drop elsewhere usually means the change traded one failure mode for
 another. Record rejected trials with numbers in this README.
 
-Parallel mode is acceptable for full sweeps:
+Parallel mode is available, but treat it as exploratory unless you intend to
+promote the parallel sweep as the new baseline:
 
 ```bash
-python3 benchmark.py --all_gt --impl all --workers 4
+python3 benchmark_native.py --all_gt --force --workers 4
 ```
 
 Each worker gets `nproc / workers` OpenMP threads and the per-run timeout is
-auto-bumped so OpenMP-heavy implementations still finish all frames.
+auto-bumped. The longer timeout can change `pure_c_plus` frame counts and ATE
+relative to the serial 120-second command, so use the serial command above for
+canonical artifacts.
 Deterministic impls (`cpp`, `c`, `pure_c`, `pure_c_brief`, `pure_c_plus`)
 reproduce canonical ATE within +/- `0.0002`; `python` and `pure_c_orb` retain
 their natural run-to-run variance.

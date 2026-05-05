@@ -69,6 +69,8 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         cmd.extend(['--video', video])
     if args.force:
         cmd.append('--force')
+    if args.workers > 1:
+        cmd.extend(['--workers', str(args.workers)])
 
     print(f"$ {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, text=True, check=False)
@@ -373,6 +375,8 @@ def main() -> None:
     parser.add_argument('--video', action='append', default=None,
                         help='Video stem or filename to benchmark; may be repeated')
     parser.add_argument('--force', action='store_true')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel SLAM jobs passed through to benchmark.py (default 1 = serial)')
     parser.add_argument('--skip_run', action='store_true',
                         help='Only read an existing summary JSON and print the comparison table')
     parser.add_argument('--summary_json', default='',

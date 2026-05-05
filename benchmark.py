@@ -421,7 +421,7 @@ def main():
         # the resulting per-binary slowdown so runs still finish all frames.
         cores = os.cpu_count() or 1
         child_env['OMP_NUM_THREADS'] = str(max(1, cores // args.workers))
-        effective_timeout = max(args.timeout, args.timeout * args.workers / 2)
+        effective_timeout = max(args.timeout, args.timeout * args.workers * 2)
         print(f"[parallel] workers={args.workers} OMP_NUM_THREADS={child_env['OMP_NUM_THREADS']} "
               f"timeout={effective_timeout:.0f}s")
 
