@@ -71,38 +71,38 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `python` | **0.6745 m** | `cpp` | 0.7194 m |
+| `test_freiburgdesk525` | `python` | **0.6777 m** | `cpp` | 0.7194 m |
 | `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7283 m |
-| `test_freiburgrpy525` | `pure_c_plus` | **0.0959 m** | `cpp` | 0.0977 m |
+| `test_freiburgrpy525` | `pure_c_plus` | **0.0950 m** | `cpp` | 0.0977 m |
 | `test_freiburgxyz525` | `cpp` | **0.1729 m** | `c` | 0.1777 m |
 
 Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | **0.6745** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7562 | 0.7363 |
-| `test_freiburgroom525` | 1.8656 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8692 | 1.7283 |
-| `test_freiburgrpy525` | 0.0982 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0959** |
-| `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1817 |
+| `test_freiburgdesk525` | **0.6777** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7566 | 0.7363 |
+| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8640 | 1.7283 |
+| `test_freiburgrpy525` | 0.0984 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0950** |
+| `test_freiburgxyz525` | 0.1773 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1817 |
 
 Runtime matrix from the same sweep, in seconds:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 16.666 | 7.235 | 31.113 | 33.024 | 41.776 | 31.384 | 102.237 |
-| `test_freiburgroom525` | 16.039 | 7.917 | 32.775 | 25.092 | 42.869 | 40.008 | 120.890 |
-| `test_freiburgrpy525` | 18.841 | 8.906 | 25.776 | 15.965 | 57.170 | 37.062 | 124.564 |
-| `test_freiburgxyz525` | 19.931 | 9.719 | 51.192 | 65.927 | 36.745 | 36.549 | 124.380 |
+| `test_freiburgdesk525` | 16.440 | 7.650 | 32.135 | 33.070 | 42.288 | 33.420 | 106.177 |
+| `test_freiburgroom525` | 16.304 | 7.927 | 31.489 | 27.581 | 43.570 | 39.417 | 125.227 |
+| `test_freiburgrpy525` | 17.870 | 8.652 | 25.649 | 17.032 | 58.534 | 41.139 | 122.175 |
+| `test_freiburgxyz525` | 23.341 | 10.711 | 52.268 | 65.793 | 36.541 | 36.374 | 123.937 |
 
 Mean ATE over the four GT datasets:
 
 | Impl | Mean ATE RMSE | GT Wins | Runner-up |
 |------|---------------|---------|-----------|
 | `cpp` | **0.6338** | **2** | 2 |
-| `pure_c_plus` | 0.6856 | 1 | 1 |
-| `python` | 0.7043 | 1 | 0 |
+| `pure_c_plus` | 0.6853 | 1 | 1 |
+| `python` | 0.7048 | 1 | 0 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
-| `pure_c_orb` | 0.7260 | 0 | 0 |
+| `pure_c_orb` | 0.7249 | 0 | 0 |
 | `c` | 0.7258 | 0 | 1 |
 | `pure_c` | 0.7258 | 0 | 0 |
 
