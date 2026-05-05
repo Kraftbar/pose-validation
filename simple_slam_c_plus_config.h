@@ -43,7 +43,11 @@ typedef struct {
     int healthy_keyframes;
     int late_kf_cooldown;
     int ba_interval;
+    int ba_start_keyframes;
+    int ba_max_points;
     int global_ba_interval;
+    int global_ba_start_keyframes;
+    int global_ba_max_points;
     int map_hygiene;
     int kf_warmup_frames;
     int first_kf_observations;
@@ -176,6 +180,30 @@ static int keyframe_interval_for_frame(const Config *c, int frame_id) {
         interval < LATE_KF_MIN_INTERVAL)
         interval = LATE_KF_MIN_INTERVAL;
     return interval;
+}
+
+static int config_allows_ba(const Config *c, int keyframes, int map_points) {
+    if (c->ba_interval <= 0 || keyframes <= 0)
+        return 0;
+    if (keyframes % c->ba_interval != 0)
+        return 0;
+    if (c->ba_start_keyframes > 0 && keyframes < c->ba_start_keyframes)
+        return 0;
+    if (c->ba_max_points > 0 && map_points > c->ba_max_points)
+        return 0;
+    return 1;
+}
+
+static int config_allows_global_ba(const Config *c, int keyframes, int map_points) {
+    if (c->global_ba_interval <= 0 || keyframes <= 0)
+        return 0;
+    if (keyframes % c->global_ba_interval != 0)
+        return 0;
+    if (c->global_ba_start_keyframes > 0 && keyframes < c->global_ba_start_keyframes)
+        return 0;
+    if (c->global_ba_max_points > 0 && map_points > c->global_ba_max_points)
+        return 0;
+    return 1;
 }
 
 static Config parse_args(int argc, char **argv) {
@@ -354,8 +382,16 @@ static Config parse_args(int argc, char **argv) {
             c.late_kf_cooldown = 1;
         else if (!strcmp(argv[i], "--ba_interval") && i + 1 < argc)
             c.ba_interval = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ba_start_keyframes") && i + 1 < argc)
+            c.ba_start_keyframes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ba_max_points") && i + 1 < argc)
+            c.ba_max_points = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--global_ba_interval") && i + 1 < argc)
             c.global_ba_interval = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--global_ba_start_keyframes") && i + 1 < argc)
+            c.global_ba_start_keyframes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--global_ba_max_points") && i + 1 < argc)
+            c.global_ba_max_points = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--map_hygiene"))
             c.map_hygiene = 1;
         else if (!strcmp(argv[i], "--kf_warmup_frames") && i + 1 < argc)

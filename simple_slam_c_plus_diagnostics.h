@@ -32,7 +32,10 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"avg_inliers_after_first\": %f, \"kf_min_inliers\": %d, \"kf_period\": %d, "
             "\"kf_min_interval\": %d, \"healthy_keyframes\": %d, "
             "\"late_kf_cooldown\": %d, \"ba_interval\": %d, "
-            "\"global_ba_interval\": %d, \"map_hygiene\": %d, "
+            "\"ba_start_keyframes\": %d, \"ba_max_points\": %d, "
+            "\"global_ba_interval\": %d, "
+            "\"global_ba_start_keyframes\": %d, \"global_ba_max_points\": %d, "
+            "\"map_hygiene\": %d, "
             "\"kf_warmup_frames\": %d, "
             "\"new_point_obs\": %d, \"pnp_min_obs\": %d, \"pnp_start_frame\": %d, "
             "\"delayed_init_frames\": %d, "
@@ -83,7 +86,9 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             s->size, pts, dur, cfg->video_path, cfg->proc_w, cfg->proc_h, kf, tri,
             cfg->speed_profile ? cfg->speed_profile : "", av,
             cfg->kf_min_inliers, cfg->kf_period, cfg->kf_min_interval, cfg->healthy_keyframes,
-            cfg->late_kf_cooldown, cfg->ba_interval, cfg->global_ba_interval, cfg->map_hygiene,
+            cfg->late_kf_cooldown, cfg->ba_interval, cfg->ba_start_keyframes,
+            cfg->ba_max_points, cfg->global_ba_interval, cfg->global_ba_start_keyframes,
+            cfg->global_ba_max_points, cfg->map_hygiene,
             cfg->kf_warmup_frames, cfg->new_point_obs, cfg->pnp_min_obs, cfg->pnp_start_frame,
             cfg->delayed_init_frames, cfg->candidate_tracks, cfg->candidate_min_obs, cfg->candidate_min_age,
             cfg->candidate_grid_cols, cfg->candidate_grid_rows, cfg->candidate_promote_per_cell,
@@ -148,18 +153,21 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
 static void write_profile_csv(FILE *f, const ProfileStatVec *p) {
     fprintf(f,
             "frame_id,decode,gray_blur,feature,lk,relink,pred_lm,pnp,essential,pose_lm,"
-            "triangulate,refill,loop,ba,global_ba,metrics,total\n");
+            "triangulate,refill,loop,ba,ba_local,ba_joint,pnp_quality,map_hygiene,"
+            "global_ba,metrics,total\n");
     for (int i = 0; i < p->size; i++) {
         const ProfileStat *s = &p->data[i];
         double total = s->decode + s->gray_blur + s->feature + s->lk + s->relink + s->pred_lm +
                        s->pnp + s->essential + s->pose_lm + s->triangulate + s->refill +
-                       s->loop + s->ba + s->global_ba + s->metrics;
+                       s->loop + s->ba + s->pnp_quality + s->map_hygiene + s->global_ba +
+                       s->metrics;
         fprintf(f,
                 "%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,"
-                "%.9f,%.9f,%.9f,%.9f\n",
+                "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
                 s->frame_id, s->decode, s->gray_blur, s->feature, s->lk, s->relink,
                 s->pred_lm, s->pnp, s->essential, s->pose_lm, s->triangulate, s->refill,
-                s->loop, s->ba, s->global_ba, s->metrics, total);
+                s->loop, s->ba, s->ba_local, s->ba_joint, s->pnp_quality, s->map_hygiene,
+                s->global_ba, s->metrics, total);
     }
 }
 

@@ -71,8 +71,8 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `python` | **0.6777 m** | `cpp` | 0.7194 m |
-| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7283 m |
+| `test_freiburgdesk525` | `python` | **0.6756 m** | `cpp` | 0.7194 m |
+| `test_freiburgroom525` | `cpp` | **1.5452 m** | `pure_c_plus` | 1.7103 m |
 | `test_freiburgrpy525` | `pure_c_plus` | **0.0950 m** | `cpp` | 0.0977 m |
 | `test_freiburgxyz525` | `cpp` | **0.1729 m** | `c` | 0.1777 m |
 
@@ -80,31 +80,31 @@ Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | **0.6777** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7566 | 0.7363 |
-| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8640 | 1.7283 |
-| `test_freiburgrpy525` | 0.0984 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0950** |
-| `test_freiburgxyz525` | 0.1773 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1817 |
+| `test_freiburgdesk525` | **0.6756** | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7571 | 0.7363 |
+| `test_freiburgroom525` | 1.8659 | **1.5452** | 1.8689 | 1.8689 | 1.8518 | 1.8690 | 1.7103 |
+| `test_freiburgrpy525` | 0.0985 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0994 | **0.0950** |
+| `test_freiburgxyz525` | 0.1787 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1828 |
 
 Runtime matrix from the same sweep, in seconds:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 16.440 | 7.650 | 32.135 | 33.070 | 42.288 | 33.420 | 106.177 |
-| `test_freiburgroom525` | 16.304 | 7.927 | 31.489 | 27.581 | 43.570 | 39.417 | 125.227 |
-| `test_freiburgrpy525` | 17.870 | 8.652 | 25.649 | 17.032 | 58.534 | 41.139 | 122.175 |
-| `test_freiburgxyz525` | 23.341 | 10.711 | 52.268 | 65.793 | 36.541 | 36.374 | 123.937 |
+| `test_freiburgdesk525` | 15.843 | 7.335 | 30.730 | 32.613 | 40.271 | 31.225 | 114.005 |
+| `test_freiburgroom525` | 17.097 | 8.007 | 32.425 | 27.075 | 45.441 | 43.523 | 126.369 |
+| `test_freiburgrpy525` | 18.392 | 8.683 | 25.651 | 17.618 | 59.109 | 40.428 | 121.944 |
+| `test_freiburgxyz525` | 20.539 | 9.553 | 51.746 | 67.383 | 37.702 | 45.490 | 120.006 |
 
 Mean ATE over the four GT datasets:
 
 | Impl | Mean ATE RMSE | GT Wins | Runner-up |
 |------|---------------|---------|-----------|
 | `cpp` | **0.6338** | **2** | 2 |
-| `pure_c_plus` | 0.6853 | 1 | 1 |
-| `python` | 0.7048 | 1 | 0 |
+| `pure_c_plus` | 0.6811 | 1 | 1 |
+| `python` | 0.7047 | 1 | 0 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
-| `pure_c_orb` | 0.7249 | 0 | 0 |
 | `c` | 0.7258 | 0 | 1 |
 | `pure_c` | 0.7258 | 0 | 0 |
+| `pure_c_orb` | 0.7261 | 0 | 0 |
 
 ## Benchmark Discipline
 
@@ -361,7 +361,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | TwitchSLAM reference benchmark | TwitchSLAM is only modestly more accurate on room while being far slower: room 8s ATE was 0.3373 in 58.6s wall time vs the current pure-C short-window best at 0.3619, and room 30s with a 300s timeout processed only 654/750 frames with ATE 1.4422. Treat it as a robustness reference, not a target implementation. Runs: `runs/benchmark_twitchslam/`. |
 | Room full-run fast profile sweeps (`pnp_dlt_iters=100/200`, LK 7/3) | All worsened the current fast-320/no-BA room 30s result: PnP100 1.8334, PnP200 1.8265, LK7/3 1.8139 vs existing PnP150 1.6861. More points/inliers again correlated with worse ATE. |
 | BA every 5 frames with global BA off | Room 30s moved to 1.7793 and desk 30s to 0.7563; near existing behavior, not a full-run win. |
-| Joint Schur-complement local BA + map-point culling (`--joint_ba`) | Mathematically correct (5-KF window, 1 fixed gauge KF, χ²(2,0.95)=5.991 Huber, LM with diagonal damping and step rejection, Schur-eliminated points; cull at 8 px reproj. when ALL window obs are bad). Full sweep regressed every sequence: desk +0.034, room +0.039, rpy +0.018, xyz neutral (`runs/joint_ba_sweep/`). Pose-only joint BA (skip dP back-sub) on 8s room also regressed (0.635 vs 0.545). Code retained behind `--joint_ba` flag (`joint_local_ba`, `cull_map_points_window` in `simple_slam_c_plus.c`); useful baseline for future work that pairs BA with proper keyframe selection / initialization. Default behavior unchanged. |
+| Joint Schur-complement local BA + map-point culling (`--joint_ba`) | Mathematically correct (5-KF window, 1 fixed gauge KF, χ²(2,0.95)=5.991 Huber, LM with diagonal damping and step rejection, Schur-eliminated points; cull at 8 px reproj. when ALL window obs are bad). Full sweep regressed every sequence: desk +0.034, room +0.039, rpy +0.018, xyz neutral (`runs/joint_ba_sweep/`). Pose-only joint BA (skip dP back-sub) on 8s room also regressed (0.635 vs 0.545). Code retained behind `--joint_ba` flag (`joint_local_ba` in `simple_slam_c_plus_backend_ba.h`, `cull_map_points_window` in `simple_slam_c_plus_backend_map.h`); useful baseline for future work that pairs BA with proper keyframe selection / initialization. Default behavior unchanged. |
 
 Next useful work should still start on the PnP side, but do not retry another
 quick numeric P3P approximation. The next candidate generator should be a
