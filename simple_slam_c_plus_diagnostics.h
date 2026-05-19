@@ -29,10 +29,12 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "{\n  \"frames\": %d, \"points\": %d, \"duration_sec\": %f, \"video_path\": \"%s\", "
             "\"proc_w\": %d, \"proc_h\": %d, \"keyframes\": %d, \"tri_points_total\": %d, "
             "\"speed_profile\": \"%s\", "
+            "\"ransac_seed\": %d, "
             "\"avg_inliers_after_first\": %f, \"kf_min_inliers\": %d, \"kf_period\": %d, "
             "\"kf_min_interval\": %d, \"healthy_keyframes\": %d, "
             "\"late_kf_cooldown\": %d, \"ba_interval\": %d, "
             "\"ba_start_keyframes\": %d, \"ba_max_points\": %d, "
+            "\"local_ba_fix_oldest\": %d, "
             "\"global_ba_interval\": %d, "
             "\"global_ba_start_keyframes\": %d, \"global_ba_max_points\": %d, "
             "\"map_hygiene\": %d, "
@@ -47,7 +49,8 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"first_kf_observations\": %d, "
             "\"unique_kf_observations\": %d, \"essential_cheirality_max\": %d, "
             "\"tri_min_parallax_deg\": %f, \"tri_max_reproj_px\": %f, "
-            "\"tri_max_depth\": %f, \"tri_max_depth_ratio\": %f, "
+            "\"tri_max_depth\": %f, \"tri_max_depth_pnp\": %f, "
+            "\"tri_max_depth_ratio\": %f, "
             "\"tri_source_kf_gap\": %d, "
             "\"pnp_pred_reproj_gate\": %f, "
             "\"pnp_quality_gate_px\": %f, \"pnp_quality_min_obs\": %d, "
@@ -60,13 +63,23 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"pnp_p3p_min_gain\": %d, \"pnp_p3p_max_mederr\": %f, "
             "\"pnp_p3p_min_posz\": %f, \"pnp_dlt_iters\": %d, "
             "\"pnp_dlt_pretest\": %d, \"pnp_dlt_pretest_margin\": %d, "
+            "\"pnp_score_rigid\": %d, \"pnp_validate_rigid\": %d, "
+            "\"pnp_validate_rigid_min_points\": %d, "
+            "\"pnp_normalize_world\": %d, "
+            "\"pnp_low_e_fallback\": %d, \"pnp_low_e_max_inliers\": %d, "
+            "\"pnp_low_e_min_inliers\": %d, \"pnp_low_e_min_gain\": %d, "
+            "\"pnp_low_e_min_jump\": %f, "
+            "\"pnp_low_e_min_map_points\": %d, "
+            "\"pnp_low_e_min_pose_jump\": %f, "
             "\"ffmpeg_gray\": %d, \"fast_corners\": %d, \"distributed_features\": %d, "
-            "\"pyramid_features\": %d, "
+            "\"pyramid_features\": %d, \"subpixel_features\": %d, "
+            "\"feature_min_dist\": %d, "
             "\"max_points\": %d, \"lk_iters\": %d, \"lk_back_iters\": %d, "
             "\"pose_lm_iters\": %d, \"essential_iters\": %d, "
             "\"descriptor_map_admission\": %d, \"descriptor_primary_admission\": %d, "
             "\"descriptor_mutual_admission\": %d, "
-            "\"oriented_brief\": %d, "
+            "\"update_map_descriptors\": %d, "
+            "\"oriented_brief\": %d, \"brief_patch_radius\": %d, "
             "\"descriptor_admission_max_hamming\": %d, "
             "\"descriptor_admission_ratio\": %f, \"descriptor_primary_map_cap\": %d, "
             "\"descriptor_source_kf_gap\": %d, "
@@ -76,18 +89,39 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"e_shape_grid_cap\": %d, \"e_shape_max_disp\": %f, "
             "\"e_shape_max_fb_err\": %f, \"e_shape_target_disp\": %f, "
             "\"anchor_e_pose\": %d, \"anchor_max_features\": %d, "
-            "\"anchor_max_hamming\": %d, \"anchor_ratio\": %f, "
+            "\"anchor_max_hamming\": %d, \"anchor_mutual\": %d, "
+            "\"anchor_ratio\": %f, "
             "\"admission_ranked\": %d, \"admission_finite_only\": %d, "
             "\"admission_batch_ranked\": %d, \"admission_batch_deferred\": %d, "
             "\"admission_target_disp\": %f, "
             "\"admission_fb_weight\": %f, "
+            "\"admission_min_inliers\": %d, "
+            "\"admission_pnp_min_inliers\": %d, "
             "\"admission_max_new_points\": %d, \"admission_grid_cap\": %d, "
+            "\"normalize_world_scale\": %d, "
+            "\"output_smooth_alpha\": %f, "
+            "\"output_smooth_outlier_alpha\": %f, "
+            "\"output_smooth_residual_k\": %f, "
+            "\"output_smooth_window\": %d, "
+            "\"output_smooth_unstable_alpha\": %f, "
+            "\"output_smooth_unstable_residual_k\": %f, "
+            "\"output_smooth_unstable_window\": %d, "
+            "\"output_smooth_unstable_points_added\": %d, "
+            "\"output_smooth_unstable_jump\": %f, "
+            "\"output_smooth_unstable_jump_count\": %d, "
+            "\"output_smooth_unstable_cap_residual\": %d, "
+            "\"output_smooth_low_link_alpha\": %f, "
+            "\"output_smooth_low_link_threshold\": %d, "
+            "\"output_smooth_low_link_window\": %d, "
+            "\"output_smooth_low_link_count\": %d, "
+            "\"output_smooth_low_link_include_current\": %d, "
             "\"timeline\": [\n",
             s->size, pts, dur, cfg->video_path, cfg->proc_w, cfg->proc_h, kf, tri,
-            cfg->speed_profile ? cfg->speed_profile : "", av,
+            cfg->speed_profile ? cfg->speed_profile : "", cfg->ransac_seed, av,
             cfg->kf_min_inliers, cfg->kf_period, cfg->kf_min_interval, cfg->healthy_keyframes,
             cfg->late_kf_cooldown, cfg->ba_interval, cfg->ba_start_keyframes,
-            cfg->ba_max_points, cfg->global_ba_interval, cfg->global_ba_start_keyframes,
+            cfg->ba_max_points, cfg->local_ba_fix_oldest,
+            cfg->global_ba_interval, cfg->global_ba_start_keyframes,
             cfg->global_ba_max_points, cfg->map_hygiene,
             cfg->kf_warmup_frames, cfg->new_point_obs, cfg->pnp_min_obs, cfg->pnp_start_frame,
             cfg->delayed_init_frames, cfg->candidate_tracks, cfg->candidate_min_obs, cfg->candidate_min_age,
@@ -96,30 +130,62 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             cfg->first_kf_observations,
             cfg->unique_kf_observations, cfg->essential_cheirality_max,
             cfg->tri_min_parallax_deg, cfg->tri_max_reproj_px,
-            cfg->tri_max_depth, cfg->tri_max_depth_ratio, cfg->tri_source_kf_gap,
+            cfg->tri_max_depth, cfg->tri_max_depth_pnp,
+            cfg->tri_max_depth_ratio, cfg->tri_source_kf_gap,
             cfg->pnp_pred_reproj_gate,
             cfg->pnp_quality_gate_px, cfg->pnp_quality_min_obs, cfg->pnp_quality_window,
             cfg->obs_stat_gate_px, cfg->obs_stat_min_good, cfg->obs_stat_max_bad_ratio,
             cfg->pnp_p3p_fallback, cfg->pnp_p3p_observe, cfg->pnp_p3p_iterations,
             cfg->pnp_p3p_max_jump, cfg->pnp_p3p_min_inl2, cfg->pnp_p3p_min_gain,
             cfg->pnp_p3p_max_mederr, cfg->pnp_p3p_min_posz, cfg->pnp_dlt_iters, cfg->pnp_dlt_pretest,
-            cfg->pnp_dlt_pretest_margin, cfg->ffmpeg_gray, cfg->fast_corners,
-            cfg->distributed_features, cfg->pyramid_features,
-            cfg->max_points, cfg->lk_iters, cfg->lk_back_iters, cfg->pose_lm_iters, cfg->essential_iters,
+            cfg->pnp_dlt_pretest_margin, cfg->pnp_score_rigid,
+            cfg->pnp_validate_rigid, cfg->pnp_validate_rigid_min_points,
+            cfg->pnp_normalize_world,
+            cfg->pnp_low_e_fallback, cfg->pnp_low_e_max_inliers,
+            cfg->pnp_low_e_min_inliers, cfg->pnp_low_e_min_gain,
+            cfg->pnp_low_e_min_jump,
+            cfg->pnp_low_e_min_map_points,
+            cfg->pnp_low_e_min_pose_jump,
+            cfg->ffmpeg_gray, cfg->fast_corners,
+            cfg->distributed_features, cfg->pyramid_features, cfg->subpixel_features,
+            cfg->feature_min_dist,
+            cfg->max_points, cfg->lk_iters, cfg->lk_back_iters, cfg->pose_lm_iters,
+            cfg->essential_iters,
             cfg->descriptor_map_admission, cfg->descriptor_primary_admission,
-            cfg->descriptor_mutual_admission, cfg->oriented_brief,
+            cfg->descriptor_mutual_admission, cfg->update_map_descriptors,
+            cfg->oriented_brief,
+            cfg->brief_patch_radius,
             cfg->descriptor_admission_max_hamming,
             cfg->descriptor_admission_ratio, cfg->descriptor_primary_map_cap,
-            cfg->descriptor_source_kf_gap, cfg->triangulate_with_e_pose,
+            cfg->descriptor_source_kf_gap,
+            cfg->triangulate_with_e_pose,
             cfg->triangulate_relative_frame, cfg->shape_e_inliers,
             cfg->e_shape_max_matches, cfg->e_shape_grid_cap,
             cfg->e_shape_max_disp, cfg->e_shape_max_fb_err,
             cfg->e_shape_target_disp, cfg->anchor_e_pose,
-            cfg->anchor_max_features, cfg->anchor_max_hamming, cfg->anchor_ratio,
+            cfg->anchor_max_features, cfg->anchor_max_hamming, cfg->anchor_mutual,
+            cfg->anchor_ratio,
             cfg->admission_ranked, cfg->admission_finite_only, cfg->admission_batch_ranked,
             cfg->admission_batch_deferred,
             cfg->admission_target_disp, cfg->admission_fb_weight,
-            cfg->admission_max_new_points, cfg->admission_grid_cap);
+            cfg->admission_min_inliers,
+            cfg->admission_pnp_min_inliers,
+            cfg->admission_max_new_points, cfg->admission_grid_cap,
+            cfg->normalize_world_scale, cfg->output_smooth_alpha,
+            cfg->output_smooth_outlier_alpha, cfg->output_smooth_residual_k,
+            cfg->output_smooth_window,
+            cfg->output_smooth_unstable_alpha,
+            cfg->output_smooth_unstable_residual_k,
+            cfg->output_smooth_unstable_window,
+            cfg->output_smooth_unstable_points_added,
+            cfg->output_smooth_unstable_jump,
+            cfg->output_smooth_unstable_jump_count,
+            cfg->output_smooth_unstable_cap_residual,
+            cfg->output_smooth_low_link_alpha,
+            cfg->output_smooth_low_link_threshold,
+            cfg->output_smooth_low_link_window,
+            cfg->output_smooth_low_link_count,
+            cfg->output_smooth_low_link_include_current);
     for (int i = 0; i < s->size; i++)
         fprintf(f,
                 "    {\"frame_id\": %d, \"inliers\": %d, \"is_keyframe\": %s, \"points_added\": "
@@ -132,6 +198,7 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
                 "\"pnp_p3p_inliers3\": %d, \"pnp_p3p_inliers5\": %d, "
                 "\"pnp_p3p_mederr\": %f, \"pnp_p3p_posz\": %f, "
                 "\"pnp_p3p_jump\": %f, \"pnp_p3p_xyz\": [%f,%f,%f], "
+                "\"raw_xyz\": [%f,%f,%f], "
                 "\"trans_jump\": %f, \"xyz\": [%f,%f,%f]}%s\n",
                 s->data[i].frame_id, s->data[i].inliers, s->data[i].is_keyframe ? "true" : "false",
                 s->data[i].points_added, s->data[i].points_total, s->data[i].method,
@@ -144,7 +211,9 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
                 s->data[i].pnp_p3p_inliers5, s->data[i].pnp_p3p_mederr,
                 s->data[i].pnp_p3p_posz, s->data[i].pnp_p3p_jump,
                 s->data[i].pnp_p3p_xyz[0], s->data[i].pnp_p3p_xyz[1],
-                s->data[i].pnp_p3p_xyz[2], s->data[i].trans_jump, s->data[i].xyz[0],
+                s->data[i].pnp_p3p_xyz[2], s->data[i].raw_xyz[0],
+                s->data[i].raw_xyz[1], s->data[i].raw_xyz[2],
+                s->data[i].trans_jump, s->data[i].xyz[0],
                 s->data[i].xyz[1], s->data[i].xyz[2],
                 (i + 1 < s->size) ? "," : "");
     fprintf(f, "  ]\n}\n");
@@ -274,10 +343,68 @@ static void write_map_admission_summary(FILE *f, int frame_id, int candidates, i
             mean_depth, min_depth, max_depth);
 }
 
+static void write_map_admission_detail(FILE *f, int frame_id, const char *source,
+                                       const char *decision, int method, int inliers,
+                                       int match_idx, int query_idx, int train_idx, int cell,
+                                       const Pose *p1, const Pose *p2, double reproj,
+                                       double parallax, double depth, double z1, double z2,
+                                       double fb_err, double track_disp, double score) {
+    if (!f)
+        return;
+    double baseline = NAN;
+    if (p1 && p2) {
+        double c1[3], c2[3];
+        camera_center_from_pose(p1, c1);
+        camera_center_from_pose(p2, c2);
+        baseline = vec3_dist(c1, c2);
+    }
+    fprintf(f, "%d,%s,%s,%d,%d,%d,%d,%d,%d,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            frame_id, source ? source : "", decision ? decision : "", method, inliers,
+            match_idx, query_idx, train_idx, cell, baseline, reproj, parallax, depth,
+            z1, z2, fb_err, track_disp, score);
+}
+
+static void write_map_lifecycle_dump(FILE *f, const Map *map,
+                                     const MapLifecycleVec *lifecycle,
+                                     int final_frame) {
+    if (!f)
+        return;
+    for (int i = 0; i < lifecycle->size; i++) {
+        const MapLifecycle *row = &lifecycle->data[i];
+        int final_obs = 0, good_obs = 0, bad_obs = 0, alive = 0;
+        double x = NAN, y = NAN, z = NAN;
+        int span_frames = row->last_frame >= row->birth_frame
+                              ? row->last_frame - row->birth_frame
+                              : 0;
+        int frames_since_seen = final_frame >= row->last_frame
+                                    ? final_frame - row->last_frame
+                                    : 0;
+        if (row->map_idx >= 0 && row->map_idx < map->size) {
+            const MapPoint *mp = &map->data[row->map_idx];
+            final_obs = mp->obs;
+            good_obs = mp->good_obs;
+            bad_obs = mp->bad_obs;
+            alive = mp->obs > 0;
+            x = mp->x;
+            y = mp->y;
+            z = mp->z;
+        }
+        fprintf(f,
+                "%d,%d,%d,%d,%d,%s,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%.9f,%.9f,%.9f\n",
+                row->map_idx, row->birth_frame, row->last_frame, span_frames,
+                frames_since_seen, row->source ? row->source : "", row->method,
+                row->inliers, row->cell, row->reproj, row->parallax, row->depth,
+                row->fb_err, row->track_disp, row->score, final_obs, good_obs,
+                bad_obs, alive, x, y, z);
+    }
+}
+
 typedef struct {
     FILE *pnp_dump;
     FILE *track_dump;
     FILE *map_admission_dump;
+    FILE *map_admission_detail_dump;
+    FILE *map_lifecycle_dump;
     FILE *e_inlier_dump;
 } DiagnosticsFiles;
 
@@ -310,6 +437,28 @@ static int diagnostics_open_files(const Config *cfg, DiagnosticsFiles *diag) {
         }
         fprintf(diag->map_admission_dump,
                 "frame_id,candidates,accepted,baseline,mean_reproj,mean_parallax,mean_depth,min_depth,max_depth\n");
+    }
+    if (cfg->map_admission_detail_dump) {
+        ensure_parent_dir(cfg->map_admission_detail_dump);
+        diag->map_admission_detail_dump = fopen(cfg->map_admission_detail_dump, "w");
+        if (!diag->map_admission_detail_dump) {
+            fprintf(stderr, "Failed to open map admission detail dump: %s\n",
+                    cfg->map_admission_detail_dump);
+            return 0;
+        }
+        fprintf(diag->map_admission_detail_dump,
+                "frame_id,source,decision,method,inliers,match_idx,query_idx,train_idx,cell,baseline,reproj,parallax,depth,z1,z2,fb_err,track_disp,score\n");
+    }
+    if (cfg->map_lifecycle_dump) {
+        ensure_parent_dir(cfg->map_lifecycle_dump);
+        diag->map_lifecycle_dump = fopen(cfg->map_lifecycle_dump, "w");
+        if (!diag->map_lifecycle_dump) {
+            fprintf(stderr, "Failed to open map lifecycle dump: %s\n",
+                    cfg->map_lifecycle_dump);
+            return 0;
+        }
+        fprintf(diag->map_lifecycle_dump,
+                "map_idx,birth_frame,last_seen_frame,span_frames,frames_since_seen,source,method,inliers,cell,birth_reproj,birth_parallax,birth_depth,birth_fb_err,birth_track_disp,birth_score,final_obs,good_obs,bad_obs,alive,x,y,z\n");
     }
     if (cfg->e_inlier_dump) {
         ensure_parent_dir(cfg->e_inlier_dump);
@@ -351,6 +500,10 @@ static void diagnostics_close_files(DiagnosticsFiles *diag) {
         fclose(diag->track_dump);
     if (diag->map_admission_dump)
         fclose(diag->map_admission_dump);
+    if (diag->map_admission_detail_dump)
+        fclose(diag->map_admission_detail_dump);
+    if (diag->map_lifecycle_dump)
+        fclose(diag->map_lifecycle_dump);
     if (diag->e_inlier_dump)
         fclose(diag->e_inlier_dump);
 }

@@ -50,12 +50,13 @@ static void select_corner_candidates(CornerScore *cand, int size, int w, int h, 
     if (size > 1)
         qsort(cand, (size_t)size, sizeof(CornerScore), corner_score_cmp_desc);
     int min_dist2 = min_dist * min_dist;
-    int *used = (int *)calloc((size_t)size, sizeof(int));
-    if (!used) {
-        fprintf(stderr, "out of memory\n");
-        exit(1);
-    }
+    int *used = NULL;
     if (distributed) {
+        used = (int *)calloc((size_t)size, sizeof(int));
+        if (!used) {
+            fprintf(stderr, "out of memory\n");
+            exit(1);
+        }
         int per_cell = (max + FEATURE_GRID_CELLS - 1) / FEATURE_GRID_CELLS;
         if (per_cell < 1)
             per_cell = 1;
@@ -64,7 +65,8 @@ static void select_corner_candidates(CornerScore *cand, int size, int w, int h, 
             int cell = feature_grid_cell(cand[i].x, cand[i].y, w, h);
             if (counts[cell] >= per_cell)
                 continue;
-            if (!corner_far_enough(out, cand[i].x, cand[i].y, min_dist2))
+            if (min_dist2 > 0 &&
+                !corner_far_enough(out, cand[i].x, cand[i].y, min_dist2))
                 continue;
             corner_vec_push(out, (Corner){cand[i].x, cand[i].y, -1, -1, 0.0f, 0.0f});
             counts[cell]++;
@@ -72,9 +74,10 @@ static void select_corner_candidates(CornerScore *cand, int size, int w, int h, 
         }
     }
     for (int i = 0; i < size && out->size < max; i++) {
-        if (used[i])
+        if (used && used[i])
             continue;
-        if (!corner_far_enough(out, cand[i].x, cand[i].y, min_dist2))
+        if (min_dist2 > 0 &&
+            !corner_far_enough(out, cand[i].x, cand[i].y, min_dist2))
             continue;
         corner_vec_push(out, (Corner){cand[i].x, cand[i].y, -1, -1, 0.0f, 0.0f});
     }
@@ -191,7 +194,7 @@ static void collect_harris_candidates(const unsigned char *g, int w, int h, floa
 }
 
 static void extract_corners_pure(const unsigned char *g, int w, int h, CornerVec *c, int max,
-                                 int distributed, int pyramid) {
+                                 int distributed, int pyramid, int min_dist) {
     if (!distributed && !pyramid) {
         extract_corners_pure_legacy(g, w, h, c, max);
         return;
@@ -211,7 +214,7 @@ static void extract_corners_pure(const unsigned char *g, int w, int h, CornerVec
         free(half);
     }
     if (distributed || pyramid)
-        select_corner_candidates(cand, cand_size, w, h, c, max, 0, 1);
+        select_corner_candidates(cand, cand_size, w, h, c, max, min_dist, 1);
     else {
         for (int i = 0; i < cand_size && c->size < max; i++)
             corner_vec_push(c, (Corner){cand[i].x, cand[i].y, -1, -1, 0.0f, 0.0f});
@@ -261,12 +264,81 @@ static void extract_corners_fast(const unsigned char *g, int w, int h, CornerVec
     free(cand);
 }
 
+static void refine_corners_subpixel(const unsigned char *g, int w, int h, CornerVec *c) {
+    const int win = 5;
+    const int margin = win + 2;
+    for (int i = 0; i < c->size; i++) {
+        float start_x = c->data[i].x;
+        float start_y = c->data[i].y;
+        float x = start_x;
+        float y = start_y;
+        if (x < margin || x >= w - margin || y < margin || y >= h - margin)
+            continue;
+        for (int iter = 0; iter < 8; iter++) {
+            double Gxx = 0.0, Gxy = 0.0, Gyy = 0.0;
+            double bx = 0.0, by = 0.0;
+            for (int dy = -win; dy <= win; dy++) {
+                for (int dx = -win; dx <= win; dx++) {
+                    float px = x + (float)dx;
+                    float py = y + (float)dy;
+                    float Ix = (get_pixel_bilinear(g, w, h, px + 1.0f, py) -
+                                get_pixel_bilinear(g, w, h, px - 1.0f, py)) *
+                               0.5f;
+                    float Iy = (get_pixel_bilinear(g, w, h, px, py + 1.0f) -
+                                get_pixel_bilinear(g, w, h, px, py - 1.0f)) *
+                               0.5f;
+                    double gxx = (double)Ix * (double)Ix;
+                    double gxy = (double)Ix * (double)Iy;
+                    double gyy = (double)Iy * (double)Iy;
+                    Gxx += gxx;
+                    Gxy += gxy;
+                    Gyy += gyy;
+                    bx += gxx * (double)px + gxy * (double)py;
+                    by += gxy * (double)px + gyy * (double)py;
+                }
+            }
+            double det = Gxx * Gyy - Gxy * Gxy;
+            if (fabs(det) < 1e-6)
+                break;
+            double nx = (Gyy * bx - Gxy * by) / det;
+            double ny = (Gxx * by - Gxy * bx) / det;
+            if (!isfinite(nx) || !isfinite(ny))
+                break;
+            double sx = nx - (double)x;
+            double sy = ny - (double)y;
+            double step2 = sx * sx + sy * sy;
+            if (step2 > 1.0) {
+                double inv = 1.0 / sqrt(step2);
+                sx *= inv;
+                sy *= inv;
+                nx = (double)x + sx;
+                ny = (double)y + sy;
+            }
+            if (nx < margin || nx >= w - margin || ny < margin || ny >= h - margin)
+                break;
+            x = (float)nx;
+            y = (float)ny;
+            if (step2 < 1e-4)
+                break;
+        }
+        float ox = x - start_x;
+        float oy = y - start_y;
+        if (ox * ox + oy * oy <= 9.0f) {
+            c->data[i].x = x;
+            c->data[i].y = y;
+        }
+    }
+}
+
 static void extract_features_pure(const Config *cfg, const unsigned char *g, int w, int h,
                                   CornerVec *c, int max) {
     if (cfg->fast_corners)
         extract_corners_fast(g, w, h, c, max, cfg->distributed_features);
     else
-        extract_corners_pure(g, w, h, c, max, cfg->distributed_features, cfg->pyramid_features);
+        extract_corners_pure(g, w, h, c, max, cfg->distributed_features,
+                             cfg->pyramid_features, cfg->feature_min_dist);
+    if (cfg->subpixel_features)
+        refine_corners_subpixel(g, w, h, c);
 }
 
 #endif

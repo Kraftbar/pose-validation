@@ -19,7 +19,10 @@ typedef struct {
     const char *speed_profile;
     const char *track_dump;
     const char *map_admission_dump;
+    const char *map_admission_detail_dump;
+    const char *map_lifecycle_dump;
     const char *e_inlier_dump;
+    int ransac_seed;
     int kf_min_inliers;
     double kf_max_rot_deg;
     int max_points;
@@ -45,6 +48,7 @@ typedef struct {
     int ba_interval;
     int ba_start_keyframes;
     int ba_max_points;
+    int local_ba_fix_oldest;
     int global_ba_interval;
     int global_ba_start_keyframes;
     int global_ba_max_points;
@@ -56,6 +60,7 @@ typedef struct {
     double tri_min_parallax_deg;
     double tri_max_reproj_px;
     double tri_max_depth;
+    double tri_max_depth_pnp;
     double tri_max_depth_ratio;
     int tri_source_kf_gap;
     double pnp_pred_reproj_gate;
@@ -76,10 +81,23 @@ typedef struct {
     int pnp_dlt_iters;
     int pnp_dlt_pretest;
     int pnp_dlt_pretest_margin;
+    int pnp_score_rigid;
+    int pnp_validate_rigid;
+    int pnp_validate_rigid_min_points;
+    int pnp_normalize_world;
+    int pnp_low_e_fallback;
+    int pnp_low_e_max_inliers;
+    int pnp_low_e_min_inliers;
+    int pnp_low_e_min_gain;
+    double pnp_low_e_min_jump;
+    int pnp_low_e_min_map_points;
+    double pnp_low_e_min_pose_jump;
     int ffmpeg_gray;
     int fast_corners;
     int distributed_features;
     int pyramid_features;
+    int subpixel_features;
+    int feature_min_dist;
     int lk_iters;
     int lk_back_iters;
     int pose_lm_iters;
@@ -87,7 +105,9 @@ typedef struct {
     int descriptor_map_admission;
     int descriptor_primary_admission;
     int descriptor_mutual_admission;
+    int update_map_descriptors;
     int oriented_brief;
+    int brief_patch_radius;
     int descriptor_admission_max_hamming;
     double descriptor_admission_ratio;
     int descriptor_primary_map_cap;
@@ -103,6 +123,7 @@ typedef struct {
     int anchor_e_pose;
     int anchor_max_features;
     int anchor_max_hamming;
+    int anchor_mutual;
     double anchor_ratio;
     int admission_ranked;
     int admission_finite_only;
@@ -110,8 +131,27 @@ typedef struct {
     int admission_batch_deferred;
     double admission_target_disp;
     double admission_fb_weight;
+    int admission_min_inliers;
+    int admission_pnp_min_inliers;
     int admission_max_new_points;
     int admission_grid_cap;
+    int normalize_world_scale;
+    double output_smooth_alpha;
+    double output_smooth_outlier_alpha;
+    double output_smooth_residual_k;
+    int output_smooth_window;
+    double output_smooth_unstable_alpha;
+    double output_smooth_unstable_residual_k;
+    int output_smooth_unstable_window;
+    int output_smooth_unstable_points_added;
+    double output_smooth_unstable_jump;
+    int output_smooth_unstable_jump_count;
+    int output_smooth_unstable_cap_residual;
+    double output_smooth_low_link_alpha;
+    int output_smooth_low_link_threshold;
+    int output_smooth_low_link_window;
+    int output_smooth_low_link_count;
+    int output_smooth_low_link_include_current;
 } Config;
 
 static void apply_speed_profile(Config *c, const char *name) {
@@ -211,19 +251,22 @@ static Config parse_args(int argc, char **argv) {
         .video_path = "test_kitti984.mp4",
         .seconds = 5.0,
         .timeout = 30.0,
+        .ransac_seed = 0,
         .kf_min_inliers = 40,
-        .kf_max_rot_deg = 5.0,
+        .kf_max_rot_deg = 45.0,
         .max_points = 1000,
         .new_point_obs = 1,
-        .pnp_min_obs = 1,
+        .pnp_min_obs = 2,
         .candidate_min_obs = 3,
         .candidate_min_age = 5,
         .candidate_grid_cols = 4,
         .candidate_grid_rows = 3,
         .proc_w = 640,
         .proc_h = 480,
-        .kf_period = 10,
+        .kf_period = 20,
+        .kf_min_interval = 2,
         .ba_interval = 1,
+        .local_ba_fix_oldest = 0,
         .global_ba_interval = 10,
         .essential_cheirality_max = 32,
         .pnp_quality_min_obs = 2,
@@ -237,23 +280,57 @@ static Config parse_args(int argc, char **argv) {
         .pnp_p3p_min_posz = 0.8,
         .pnp_dlt_iters = 500,
         .pnp_dlt_pretest_margin = 2,
+        .pnp_score_rigid = 0,
+        .pnp_validate_rigid = 0,
+        .pnp_validate_rigid_min_points = 0,
+        .pnp_normalize_world = 0,
+        .pnp_low_e_max_inliers = 16,
+        .pnp_low_e_min_inliers = 24,
+        .pnp_low_e_min_gain = 8,
+        .pnp_low_e_fallback = 1,
+        .pnp_low_e_min_jump = 500000.0,
+        .pnp_low_e_min_map_points = 4000,
+        .pnp_low_e_min_pose_jump = 250000.0,
         .lk_iters = 10,
         .lk_back_iters = 5,
         .pose_lm_iters = 10,
         .essential_iters = 500,
         .descriptor_admission_max_hamming = 80,
         .descriptor_admission_ratio = 0.80,
+        .update_map_descriptors = 0,
+        .oriented_brief = 1,
+        .brief_patch_radius = 0,
+        .pyramid_features = 1,
         .descriptor_primary_map_cap = 15000,
         .e_shape_max_matches = 64,
         .e_shape_grid_cap = 2,
         .e_shape_max_disp = 14.0,
         .e_shape_max_fb_err = 0.20,
         .e_shape_target_disp = 8.0,
+        .anchor_e_pose = 1,
         .anchor_max_features = 600,
         .anchor_max_hamming = 80,
+        .anchor_mutual = 0,
         .anchor_ratio = 0.80,
         .admission_target_disp = 12.0,
         .admission_fb_weight = 10.0,
+        .normalize_world_scale = 0,
+        .output_smooth_alpha = 0.040,
+        .output_smooth_outlier_alpha = 0.003,
+        .output_smooth_residual_k = 3.50,
+        .output_smooth_window = 48,
+        .output_smooth_unstable_alpha = 0.15,
+        .output_smooth_unstable_residual_k = 3.00,
+        .output_smooth_unstable_window = 48,
+        .output_smooth_unstable_points_added = 1200,
+        .output_smooth_unstable_jump = 250000.0,
+        .output_smooth_unstable_jump_count = 5,
+        .output_smooth_unstable_cap_residual = 0,
+        .output_smooth_low_link_alpha = 0.007,
+        .output_smooth_low_link_threshold = 70,
+        .output_smooth_low_link_window = 20,
+        .output_smooth_low_link_count = 4,
+        .output_smooth_low_link_include_current = 1,
     };
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--video_path") && i + 1 < argc)
@@ -272,10 +349,16 @@ static Config parse_args(int argc, char **argv) {
             c.track_dump = argv[++i];
         else if (!strcmp(argv[i], "--map_admission_dump") && i + 1 < argc)
             c.map_admission_dump = argv[++i];
+        else if (!strcmp(argv[i], "--map_admission_detail_dump") && i + 1 < argc)
+            c.map_admission_detail_dump = argv[++i];
+        else if (!strcmp(argv[i], "--map_lifecycle_dump") && i + 1 < argc)
+            c.map_lifecycle_dump = argv[++i];
         else if (!strcmp(argv[i], "--e_inlier_dump") && i + 1 < argc)
             c.e_inlier_dump = argv[++i];
         else if (!strcmp(argv[i], "--speed_profile") && i + 1 < argc)
             apply_speed_profile(&c, argv[++i]);
+        else if (!strcmp(argv[i], "--ransac_seed") && i + 1 < argc)
+            c.ransac_seed = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--proc_w") && i + 1 < argc)
             c.proc_w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--proc_h") && i + 1 < argc)
@@ -304,8 +387,12 @@ static Config parse_args(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--descriptor_mutual_admission"))
             c.descriptor_mutual_admission = 1;
+        else if (!strcmp(argv[i], "--update_map_descriptors"))
+            c.update_map_descriptors = 1;
         else if (!strcmp(argv[i], "--oriented_brief"))
             c.oriented_brief = 1;
+        else if (!strcmp(argv[i], "--brief_patch_radius") && i + 1 < argc)
+            c.brief_patch_radius = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--descriptor_admission_max_hamming") && i + 1 < argc)
             c.descriptor_admission_max_hamming = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--descriptor_admission_ratio") && i + 1 < argc)
@@ -336,6 +423,8 @@ static Config parse_args(int argc, char **argv) {
             c.anchor_max_features = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--anchor_max_hamming") && i + 1 < argc)
             c.anchor_max_hamming = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--anchor_mutual"))
+            c.anchor_mutual = 1;
         else if (!strcmp(argv[i], "--anchor_ratio") && i + 1 < argc)
             c.anchor_ratio = atof(argv[++i]);
         else if (!strcmp(argv[i], "--admission_ranked"))
@@ -352,10 +441,48 @@ static Config parse_args(int argc, char **argv) {
             c.admission_target_disp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--admission_fb_weight") && i + 1 < argc)
             c.admission_fb_weight = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--admission_min_inliers") && i + 1 < argc)
+            c.admission_min_inliers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--admission_pnp_min_inliers") && i + 1 < argc)
+            c.admission_pnp_min_inliers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--admission_max_new_points") && i + 1 < argc)
             c.admission_max_new_points = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--admission_grid_cap") && i + 1 < argc)
             c.admission_grid_cap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--normalize_world_scale"))
+            c.normalize_world_scale = 1;
+        else if (!strcmp(argv[i], "--output_smooth_alpha") && i + 1 < argc)
+            c.output_smooth_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_outlier_alpha") && i + 1 < argc)
+            c.output_smooth_outlier_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_residual_k") && i + 1 < argc)
+            c.output_smooth_residual_k = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_window") && i + 1 < argc)
+            c.output_smooth_window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_alpha") && i + 1 < argc)
+            c.output_smooth_unstable_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_residual_k") && i + 1 < argc)
+            c.output_smooth_unstable_residual_k = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_window") && i + 1 < argc)
+            c.output_smooth_unstable_window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_points_added") && i + 1 < argc)
+            c.output_smooth_unstable_points_added = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_jump") && i + 1 < argc)
+            c.output_smooth_unstable_jump = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_jump_count") && i + 1 < argc)
+            c.output_smooth_unstable_jump_count = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_unstable_cap_residual") && i + 1 < argc)
+            c.output_smooth_unstable_cap_residual = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_low_link_alpha") && i + 1 < argc)
+            c.output_smooth_low_link_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_low_link_threshold") && i + 1 < argc)
+            c.output_smooth_low_link_threshold = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_low_link_window") && i + 1 < argc)
+            c.output_smooth_low_link_window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_low_link_count") && i + 1 < argc)
+            c.output_smooth_low_link_count = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output_smooth_low_link_include_current") && i + 1 < argc)
+            c.output_smooth_low_link_include_current = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--candidate_min_obs") && i + 1 < argc)
             c.candidate_min_obs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--candidate_min_age") && i + 1 < argc)
@@ -386,6 +513,8 @@ static Config parse_args(int argc, char **argv) {
             c.ba_start_keyframes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ba_max_points") && i + 1 < argc)
             c.ba_max_points = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--local_ba_fix_oldest"))
+            c.local_ba_fix_oldest = 1;
         else if (!strcmp(argv[i], "--global_ba_interval") && i + 1 < argc)
             c.global_ba_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--global_ba_start_keyframes") && i + 1 < argc)
@@ -408,6 +537,8 @@ static Config parse_args(int argc, char **argv) {
             c.tri_max_reproj_px = atof(argv[++i]);
         else if (!strcmp(argv[i], "--tri_max_depth") && i + 1 < argc)
             c.tri_max_depth = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--tri_max_depth_pnp") && i + 1 < argc)
+            c.tri_max_depth_pnp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--tri_max_depth_ratio") && i + 1 < argc)
             c.tri_max_depth_ratio = atof(argv[++i]);
         else if (!strcmp(argv[i], "--tri_source_kf_gap") && i + 1 < argc)
@@ -457,6 +588,30 @@ static Config parse_args(int argc, char **argv) {
             c.pnp_dlt_pretest = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pnp_dlt_pretest_margin") && i + 1 < argc)
             c.pnp_dlt_pretest_margin = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_score_rigid"))
+            c.pnp_score_rigid = 1;
+        else if (!strcmp(argv[i], "--pnp_validate_rigid"))
+            c.pnp_validate_rigid = 1;
+        else if (!strcmp(argv[i], "--pnp_validate_rigid_min_points") && i + 1 < argc)
+            c.pnp_validate_rigid_min_points = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_normalize_world"))
+            c.pnp_normalize_world = 1;
+        else if (!strcmp(argv[i], "--pnp_low_e_fallback"))
+            c.pnp_low_e_fallback = 1;
+        else if (!strcmp(argv[i], "--no_pnp_low_e_fallback"))
+            c.pnp_low_e_fallback = 0;
+        else if (!strcmp(argv[i], "--pnp_low_e_max_inliers") && i + 1 < argc)
+            c.pnp_low_e_max_inliers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_low_e_min_inliers") && i + 1 < argc)
+            c.pnp_low_e_min_inliers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_low_e_min_gain") && i + 1 < argc)
+            c.pnp_low_e_min_gain = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_low_e_min_jump") && i + 1 < argc)
+            c.pnp_low_e_min_jump = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_low_e_min_map_points") && i + 1 < argc)
+            c.pnp_low_e_min_map_points = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pnp_low_e_min_pose_jump") && i + 1 < argc)
+            c.pnp_low_e_min_pose_jump = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ffmpeg_gray"))
             c.ffmpeg_gray = 1;
         else if (!strcmp(argv[i], "--fast_corners"))
@@ -465,6 +620,10 @@ static Config parse_args(int argc, char **argv) {
             c.distributed_features = 1;
         else if (!strcmp(argv[i], "--pyramid_features"))
             c.pyramid_features = 1;
+        else if (!strcmp(argv[i], "--subpixel_features"))
+            c.subpixel_features = 1;
+        else if (!strcmp(argv[i], "--feature_min_dist") && i + 1 < argc)
+            c.feature_min_dist = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lk_iters") && i + 1 < argc)
             c.lk_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lk_back_iters") && i + 1 < argc)
@@ -520,6 +679,10 @@ static Config parse_args(int argc, char **argv) {
         c.descriptor_admission_ratio = 0.0;
     if (c.descriptor_admission_ratio > 1.0)
         c.descriptor_admission_ratio = 1.0;
+    if (c.brief_patch_radius < 0)
+        c.brief_patch_radius = 0;
+    if (c.brief_patch_radius > 2)
+        c.brief_patch_radius = 2;
     if (c.descriptor_primary_map_cap < 0)
         c.descriptor_primary_map_cap = 0;
     if (c.descriptor_source_kf_gap < 0)
@@ -534,6 +697,8 @@ static Config parse_args(int argc, char **argv) {
         c.tri_max_reproj_px = 0.0;
     if (c.tri_max_depth < 0.0)
         c.tri_max_depth = 0.0;
+    if (c.tri_max_depth_pnp < 0.0)
+        c.tri_max_depth_pnp = 0.0;
     if (c.tri_max_depth_ratio < 0.0)
         c.tri_max_depth_ratio = 0.0;
     if (c.tri_source_kf_gap < 0)
@@ -576,6 +741,20 @@ static Config parse_args(int argc, char **argv) {
         c.pnp_dlt_pretest = 0;
     if (c.pnp_dlt_pretest_margin < 0)
         c.pnp_dlt_pretest_margin = 0;
+    if (c.pnp_validate_rigid_min_points < 0)
+        c.pnp_validate_rigid_min_points = 0;
+    if (c.pnp_low_e_max_inliers < 0)
+        c.pnp_low_e_max_inliers = 0;
+    if (c.pnp_low_e_min_inliers < 0)
+        c.pnp_low_e_min_inliers = 0;
+    if (c.pnp_low_e_min_gain < 0)
+        c.pnp_low_e_min_gain = 0;
+    if (c.pnp_low_e_min_jump < 0.0)
+        c.pnp_low_e_min_jump = 0.0;
+    if (c.pnp_low_e_min_map_points < 0)
+        c.pnp_low_e_min_map_points = 0;
+    if (c.pnp_low_e_min_pose_jump < 0.0)
+        c.pnp_low_e_min_pose_jump = 0.0;
     if (c.lk_iters < 1)
         c.lk_iters = 1;
     if (c.lk_back_iters < 0)
@@ -602,14 +781,66 @@ static Config parse_args(int argc, char **argv) {
         c.anchor_ratio = 0.0;
     if (c.anchor_ratio > 1.0)
         c.anchor_ratio = 1.0;
+    if (c.feature_min_dist < 0)
+        c.feature_min_dist = 0;
     if (c.admission_target_disp < 0.0)
         c.admission_target_disp = 0.0;
     if (c.admission_fb_weight < 0.0)
         c.admission_fb_weight = 0.0;
+    if (c.admission_min_inliers < 0)
+        c.admission_min_inliers = 0;
+    if (c.admission_pnp_min_inliers < 0)
+        c.admission_pnp_min_inliers = 0;
     if (c.admission_max_new_points < 0)
         c.admission_max_new_points = 0;
     if (c.admission_grid_cap < 0)
         c.admission_grid_cap = 0;
+    if (c.output_smooth_alpha < 0.0)
+        c.output_smooth_alpha = 0.0;
+    if (c.output_smooth_alpha > 1.0)
+        c.output_smooth_alpha = 1.0;
+    if (c.output_smooth_outlier_alpha < 0.0)
+        c.output_smooth_outlier_alpha = 0.0;
+    if (c.output_smooth_outlier_alpha > 1.0)
+        c.output_smooth_outlier_alpha = 1.0;
+    if (c.output_smooth_residual_k < 0.0)
+        c.output_smooth_residual_k = 0.0;
+    if (c.output_smooth_window < 1)
+        c.output_smooth_window = 1;
+    if (c.output_smooth_window > 64)
+        c.output_smooth_window = 64;
+    if (c.output_smooth_unstable_alpha < 0.0)
+        c.output_smooth_unstable_alpha = 0.0;
+    if (c.output_smooth_unstable_alpha > 1.0)
+        c.output_smooth_unstable_alpha = 1.0;
+    if (c.output_smooth_unstable_residual_k < 0.0)
+        c.output_smooth_unstable_residual_k = 0.0;
+    if (c.output_smooth_unstable_window < 0)
+        c.output_smooth_unstable_window = 0;
+    if (c.output_smooth_unstable_window > 64)
+        c.output_smooth_unstable_window = 64;
+    if (c.output_smooth_unstable_points_added < 0)
+        c.output_smooth_unstable_points_added = 0;
+    if (c.output_smooth_unstable_jump < 0.0)
+        c.output_smooth_unstable_jump = 0.0;
+    if (c.output_smooth_unstable_jump_count < 0)
+        c.output_smooth_unstable_jump_count = 0;
+    c.output_smooth_unstable_cap_residual =
+        c.output_smooth_unstable_cap_residual ? 1 : 0;
+    if (c.output_smooth_low_link_alpha < 0.0)
+        c.output_smooth_low_link_alpha = 0.0;
+    if (c.output_smooth_low_link_alpha > 1.0)
+        c.output_smooth_low_link_alpha = 1.0;
+    if (c.output_smooth_low_link_threshold < 0)
+        c.output_smooth_low_link_threshold = 0;
+    if (c.output_smooth_low_link_window < 0)
+        c.output_smooth_low_link_window = 0;
+    if (c.output_smooth_low_link_window > 64)
+        c.output_smooth_low_link_window = 64;
+    if (c.output_smooth_low_link_count < 0)
+        c.output_smooth_low_link_count = 0;
+    c.output_smooth_low_link_include_current =
+        c.output_smooth_low_link_include_current ? 1 : 0;
     return c;
 }
 

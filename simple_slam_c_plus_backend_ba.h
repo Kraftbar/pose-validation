@@ -1,45 +1,111 @@
 #ifndef SIMPLE_SLAM_C_PLUS_BACKEND_BA_H
 #define SIMPLE_SLAM_C_PLUS_BACKEND_BA_H
 
-static void refine_map_point_against_kfs(Map *map, int i, KFDB *db, int k_start, int k_end,
-                                         double fx, double fy, double cx, double cy) {
+typedef struct {
+    int kf_idx;
+    int corner_idx;
+} BAObservation;
+
+typedef struct {
+    int *offsets;
+    BAObservation *obs;
+} BAObservationIndex;
+
+static void ba_observation_index_free(BAObservationIndex *idx) {
+    free(idx->offsets);
+    free(idx->obs);
+    memset(idx, 0, sizeof(*idx));
+}
+
+static int ba_observation_index_build(const Map *map, const KFDB *db, int k_start, int k_end,
+                                      BAObservationIndex *out) {
+    memset(out, 0, sizeof(*out));
+    if (map->size <= 0 || k_start >= k_end)
+        return 1;
+    out->offsets = calloc((size_t)map->size + 1, sizeof(int));
+    if (!out->offsets)
+        return 0;
+    int total = 0;
+    for (int k = k_start; k < k_end; k++) {
+        const KFEntry *kf = &db->data[k];
+        for (int j = 0; j < kf->corners.size; j++) {
+            int pi = kf->corners.data[j].pt_idx;
+            if (pi < 0 || pi >= map->size || map->data[pi].obs < 2)
+                continue;
+            out->offsets[pi + 1]++;
+            total++;
+        }
+    }
+    for (int i = 1; i <= map->size; i++)
+        out->offsets[i] += out->offsets[i - 1];
+    out->obs = malloc((size_t)total * sizeof(BAObservation));
+    if (total > 0 && !out->obs) {
+        ba_observation_index_free(out);
+        return 0;
+    }
+    int *cursor = malloc((size_t)map->size * sizeof(int));
+    if (map->size > 0 && !cursor) {
+        ba_observation_index_free(out);
+        return 0;
+    }
+    memcpy(cursor, out->offsets, (size_t)map->size * sizeof(int));
+    for (int k = k_start; k < k_end; k++) {
+        const KFEntry *kf = &db->data[k];
+        for (int j = 0; j < kf->corners.size; j++) {
+            int pi = kf->corners.data[j].pt_idx;
+            if (pi < 0 || pi >= map->size || map->data[pi].obs < 2)
+                continue;
+            int pos = cursor[pi]++;
+            out->obs[pos].kf_idx = k;
+            out->obs[pos].corner_idx = j;
+        }
+    }
+    free(cursor);
+    return 1;
+}
+
+static void refine_map_point_against_observations(Map *map, int i, KFDB *db,
+                                                  const BAObservationIndex *obs_index,
+                                                  double fx, double fy, double cx, double cy) {
     if (map->data[i].obs < 2)
         return;
+    int obs_start = obs_index->offsets[i];
+    int obs_end = obs_index->offsets[i + 1];
+    if (obs_end == obs_start)
+        return;
     double H[9] = {0}, b[3] = {0};
-    for (int k = k_start; k < k_end; k++) {
-        KFEntry *kf = &db->data[k];
+    for (int oi = obs_start; oi < obs_end; oi++) {
+        const BAObservation *obs = &obs_index->obs[oi];
+        KFEntry *kf = &db->data[obs->kf_idx];
+        Corner *corner = &kf->corners.data[obs->corner_idx];
         double R[9], t[3];
         pose_get_rotation(&kf->pose, R);
         pose_get_translation(&kf->pose, t);
-        for (int j = 0; j < kf->corners.size; j++) {
-            if (kf->corners.data[j].pt_idx != i)
-                continue;
-            MapPoint p = map->data[i];
+        MapPoint p = map->data[i];
 
-            // Project P into camera k:  cp = R·P + t
-            double cp[3] = {R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0],
-                            R[3]*p.x + R[4]*p.y + R[5]*p.z + t[1],
-                            R[6]*p.x + R[7]*p.y + R[8]*p.z + t[2]};
-            if (cp[2] < 0.1)
-                continue;
+        // Project P into camera k:  cp = R·P + t
+        double cp[3] = {R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0],
+                        R[3]*p.x + R[4]*p.y + R[5]*p.z + t[1],
+                        R[6]*p.x + R[7]*p.y + R[8]*p.z + t[2]};
+        if (cp[2] < 0.1)
+            continue;
 
-            double inv_z  = 1.0 / cp[2];
-            double inv_z2 = inv_z * inv_z;
-            double u  = fx*cp[0]*inv_z + cx;
-            double v  = fy*cp[1]*inv_z + cy;
-            double du = kf->corners.data[j].x - u;
-            double dv = kf->corners.data[j].y - v;
+        double inv_z  = 1.0 / cp[2];
+        double inv_z2 = inv_z * inv_z;
+        double u  = fx*cp[0]*inv_z + cx;
+        double v  = fy*cp[1]*inv_z + cy;
+        double du = corner->x - u;
+        double dv = corner->y - v;
 
-            // J[2][3] = ∂(u,v)/∂P  (3-DoF Jacobian wrt world point):
-            double J[2][3] = {
-                {fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2,  fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2,  fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2},
-                {fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2,  fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2,  fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2},
-            };
-            for (int r = 0; r < 3; r++) {
-                b[r] += J[0][r] * du + J[1][r] * dv;
-                for (int c = 0; c < 3; c++)
-                    H[r * 3 + c] += J[0][r] * J[0][c] + J[1][r] * J[1][c];
-            }
+        // J[2][3] = ∂(u,v)/∂P  (3-DoF Jacobian wrt world point):
+        double J[2][3] = {
+            {fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2,  fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2,  fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2},
+            {fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2,  fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2,  fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2},
+        };
+        for (int r = 0; r < 3; r++) {
+            b[r] += J[0][r] * du + J[1][r] * dv;
+            for (int c = 0; c < 3; c++)
+                H[r * 3 + c] += J[0][r] * J[0][c] + J[1][r] * J[1][c];
         }
     }
     for (int r = 0; r < 3; r++)
@@ -115,6 +181,9 @@ static void global_ba(KFDB *db, Map *map, double fx, double fy, double cx, doubl
                       int iters, int pose_lm_iters) {
     if (db->size < 3)
         return;
+    BAObservationIndex obs_index = {0};
+    if (!ba_observation_index_build(map, db, 0, db->size, &obs_index))
+        return;
     for (int iter = 0; iter < iters; iter++) {
 #pragma omp parallel for
         for (int k = 1; k < db->size; k++)
@@ -122,74 +191,30 @@ static void global_ba(KFDB *db, Map *map, double fx, double fy, double cx, doubl
                            &db->data[k].pose);
 #pragma omp parallel for
         for (int i = 0; i < map->size; i++)
-            refine_map_point_against_kfs(map, i, db, 0, db->size, fx, fy, cx, cy);
+            refine_map_point_against_observations(map, i, db, &obs_index, fx, fy, cx, cy);
     }
+    ba_observation_index_free(&obs_index);
 }
 
 static void local_ba(KFDB *db, Map *map, double fx, double fy, double cx, double cy,
-                     int pose_lm_iters) {
+                     int pose_lm_iters, int fix_oldest) {
     if (db->size < 3)
+        return;
+    int k_start = db->size - 3;
+    BAObservationIndex obs_index = {0};
+    if (!ba_observation_index_build(map, db, k_start, db->size, &obs_index))
         return;
     for (int iter = 0; iter < 5; iter++) {
 
-        for (int k = db->size - 3; k < db->size; k++) {
+        int pose_start = fix_oldest ? k_start + 1 : k_start;
+        for (int k = pose_start; k < db->size; k++) {
             refine_pose_lm(map, &db->data[k].corners, fx, fy, cx, cy, pose_lm_iters,
                            &db->data[k].pose);
         }
-        for (int i = 0; i < map->size; i++) {
-            if (map->data[i].obs < 2)
-                continue;
-            double H[9] = {0}, b[3] = {0};
-            for (int k = db->size - 3; k < db->size; k++) {
-                KFEntry *kf = &db->data[k];
-                double R[9], t[3];
-                pose_get_rotation(&kf->pose, R);
-                pose_get_translation(&kf->pose, t);
-                for (int j = 0; j < kf->corners.size; j++) {
-                    if (kf->corners.data[j].pt_idx != i)
-                        continue;
-                    MapPoint p = map->data[i];
-
-                    // Project P into camera k:  cp = R·P + t
-                    double cp[3] = {R[0]*p.x + R[1]*p.y + R[2]*p.z + t[0],
-                                    R[3]*p.x + R[4]*p.y + R[5]*p.z + t[1],
-                                    R[6]*p.x + R[7]*p.y + R[8]*p.z + t[2]};
-                    if (cp[2] < 0.1)
-                        continue;
-
-                    double inv_z  = 1.0 / cp[2];
-                    double inv_z2 = inv_z * inv_z;
-                    double u  = fx*cp[0]*inv_z + cx;
-                    double v  = fy*cp[1]*inv_z + cy;
-                    double du = kf->corners.data[j].x - u;
-                    double dv = kf->corners.data[j].y - v;
-
-                    // J[2][3] = ∂(u,v)/∂P
-                    double J[2][3] = {
-                        {fx*R[0]*inv_z - fx*cp[0]*R[6]*inv_z2,  fx*R[1]*inv_z - fx*cp[0]*R[7]*inv_z2,  fx*R[2]*inv_z - fx*cp[0]*R[8]*inv_z2},
-                        {fy*R[3]*inv_z - fy*cp[1]*R[6]*inv_z2,  fy*R[4]*inv_z - fy*cp[1]*R[7]*inv_z2,  fy*R[5]*inv_z - fy*cp[1]*R[8]*inv_z2},
-                    };
-                    for (int r = 0; r < 3; r++) {
-                        b[r] += J[0][r] * du + J[1][r] * dv;
-                        for (int c = 0; c < 3; c++)
-                            H[r * 3 + c] += J[0][r] * J[0][c] + J[1][r] * J[1][c];
-                    }
-                }
-            }
-            for (int r = 0; r < 3; r++)
-                H[r * 3 + r] += 1e-4;
-            double det = H[0] * (H[4] * H[8] - H[5] * H[7]) - H[1] * (H[3] * H[8] - H[5] * H[6]) +
-                         H[2] * (H[3] * H[7] - H[4] * H[6]);
-            if (fabs(det) > 1e-9) {
-                double dx = (b[0]*(H[4]*H[8] - H[5]*H[7]) - H[1]*(b[1]*H[8] - H[5]*b[2]) + H[2]*(b[1]*H[7] - H[4]*b[2])) / det;
-                double dy = (H[0]*(b[1]*H[8] - H[5]*b[2]) - b[0]*(H[3]*H[8] - H[5]*H[6]) + H[2]*(H[3]*b[2] - b[1]*H[6])) / det;
-                double dz = (H[0]*(H[4]*b[2] - b[1]*H[7]) - H[1]*(H[3]*b[2] - b[1]*H[6]) + b[0]*(H[3]*H[7] - H[4]*H[6])) / det;
-                map->data[i].x += dx;
-                map->data[i].y += dy;
-                map->data[i].z += dz;
-            }
-        }
+        for (int i = 0; i < map->size; i++)
+            refine_map_point_against_observations(map, i, db, &obs_index, fx, fy, cx, cy);
     }
+    ba_observation_index_free(&obs_index);
 }
 
 // Robust χ² (Huber-rho) over all observations in the local BA window — used to

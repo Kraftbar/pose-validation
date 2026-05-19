@@ -145,6 +145,13 @@ def ensure_native_binary(root: Path, impl: str) -> Path:
     return binary_path
 
 
+def pure_c_sources(root: Path, source_name: str) -> list[Path]:
+    sources = [root / source_name, root / 'pure_c_math.h']
+    if source_name == 'simple_slam_c_plus.c':
+        sources.extend(sorted(root.glob('simple_slam_c_plus_*.h')))
+    return sources
+
+
 def ensure_pure_c_binary(root: Path, source_name: str = 'simple_slam_c.c', binary_name: str = 'simple_slam_pure_c') -> Path:
     root = root.resolve()
     compiler = shutil.which('gcc')
@@ -152,7 +159,7 @@ def ensure_pure_c_binary(root: Path, source_name: str = 'simple_slam_c.c', binar
         raise RuntimeError('gcc not found; cannot build `simple_slam_pure_c`')
 
     binary_path = root / binary_name
-    sources = [root / source_name, root / 'pure_c_math.h']
+    sources = pure_c_sources(root, source_name)
     if not needs_rebuild(binary_path, sources):
         return binary_path
 

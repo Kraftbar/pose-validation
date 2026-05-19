@@ -3,6 +3,7 @@
 
 static int g_brief_pattern[256 * 4];
 static int g_oriented_brief = 0;
+static int g_brief_patch_radius = 0;
 
 static void brief_init_pattern(void) {
     srand(42);
@@ -12,7 +13,8 @@ static void brief_init_pattern(void) {
 
 static int compute_brief(const unsigned char *g, int w, int h, float fx, float fy, Brief256 *out) {
     int cx = (int)fx, cy = (int)fy;
-    int margin = g_oriented_brief ? 18 : 13;
+    int patch_radius = g_brief_patch_radius;
+    int margin = (g_oriented_brief ? 18 : 13) + patch_radius;
     if (cx < margin || cx >= w - margin || cy < margin || cy >= h - margin)
         return 0;
     double ct = 1.0, st = 0.0;
@@ -45,7 +47,19 @@ static int compute_brief(const unsigned char *g, int w, int h, float fx, float f
             dx2 = rdx2;
             dy2 = rdy2;
         }
-        unsigned char a = g[(cy + dy1) * w + (cx + dx1)], b = g[(cy + dy2) * w + (cx + dx2)];
+        int ax = cx + dx1, ay = cy + dy1, bx = cx + dx2, by = cy + dy2;
+        int a = 0, b = 0;
+        if (patch_radius > 0) {
+            for (int py = -patch_radius; py <= patch_radius; py++) {
+                for (int px = -patch_radius; px <= patch_radius; px++) {
+                    a += g[(ay + py) * w + (ax + px)];
+                    b += g[(by + py) * w + (bx + px)];
+                }
+            }
+        } else {
+            a = g[ay * w + ax];
+            b = g[by * w + bx];
+        }
         if (a > b)
             out->bits[i / 64] |= (uint64_t)1 << (i % 64);
     }
@@ -212,10 +226,29 @@ static void anchor_set_build(AnchorSet *a, const unsigned char *gray, int w, int
 }
 
 static void match_anchor_sets(const AnchorSet *a, const AnchorSet *b, int max_hamming,
-                              double ratio, MatchVec *out) {
+                              int mutual, double ratio, MatchVec *out) {
     out->size = 0;
     if (a->corners.size <= 0 || b->corners.size <= 0)
         return;
+    int *reverse_best = NULL;
+    if (mutual) {
+        reverse_best = (int *)malloc((size_t)b->corners.size * sizeof(int));
+        if (!reverse_best) {
+            fprintf(stderr, "out of memory\n");
+            exit(1);
+        }
+        for (int j = 0; j < b->corners.size; j++) {
+            int best = 257, best_idx = -1;
+            for (int i = 0; i < a->corners.size; i++) {
+                int d = brief_hamming(&b->desc[j], &a->desc[i]);
+                if (d < best) {
+                    best = d;
+                    best_idx = i;
+                }
+            }
+            reverse_best[j] = best_idx;
+        }
+    }
     for (int i = 0; i < a->corners.size; i++) {
         int best = 257, second = 257, best_idx = -1;
         for (int j = 0; j < b->corners.size; j++) {
@@ -234,10 +267,13 @@ static void match_anchor_sets(const AnchorSet *a, const AnchorSet *b, int max_ha
             continue;
         if (ratio > 0.0 && second < 257 && (double)best >= ratio * (double)second)
             continue;
+        if (mutual && reverse_best && reverse_best[best_idx] != i)
+            continue;
         match_vec_push(out, (Match){i, best_idx, (float)best});
     }
     if (out->size > 1)
         qsort(out->data, (size_t)out->size, sizeof(Match), match_cmp_score_asc);
+    free(reverse_best);
 }
 
 #endif

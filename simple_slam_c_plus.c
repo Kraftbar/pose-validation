@@ -33,6 +33,8 @@ static void jacobi_12x12(double A[144], double W[12], double V[144]) {
 #define MAP_HYGIENE_REPROJ_PX 8.0
 #define MAP_HYGIENE_START_FRAME 200
 
+static unsigned int g_ransac_seed = 0;
+
 typedef struct {
     float x, y;
     int pt_idx;
@@ -54,6 +56,7 @@ typedef struct {
     double pnp_p3p_mederr, pnp_p3p_posz, pnp_p3p_jump;
     double pnp_p3p_xyz[3];
     double trans_jump;
+    double raw_xyz[3];
     double xyz[3];
 } FrameStat;
 typedef struct {
@@ -99,6 +102,25 @@ typedef struct {
     MapPoint *data;
     int size, cap;
 } Map;
+typedef struct {
+    int map_idx;
+    int birth_frame;
+    int last_frame;
+    int method;
+    int inliers;
+    int cell;
+    double reproj;
+    double parallax;
+    double depth;
+    double fb_err;
+    double track_disp;
+    double score;
+    const char *source;
+} MapLifecycle;
+typedef struct {
+    MapLifecycle *data;
+    int size, cap;
+} MapLifecycleVec;
 typedef struct {
     CornerVec corners;
     Brief256 *desc;
@@ -222,6 +244,98 @@ static void map_push(Map *m, MapPoint p) {
         m->data = (MapPoint *)xrealloc(m->data, (size_t)m->cap * sizeof(MapPoint));
     }
     m->data[m->size++] = p;
+}
+static int compare_double_asc(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+static double median_recent_values(const double *values, int count) {
+    double tmp[64];
+    if (count <= 0)
+        return NAN;
+    if (count > 64)
+        count = 64;
+    for (int i = 0; i < count; i++)
+        tmp[i] = values[i];
+    qsort(tmp, (size_t)count, sizeof(double), compare_double_asc);
+    if (count & 1)
+        return tmp[count / 2];
+    return 0.5 * (tmp[count / 2 - 1] + tmp[count / 2]);
+}
+static int recent_int_sum(const int *values, int count, int pos, int window) {
+    if (window > count)
+        window = count;
+    int sum = 0;
+    for (int i = 0; i < window; i++) {
+        int idx = pos - 1 - i;
+        while (idx < 0)
+            idx += 64;
+        sum += values[idx % 64];
+    }
+    return sum;
+}
+static int recent_double_count_gt(const double *values, int count, int pos,
+                                  int window, double threshold) {
+    if (window > count)
+        window = count;
+    int n = 0;
+    for (int i = 0; i < window; i++) {
+        int idx = pos - 1 - i;
+        while (idx < 0)
+            idx += 64;
+        if (values[idx % 64] > threshold)
+            n++;
+    }
+    return n;
+}
+static int recent_int_count_lt(const int *values, int count, int pos,
+                               int window, int threshold) {
+    if (window > count)
+        window = count;
+    int n = 0;
+    for (int i = 0; i < window; i++) {
+        int idx = pos - 1 - i;
+        while (idx < 0)
+            idx += 64;
+        if (values[idx % 64] < threshold)
+            n++;
+    }
+    return n;
+}
+static void map_lifecycle_vec_push(MapLifecycleVec *v, MapLifecycle row) {
+    if (v->size == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 1024;
+        v->data = (MapLifecycle *)xrealloc(v->data,
+                                           (size_t)v->cap * sizeof(MapLifecycle));
+    }
+    v->data[v->size++] = row;
+}
+static void record_map_lifecycle(MapLifecycleVec *v, int enabled, int map_idx,
+                                 int birth_frame, const char *source, int method,
+                                 int inliers, int cell, double reproj,
+                                 double parallax, double depth, double fb_err,
+                                 double track_disp, double score) {
+    if (!enabled)
+        return;
+    MapLifecycle row = {map_idx, birth_frame, birth_frame, method, inliers, cell, reproj,
+                        parallax, depth, fb_err, track_disp, score, source};
+    map_lifecycle_vec_push(v, row);
+}
+static void mark_map_lifecycle_observed(MapLifecycleVec *v, int enabled, int map_idx,
+                                        int frame_id) {
+    if (!enabled || map_idx < 0)
+        return;
+    if (map_idx < v->size && v->data[map_idx].map_idx == map_idx) {
+        v->data[map_idx].last_frame = frame_id;
+        return;
+    }
+    for (int i = v->size - 1; i >= 0; i--) {
+        if (v->data[i].map_idx == map_idx) {
+            v->data[i].last_frame = frame_id;
+            return;
+        }
+    }
 }
 static int candidate_vec_push(CandidateVec *v, TrackCandidate c) {
     if (v->size == v->cap) {
@@ -773,7 +887,9 @@ static void build_shaped_e_matches(const Config *cfg, const CornerVec *prev_pts,
 static int promote_candidate_if_ready(CandidateVec *cands, int cand_idx, int frame_id,
                                       const Pose *pose, Corner current, double fx, double fy,
                                       double cx, double cy, const Config *cfg, Map *map,
-                                      unsigned char *gray, int w, int h, int *pts, int *tri) {
+                                      unsigned char *gray, int w, int h, int *pts, int *tri,
+                                      MapLifecycleVec *map_lifecycle,
+                                      int map_lifecycle_enabled) {
     if (cand_idx < 0 || cand_idx >= cands->size)
         return -1;
     TrackCandidate *tc = &cands->data[cand_idx];
@@ -790,6 +906,9 @@ static int promote_candidate_if_ready(CandidateVec *cands, int cand_idx, int fra
     int map_idx = map->size;
     MapPoint mp = {X[0], X[1], X[2], cfg->new_point_obs > 2 ? cfg->new_point_obs : 2, 0, 0, d};
     map_push(map, mp);
+    record_map_lifecycle(map_lifecycle, map_lifecycle_enabled, map_idx, frame_id,
+                         "candidate_ready", -1, -1, -1, NAN, NAN, NAN,
+                         current.fb_err, current.track_disp, NAN);
     tc->valid = 0;
     if (pts)
         (*pts)++;
@@ -937,7 +1056,7 @@ static int estimate_pose_E(const CornerVec *p_pts, const CornerVec *c_pts, const
         normalize_point(fx, fy, cx, cy, c_pts->data[matches->data[i].train_idx], &n2[i * 3]);
     }
     unsigned char *bmask = calloc(matches->size, 1);
-    srand(0);
+    srand(g_ransac_seed);
     for (int i = 0; i < iters; i++) {
         int smp[8];
         unsigned char used[4096] = {0};
@@ -1093,12 +1212,76 @@ static int image_grid_cell(double x, double y, int w, int h, int cols, int rows)
     return gy * cols + gx;
 }
 
+static void scale_pose_translation(Pose *pose, double s) {
+    pose->m[3] *= s;
+    pose->m[7] *= s;
+    pose->m[11] *= s;
+}
+
+static void scale_world_state(double s, Map *map, KFDB *kf_db, AnchorSet *anchors,
+                              CandidateVec *candidates, FrameLite *prev, Pose *pose,
+                              Pose *lkf_pose, Pose *last_rel) {
+    if (!isfinite(s) || s <= 0.0 || fabs(s - 1.0) < 1e-12)
+        return;
+    for (int i = 0; i < map->size; i++) {
+        map->data[i].x *= s;
+        map->data[i].y *= s;
+        map->data[i].z *= s;
+    }
+    for (int i = 0; i < kf_db->size; i++)
+        scale_pose_translation(&kf_db->data[i].pose, s);
+    for (int i = 0; i < candidates->size; i++) {
+        TrackCandidate *tc = &candidates->data[i];
+        if (!tc->valid)
+            continue;
+        scale_pose_translation(&tc->anchor_pose, s);
+        for (int j = 0; j < tc->obs_count; j++)
+            scale_pose_translation(&tc->history[j].pose, s);
+    }
+    scale_pose_translation(&anchors->pose, s);
+    scale_pose_translation(&prev->pose, s);
+    scale_pose_translation(pose, s);
+    scale_pose_translation(lkf_pose, s);
+    scale_pose_translation(last_rel, s);
+}
+
+static void maybe_normalize_world_scale(const Config *cfg, Map *map, KFDB *kf_db,
+                                        AnchorSet *anchors, CandidateVec *candidates,
+                                        FrameLite *prev, Pose *pose, Pose *lkf_pose,
+                                        Pose *last_rel) {
+    if (!cfg->normalize_world_scale || map->size < 100)
+        return;
+    double center[3];
+    camera_center_from_pose(pose, center);
+    double norm = sqrt(center[0] * center[0] +
+                       center[1] * center[1] +
+                       center[2] * center[2]);
+    if (!isfinite(norm) || norm <= 1000.0)
+        return;
+    scale_world_state(10.0 / norm, map, kf_db, anchors, candidates, prev, pose,
+                      lkf_pose, last_rel);
+}
+
+static void refresh_map_descriptors(Map *map, const CornerVec *corners,
+                                    const unsigned char *gray, int w, int h) {
+    for (int i = 0; i < corners->size; i++) {
+        int pi = corners->data[i].pt_idx;
+        if (pi < 0 || pi >= map->size || map->data[pi].obs <= 0)
+            continue;
+        Brief256 d;
+        if (compute_brief(gray, w, h, corners->data[i].x, corners->data[i].y, &d))
+            map->data[pi].desc = d;
+    }
+}
+
 #include "simple_slam_c_plus_diagnostics.h"
 
 int main(int argc, char **argv) {
     Config cfg = parse_args(argc, argv);
+    g_ransac_seed = (unsigned int)cfg.ransac_seed;
     brief_init_pattern();
     g_oriented_brief = cfg.oriented_brief;
+    g_brief_patch_radius = cfg.brief_patch_radius;
     FFmpegCap *cap = ffmpeg_open(cfg.video_path, cfg.proc_w, cfg.proc_h, cfg.ffmpeg_gray);
     if (!cap) {
         fprintf(stderr, "Failed pipe.\n");
@@ -1126,12 +1309,24 @@ int main(int argc, char **argv) {
     pose_identity(&last_rel);
     KFDB kf_db = {0};
     Map map = {0};
+    MapLifecycleVec map_lifecycle = {0};
     CandidateVec candidates = {0};
     AnchorSet anchors = {0};
     int frame_id = 0, pts = 0, tri = 0;
+    int output_smooth_initialized = 0;
+    double output_smooth_xyz[3] = {0.0, 0.0, 0.0};
+    double output_smooth_residuals[64] = {0.0};
+    int output_smooth_residual_count = 0;
+    int output_smooth_residual_pos = 0;
+    int output_smooth_added_history[64] = {0};
+    int output_smooth_linked_history[64] = {0};
+    double output_smooth_jump_history[64] = {0.0};
+    int output_smooth_history_count = 0;
+    int output_smooth_history_pos = 0;
     double start = now_seconds();
     double fx = 525.0 * ((double)w / 640.0), fy = 525.0 * ((double)h / 480.0);
     double cx = 319.5 * ((double)w / 640.0), cy = 239.5 * ((double)h / 480.0);
+    int map_lifecycle_enabled = cfg.map_lifecycle_dump != NULL;
     DiagnosticsFiles diag;
     if (!diagnostics_open_files(&cfg, &diag))
         return 1;
@@ -1198,7 +1393,7 @@ int main(int argc, char **argv) {
                                  frame_id, cfg.anchor_max_features);
                 free(anchor_cur_corners.data);
                 match_anchor_sets(&anchors, &cur_anchors, cfg.anchor_max_hamming,
-                                  cfg.anchor_ratio, &anchor_matches);
+                                  cfg.anchor_mutual, cfg.anchor_ratio, &anchor_matches);
                 if (anchor_matches.size >= 8) {
                     active_e_prev = &anchors.corners;
                     active_e_cur = &cur_anchors.corners;
@@ -1238,6 +1433,8 @@ int main(int argc, char **argv) {
             int has_pnp_pose_for_dump = 0;
             unsigned char *pnp_point_ok = NULL;
             int pnp_ok = 0;
+            int low_e_override = 0;
+            Pose low_e_pose;
             t0 = now_seconds();
             if (frame_id >= cfg.pnp_start_frame) {
                 pnp_point_ok = build_pnp_quality_mask(
@@ -1258,7 +1455,11 @@ int main(int argc, char **argv) {
             if (frame_id >= cfg.pnp_start_frame)
                 pnp_ok = estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, cfg.pnp_dlt_iters,
                                            cfg.pnp_dlt_pretest, cfg.pnp_dlt_pretest_margin,
-                                           cfg.pnp_min_obs, pnp_point_ok, &pose, &pnp_inliers);
+                                           cfg.pnp_min_obs, pnp_point_ok,
+                                           cfg.pnp_score_rigid,
+                                           cfg.pnp_validate_rigid,
+                                           cfg.pnp_validate_rigid_min_points,
+                                           cfg.pnp_normalize_world, &pose, &pnp_inliers);
             free(pnp_point_ok);
             if (!pnp_ok && (cfg.pnp_p3p_fallback || cfg.pnp_p3p_observe)) {
                 Pose p3p_pose;
@@ -1275,30 +1476,94 @@ int main(int argc, char **argv) {
                     pnp_fallback_used = 1;
                 }
             }
+            prof.pnp += now_seconds() - t0;
             if (pnp_ok) {
-                prof.pnp += now_seconds() - t0;
-                inl = pnp_inliers;
                 pnp_pose_for_dump = pose;
                 has_pnp_pose_for_dump = 1;
+            }
+            double pnp_predicted_jump = 0.0;
+            double pnp_pose_jump = 0.0;
+            if (pnp_ok && cfg.pnp_low_e_fallback &&
+                (cfg.pnp_low_e_min_jump > 0.0 ||
+                 cfg.pnp_low_e_min_pose_jump > 0.0)) {
+                double pnp_center[3];
+                camera_center_from_pose(&pose, pnp_center);
+                if (cfg.pnp_low_e_min_jump > 0.0) {
+                    double pred_center[3];
+                    camera_center_from_pose(&predicted, pred_center);
+                    pnp_predicted_jump = vec3_dist(pred_center, pnp_center);
+                }
+                if (cfg.pnp_low_e_min_pose_jump > 0.0) {
+                    double prev_center[3];
+                    camera_center_from_pose(&prev.pose, prev_center);
+                    pnp_pose_jump = vec3_dist(prev_center, pnp_center);
+                }
+            }
+            if (pnp_ok && cfg.pnp_low_e_fallback &&
+                (cfg.pnp_low_e_min_map_points <= 0 ||
+                 map.size >= cfg.pnp_low_e_min_map_points) &&
+                pnp_inliers <= cfg.pnp_low_e_max_inliers &&
+                (cfg.pnp_low_e_min_jump <= 0.0 ||
+                 pnp_predicted_jump >= cfg.pnp_low_e_min_jump) &&
+                (cfg.pnp_low_e_min_pose_jump <= 0.0 ||
+                 pnp_pose_jump >= cfg.pnp_low_e_min_pose_jump)) {
+                Pose low_rel;
+                unsigned char *low_mask = NULL;
+                int low_inliers = 0;
+                t0 = now_seconds();
+                int low_e_ok = estimate_pose_E(active_e_prev, active_e_cur, active_e_matches,
+                                               fx, fy, cx, cy, &low_rel,
+                                               cfg.essential_iters,
+                                               cfg.essential_cheirality_max,
+                                               &low_mask, &low_inliers);
+                if (low_e_ok)
+                    write_e_inlier_pairs(diag.e_inlier_dump, frame_id,
+                                         active_e_cur == &tracked ? "pnp_low_pose"
+                                                                 : "pnp_low_anchor_pose",
+                                         active_e_prev, active_e_cur, active_e_matches,
+                                         low_mask, w, h);
+                prof.essential += now_seconds() - t0;
+                if (low_e_ok &&
+                    low_inliers >= cfg.pnp_low_e_min_inliers &&
+                    low_inliers >= pnp_inliers + cfg.pnp_low_e_min_gain) {
+                    pose_compose_relative(&low_rel, active_e_prev_pose, &low_e_pose);
+                    free(mask);
+                    mask = low_mask;
+                    low_mask = NULL;
+                    e_inliers = low_inliers;
+                    low_e_override = 1;
+                }
+                free(low_mask);
+            }
+            if (pnp_ok && !low_e_override) {
+                inl = pnp_inliers;
                 t0 = now_seconds();
                 refine_pose_lm(&map, &tracked, fx, fy, cx, cy, cfg.pose_lm_iters, &pose);
                 prof.pose_lm += now_seconds() - t0;
                 method = 2;
             } else {
-                prof.pnp += now_seconds() - t0;
-                t0 = now_seconds();
-                int e_ok = estimate_pose_E(active_e_prev, active_e_cur, active_e_matches,
+                int e_ok = 0;
+                if (low_e_override) {
+                    pose = low_e_pose;
+                    inl = e_inliers;
+                    e_ok = 1;
+                } else {
+                    t0 = now_seconds();
+                    e_ok = estimate_pose_E(active_e_prev, active_e_cur, active_e_matches,
                                            fx, fy, cx, cy, &rel,
                                            cfg.essential_iters, cfg.essential_cheirality_max,
                                            &mask, &inl);
-                if (e_ok)
-                    write_e_inlier_pairs(diag.e_inlier_dump, frame_id,
-                                         active_e_cur == &tracked ? "pose" : "anchor_pose",
-                                         active_e_prev, active_e_cur, active_e_matches, mask, w, h);
-                prof.essential += now_seconds() - t0;
+                    if (e_ok)
+                        write_e_inlier_pairs(diag.e_inlier_dump, frame_id,
+                                             active_e_cur == &tracked ? "pose" : "anchor_pose",
+                                             active_e_prev, active_e_cur, active_e_matches, mask, w, h);
+                    prof.essential += now_seconds() - t0;
+                }
                 if (e_ok) {
-                    e_inliers = inl;
-                    pose_compose_relative(&rel, active_e_prev_pose, &pose);
+                    if (!low_e_override) {
+                        e_inliers = inl;
+                        pose_compose_relative(&rel, active_e_prev_pose, &pose);
+                    }
                     t0 = now_seconds();
                     refine_pose_lm(&map, &tracked, fx, fy, cx, cy, cfg.pose_lm_iters, &pose);
                     prof.pose_lm += now_seconds() - t0;
@@ -1336,6 +1601,11 @@ int main(int argc, char **argv) {
 	                    double adm_sum_reproj = 0.0, adm_sum_parallax = 0.0, adm_sum_depth = 0.0;
 	                    double adm_min_depth = DBL_MAX, adm_max_depth = 0.0;
 	                    int adm_cell_counts[ADMISSION_GRID_CELLS] = {0};
+	                    int admission_allows_new = cfg.admission_min_inliers <= 0 ||
+	                                               inl >= cfg.admission_min_inliers;
+	                    if (cfg.admission_pnp_min_inliers > 0 && method == 2 &&
+	                        inl < cfg.admission_pnp_min_inliers)
+	                        admission_allows_new = 0;
 	                    Pose admission_pose = pose;
 	                    Pose admission_rel;
 	                    int has_admission_rel = 0;
@@ -1403,6 +1673,8 @@ int main(int argc, char **argv) {
 	                                continue;
 	                            if (!config_allows_new_landmarks(&cfg, frame_id))
 	                                continue;
+	                            if (!admission_allows_new)
+	                                continue;
 	                            adm_candidates++;
 		                            Corner pc = prev.corners.data[am.query_idx];
 		                            Corner cc = tracked.data[am.train_idx];
@@ -1429,6 +1701,10 @@ int main(int argc, char **argv) {
 	                                                    0,
 	                                                    _d};
 	                                    map_push(&map, _mp);
+	                                    record_map_lifecycle(
+	                                        &map_lifecycle, map_lifecycle_enabled, map_idx,
+	                                        frame_id, "candidate_deferred", method, inl, -1,
+	                                        NAN, NAN, NAN, cc.fb_err, cc.track_disp, score);
 	                                    candidates.data[ci].valid = 0;
 	                                    tracked.data[am.train_idx].pt_idx = map_idx;
 	                                    tracked.data[am.train_idx].cand_idx = -1;
@@ -1507,7 +1783,8 @@ int main(int argc, char **argv) {
 	                                } else {
 	                                    int promoted = promote_candidate_if_ready(
 	                                        &candidates, ci, frame_id, &admission_pose, cc, fx, fy, cx, cy,
-	                                        &cfg, &map, cblur, w, h, &pts, &tri);
+	                                        &cfg, &map, cblur, w, h, &pts, &tri,
+	                                        &map_lifecycle, map_lifecycle_enabled);
 	                                    if (promoted >= 0) {
 	                                        tracked.data[am.train_idx].pt_idx = promoted;
 	                                        tracked.data[am.train_idx].cand_idx = -1;
@@ -1532,8 +1809,15 @@ int main(int argc, char **argv) {
 	                                                               fx, fy, cx, cy, X);
 	                                    memcpy(Xstat, X, sizeof(Xstat));
 	                                }
-	                                if (!tri_ok)
+	                                if (!tri_ok) {
+	                                    write_map_admission_detail(
+	                                        diag.map_admission_detail_dump, frame_id, "lk",
+	                                        "tri_fail", method, inl, j, am.query_idx,
+	                                        am.train_idx, adm_cell, stat_p1, stat_p2, NAN, NAN,
+	                                        NAN, NAN, NAN, cc.fb_err, cc.track_disp,
+	                                        admission_order ? admission_order[oi].score : 0.0);
 	                                    continue;
+	                                }
 	                                if ((cfg.tri_min_parallax_deg > 0.0 ||
 	                                     cfg.tri_max_reproj_px > 0.0 ||
 	                                     cfg.tri_max_depth > 0.0 ||
@@ -1555,8 +1839,25 @@ int main(int argc, char **argv) {
 	                                double parallax = triangulation_parallax_deg(stat_p1, stat_p2, Xstat);
 	                                if (cfg.admission_finite_only &&
 	                                    (!isfinite(e1) || !isfinite(e2) || !isfinite(depth) ||
-	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2])))
+	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2]))) {
+	                                    write_map_admission_detail(
+	                                        diag.map_admission_detail_dump, frame_id, "lk",
+	                                        "finite_reject", method, inl, j, am.query_idx,
+	                                        am.train_idx, adm_cell, stat_p1, stat_p2, reproj,
+	                                        parallax, depth, z1, z2, cc.fb_err, cc.track_disp,
+	                                        admission_order ? admission_order[oi].score : 0.0);
 	                                    continue;
+	                                }
+	                                if (cfg.tri_max_depth_pnp > 0.0 && method == 2 &&
+	                                    (!isfinite(depth) || depth > cfg.tri_max_depth_pnp)) {
+	                                    write_map_admission_detail(
+	                                        diag.map_admission_detail_dump, frame_id, "lk",
+	                                        "pnp_depth_reject", method, inl, j, am.query_idx,
+	                                        am.train_idx, adm_cell, stat_p1, stat_p2, reproj,
+	                                        parallax, depth, z1, z2, cc.fb_err, cc.track_disp,
+	                                        admission_order ? admission_order[oi].score : 0.0);
+	                                    continue;
+	                                }
 	                                if (cfg.admission_batch_ranked) {
 	                                    double score = isfinite(reproj) ? reproj : 1.0e30;
 	                                    AdmissionCandidate ac = {am.query_idx,
@@ -1590,6 +1891,12 @@ int main(int argc, char **argv) {
 	                                adm_accepted++;
 	                                if (adm_cell >= 0)
 	                                    adm_cell_counts[adm_cell]++;
+	                                write_map_admission_detail(
+	                                    diag.map_admission_detail_dump, frame_id, "lk", "accept",
+	                                    method, inl, j, am.query_idx, am.train_idx, adm_cell,
+	                                    stat_p1, stat_p2, reproj, parallax, depth, z1, z2,
+	                                    cc.fb_err, cc.track_disp,
+	                                    admission_order ? admission_order[oi].score : 0.0);
 	                                MapPoint _mp = {X[0], X[1], X[2],
 	                                                cfg.first_kf_observations && kf_db.size == 0
 	                                                    ? 2
@@ -1598,6 +1905,12 @@ int main(int argc, char **argv) {
 	                                                0,
 	                                                _d};
 	                                map_push(&map, _mp);
+	                                record_map_lifecycle(
+	                                    &map_lifecycle, map_lifecycle_enabled,
+	                                    tracked.data[am.train_idx].pt_idx, frame_id, "lk",
+	                                    method, inl, adm_cell, reproj, parallax, depth,
+	                                    cc.fb_err, cc.track_disp,
+	                                    admission_order ? admission_order[oi].score : 0.0);
 	                                pts++;
 	                                added++;
 	                                tri++;
@@ -1606,6 +1919,9 @@ int main(int argc, char **argv) {
 	                            int pi = tracked.data[am.train_idx].pt_idx;
 	                            if (!obs_seen || pi >= obs_seen_cap || !obs_seen[pi]) {
 	                                map.data[pi].obs++;
+	                                mark_map_lifecycle_observed(&map_lifecycle,
+	                                                            map_lifecycle_enabled,
+	                                                            pi, frame_id);
                                 if (obs_seen && pi < obs_seen_cap)
                                     obs_seen[pi] = 1;
 	                            }
@@ -1661,6 +1977,19 @@ int main(int argc, char **argv) {
 	                            adm_accepted++;
 	                            if (ac->cell >= 0)
 	                                adm_cell_counts[ac->cell]++;
+	                            double bz1 = 0.0, bz2 = 0.0;
+	                            (void)reprojection_error_xyz(&ac->prev_pose, ac->Xstat,
+	                                                          ac->prev_corner, fx, fy, cx, cy,
+	                                                          &bz1);
+	                            (void)reprojection_error_xyz(&ac->cur_pose, ac->Xstat,
+	                                                          ac->cur_corner, fx, fy, cx, cy,
+	                                                          &bz2);
+	                            write_map_admission_detail(
+	                                diag.map_admission_detail_dump, frame_id, "lk_batch",
+	                                "accept", method, inl, -1, ac->query_idx, ac->train_idx,
+	                                ac->cell, &ac->prev_pose, &ac->cur_pose, ac->reproj,
+	                                ac->parallax, ac->depth, bz1, bz2,
+	                                ac->cur_corner.fb_err, ac->cur_corner.track_disp, ac->score);
 	                            MapPoint _mp = {ac->X[0], ac->X[1], ac->X[2],
 	                                            cfg.first_kf_observations && kf_db.size == 0
 	                                                ? 2
@@ -1669,6 +1998,11 @@ int main(int argc, char **argv) {
 	                                            0,
 	                                            ac->desc};
 	                            map_push(&map, _mp);
+	                            record_map_lifecycle(
+	                                &map_lifecycle, map_lifecycle_enabled, map_idx,
+	                                frame_id, "lk_batch", method, inl, ac->cell, ac->reproj,
+	                                ac->parallax, ac->depth, ac->cur_corner.fb_err,
+	                                ac->cur_corner.track_disp, ac->score);
 	                            pts++;
 	                            added++;
 	                            tri++;
@@ -1677,7 +2011,7 @@ int main(int argc, char **argv) {
 	                    }
 	                    free(admission_batch.data);
 	                    free(admission_order);
-	                    if (config_suppresses_lk_landmarks(&cfg)) {
+	                    if (admission_allows_new && config_suppresses_lk_landmarks(&cfg)) {
 	                        CornerVec desc_cur = {0};
 	                        extract_features_pure(&cfg, cblur, w, h, &desc_cur, cfg.max_points);
 	                        const CornerVec *desc_src_corners = &prev.corners;
@@ -1790,8 +2124,15 @@ int main(int argc, char **argv) {
 	                                                               pc, cc, fx, fy, cx, cy, X);
 	                                    memcpy(Xstat, X, sizeof(Xstat));
 	                                }
-	                                if (!tri_ok)
+	                                if (!tri_ok) {
+	                                    write_map_admission_detail(
+	                                        diag.map_admission_detail_dump, frame_id,
+	                                        desc_dump_kind, "tri_fail", method, inl, j,
+	                                        dm.query_idx, dm.train_idx, -1, stat_p1, stat_p2,
+	                                        NAN, NAN, NAN, NAN, NAN, cc.fb_err,
+	                                        cc.track_disp, dm.score);
 	                                    continue;
+	                                }
 	                                if ((cfg.tri_min_parallax_deg > 0.0 ||
 	                                     cfg.tri_max_reproj_px > 0.0 ||
 	                                     cfg.tri_max_depth > 0.0 ||
@@ -1825,12 +2166,21 @@ int main(int argc, char **argv) {
 	                                double e1 = reprojection_error_xyz(stat_p1, Xstat, pc, fx, fy, cx, cy, &z1);
 	                                double e2 = reprojection_error_xyz(stat_p2, Xstat, cc, fx, fy, cx, cy, &z2);
 	                                double depth = 0.5 * (z1 + z2);
+	                                double reproj = 0.5 * (e1 + e2);
+	                                double parallax = triangulation_parallax_deg(stat_p1, stat_p2, Xstat);
 	                                if (cfg.admission_finite_only &&
 	                                    (!isfinite(e1) || !isfinite(e2) || !isfinite(depth) ||
-	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2])))
+	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2]))) {
+	                                    write_map_admission_detail(
+	                                        diag.map_admission_detail_dump, frame_id,
+	                                        desc_dump_kind, "finite_reject", method, inl, j,
+	                                        dm.query_idx, dm.train_idx, -1, stat_p1, stat_p2,
+	                                        reproj, parallax, depth, z1, z2, cc.fb_err,
+	                                        cc.track_disp, dm.score);
 	                                    continue;
-	                                adm_sum_reproj += 0.5 * (e1 + e2);
-	                                adm_sum_parallax += triangulation_parallax_deg(stat_p1, stat_p2, Xstat);
+	                                }
+	                                adm_sum_reproj += reproj;
+	                                adm_sum_parallax += parallax;
 	                                adm_sum_depth += depth;
 	                                if (depth < adm_min_depth)
 	                                    adm_min_depth = depth;
@@ -1838,6 +2188,11 @@ int main(int argc, char **argv) {
 	                                    adm_max_depth = depth;
 	                                adm_accepted++;
 	                                desc_added++;
+	                                write_map_admission_detail(
+	                                    diag.map_admission_detail_dump, frame_id, desc_dump_kind,
+	                                    "accept", method, inl, j, dm.query_idx, dm.train_idx,
+	                                    -1, stat_p1, stat_p2, reproj, parallax, depth, z1, z2,
+	                                    cc.fb_err, cc.track_disp, dm.score);
 	                                MapPoint _mp = {X[0], X[1], X[2],
 	                                                cfg.first_kf_observations && kf_db.size == 0
 	                                                    ? 2
@@ -1846,6 +2201,11 @@ int main(int argc, char **argv) {
 	                                                0,
 	                                                _d};
 	                                map_push(&map, _mp);
+	                                record_map_lifecycle(
+	                                    &map_lifecycle, map_lifecycle_enabled, map_idx,
+	                                    frame_id, desc_dump_kind, method, inl, -1,
+	                                    reproj, parallax, depth, cc.fb_err,
+	                                    cc.track_disp, dm.score);
 	                                pts++;
 	                                added++;
 	                                tri++;
@@ -1894,6 +2254,10 @@ int main(int argc, char **argv) {
 	                                            0,
 	                                            _d};
 	                            map_push(&map, _mp);
+	                            record_map_lifecycle(
+	                                &map_lifecycle, map_lifecycle_enabled, map_idx,
+	                                frame_id, "candidate_grid", method, inl, cp->cell,
+	                                NAN, NAN, NAN, cc.fb_err, cc.track_disp, cp->score);
 	                            candidates.data[cp->cand_idx].valid = 0;
 	                            tracked.data[cp->corner_idx].pt_idx = map_idx;
 	                            tracked.data[cp->corner_idx].cand_idx = -1;
@@ -1980,6 +2344,16 @@ int main(int argc, char **argv) {
 	                                    Brief256 _d = {{0, 0, 0, 0}};
 	                                    compute_brief(cblur, w, h, cur_corner.x, cur_corner.y, &_d);
 	                                    int new_idx = map.size;
+	                                    double src_z1 = 0.0, src_z2 = 0.0;
+	                                    double src_e1 = reprojection_error_xyz(
+	                                        &src->pose, X, src->corners.data[orig_qi],
+	                                        fx, fy, cx, cy, &src_z1);
+	                                    double src_e2 = reprojection_error_xyz(
+	                                        &pose, X, cur_corner, fx, fy, cx, cy, &src_z2);
+	                                    double src_depth = 0.5 * (src_z1 + src_z2);
+	                                    double src_reproj = 0.5 * (src_e1 + src_e2);
+	                                    double src_parallax =
+	                                        triangulation_parallax_deg(&src->pose, &pose, X);
 	                                    tracked.data[cur_idx].pt_idx = new_idx;
 	                                    src->corners.data[orig_qi].pt_idx = new_idx;
 	                                    MapPoint _mp = {X[0], X[1], X[2],
@@ -1988,6 +2362,11 @@ int main(int argc, char **argv) {
 	                                                    0,
 	                                                    _d};
 	                                    map_push(&map, _mp);
+	                                    record_map_lifecycle(
+	                                        &map_lifecycle, map_lifecycle_enabled, new_idx,
+	                                        frame_id, "tri_source_kf", 1, src_inl, -1,
+	                                        src_reproj, src_parallax, src_depth,
+	                                        cur_corner.fb_err, cur_corner.track_disp, 0.0);
 	                                    pts++;
 	                                    added++;
 	                                    tri++;
@@ -2058,7 +2437,8 @@ int main(int argc, char **argv) {
                                                fx, fy, cx, cy, 8.0);
                         prof.map_hygiene += now_seconds() - t0;
                     } else {
-                        local_ba(&kf_db, &map, fx, fy, cx, cy, cfg.pose_lm_iters);
+                        local_ba(&kf_db, &map, fx, fy, cx, cy, cfg.pose_lm_iters,
+                                 cfg.local_ba_fix_oldest);
                         prof.ba_local += now_seconds() - t0;
                         prof.ba += prof.ba_local;
                     }
@@ -2094,8 +2474,98 @@ int main(int argc, char **argv) {
             pose_inverse(&prev.pose, &inv_prev);
             pose_compose_relative(&pose, &inv_prev, &last_rel);
         }
+        if (cfg.update_map_descriptors && frame_id > 0)
+            refresh_map_descriptors(&map, &tracked, cblur, w, h);
+        maybe_normalize_world_scale(&cfg, &map, &kf_db, &anchors, &candidates,
+                                    &prev, &pose, &lkf_pose, &last_rel);
         double c[3];
         camera_center_from_pose(&pose, c);
+        double out_c[3] = {c[0], c[1], c[2]};
+        int output_smooth_unstable = 0;
+        if (cfg.output_smooth_alpha > 0.0 && cfg.output_smooth_alpha < 1.0) {
+            if (cfg.output_smooth_unstable_window > 0 &&
+                cfg.output_smooth_unstable_points_added > 0 &&
+                cfg.output_smooth_unstable_jump_count > 0 &&
+                output_smooth_history_count > 0) {
+                int recent_added = recent_int_sum(
+                    output_smooth_added_history, output_smooth_history_count,
+                    output_smooth_history_pos, cfg.output_smooth_unstable_window);
+                int recent_jumps = recent_double_count_gt(
+                    output_smooth_jump_history, output_smooth_history_count,
+                    output_smooth_history_pos, cfg.output_smooth_unstable_window,
+                    cfg.output_smooth_unstable_jump);
+                output_smooth_unstable =
+                    recent_added >= cfg.output_smooth_unstable_points_added &&
+                    recent_jumps >= cfg.output_smooth_unstable_jump_count;
+            }
+            if (!output_smooth_initialized) {
+                output_smooth_xyz[0] = c[0];
+                output_smooth_xyz[1] = c[1];
+                output_smooth_xyz[2] = c[2];
+                output_smooth_initialized = 1;
+            } else {
+                double a = output_smooth_unstable &&
+                                   cfg.output_smooth_unstable_alpha > 0.0
+                               ? cfg.output_smooth_unstable_alpha
+                               : cfg.output_smooth_alpha;
+                double residual_k = output_smooth_unstable &&
+                                            cfg.output_smooth_unstable_residual_k > 0.0
+                                        ? cfg.output_smooth_unstable_residual_k
+                                        : cfg.output_smooth_residual_k;
+                if (cfg.output_smooth_low_link_alpha > 0.0 &&
+                    cfg.output_smooth_low_link_alpha < a &&
+                    cfg.output_smooth_low_link_threshold > 0 &&
+                    cfg.output_smooth_low_link_window > 0 &&
+                    cfg.output_smooth_low_link_count > 0 &&
+                    output_smooth_history_count > 0) {
+                    int low_link_frames = recent_int_count_lt(
+                        output_smooth_linked_history, output_smooth_history_count,
+                        output_smooth_history_pos, cfg.output_smooth_low_link_window,
+                        cfg.output_smooth_low_link_threshold);
+                    if (cfg.output_smooth_low_link_include_current &&
+                        linked_points < cfg.output_smooth_low_link_threshold)
+                        low_link_frames++;
+                    if (low_link_frames >= cfg.output_smooth_low_link_count)
+                        a = cfg.output_smooth_low_link_alpha;
+                }
+                double residual = vec3_dist(c, output_smooth_xyz);
+                double stored_residual = residual;
+                if (cfg.output_smooth_outlier_alpha > 0.0 &&
+                    cfg.output_smooth_outlier_alpha < a &&
+                    residual_k > 0.0 &&
+                    output_smooth_residual_count > 0) {
+                    double med = median_recent_values(output_smooth_residuals,
+                                                      output_smooth_residual_count);
+                    if (isfinite(med) && med > 0.0 &&
+                        residual > residual_k * med) {
+                        a = cfg.output_smooth_outlier_alpha;
+                        if (output_smooth_unstable &&
+                            cfg.output_smooth_unstable_cap_residual)
+                            stored_residual = residual_k * med;
+                    }
+                }
+                output_smooth_xyz[0] = a * c[0] + (1.0 - a) * output_smooth_xyz[0];
+                output_smooth_xyz[1] = a * c[1] + (1.0 - a) * output_smooth_xyz[1];
+                output_smooth_xyz[2] = a * c[2] + (1.0 - a) * output_smooth_xyz[2];
+                output_smooth_residuals[output_smooth_residual_pos] = stored_residual;
+                output_smooth_residual_pos =
+                    (output_smooth_residual_pos + 1) % cfg.output_smooth_window;
+                if (output_smooth_residual_count < cfg.output_smooth_window)
+                    output_smooth_residual_count++;
+            }
+            out_c[0] = output_smooth_xyz[0];
+            out_c[1] = output_smooth_xyz[1];
+            out_c[2] = output_smooth_xyz[2];
+        }
+        if (cfg.output_smooth_unstable_window > 0 ||
+            cfg.output_smooth_low_link_window > 0) {
+            output_smooth_added_history[output_smooth_history_pos] = added;
+            output_smooth_linked_history[output_smooth_history_pos] = linked_points;
+            output_smooth_jump_history[output_smooth_history_pos] = trans_jump;
+            output_smooth_history_pos = (output_smooth_history_pos + 1) % 64;
+            if (output_smooth_history_count < 64)
+                output_smooth_history_count++;
+        }
         t0 = now_seconds();
         frame_stat_vec_push(&stats, (FrameStat){frame_id,
                                                 inl,
@@ -2125,7 +2595,8 @@ int main(int argc, char **argv) {
                                                  pnp_p3p_probe.center[1],
                                                  pnp_p3p_probe.center[2]},
                                                 trans_jump,
-                                                {c[0], c[1], c[2]}});
+                                                {c[0], c[1], c[2]},
+                                                {out_c[0], out_c[1], out_c[2]}});
         profile_stat_vec_push(&profile, prof);
         profile.data[profile.size - 1].metrics += now_seconds() - t0;
         if ((frame_id + 1) % 10 == 0)
@@ -2141,6 +2612,8 @@ int main(int argc, char **argv) {
         free(mask);
         frame_id++;
     }
+    write_map_lifecycle_dump(diag.map_lifecycle_dump, &map, &map_lifecycle,
+                             frame_id > 0 ? frame_id - 1 : 0);
     diagnostics_write_outputs(&cfg, &stats, &profile, pts, tri, now_seconds() - start);
     diagnostics_close_files(&diag);
     ffmpeg_close(cap);
@@ -2153,6 +2626,7 @@ int main(int argc, char **argv) {
     free(profile.data);
     free(stats.data);
     free(candidates.data);
+    free(map_lifecycle.data);
     anchor_set_free(&anchors);
     kfdb_free(&kf_db);
     free(map.data);

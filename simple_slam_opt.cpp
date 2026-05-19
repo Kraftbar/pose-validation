@@ -39,6 +39,7 @@ struct Config {
     int max_proc_w = 640;
     int max_points = 15000;
     int cull_min_obs = 2;
+    std::string map_admission_detail_dump;
 };
 
 struct Observation {
@@ -155,6 +156,20 @@ class SimpleSlamOpt {
     explicit SimpleSlamOpt(Config config)
         : config_(std::move(config)), orb_(cv::ORB::create(3000)),
           matcher_(cv::BFMatcher::create(cv::NORM_HAMMING, false)) {
+        if (!config_.map_admission_detail_dump.empty()) {
+            const std::filesystem::path path(config_.map_admission_detail_dump);
+            if (path.has_parent_path()) {
+                std::filesystem::create_directories(path.parent_path());
+            }
+            admission_detail_.open(config_.map_admission_detail_dump, std::ios::binary);
+            if (!admission_detail_) {
+                throw std::runtime_error("failed to open map admission detail dump: " +
+                                         config_.map_admission_detail_dump);
+            }
+            admission_detail_
+                << "frame_id,source,decision,method,inliers,match_idx,query_idx,train_idx,"
+                   "cell,baseline,reproj,parallax,depth,z1,z2,fb_err,track_disp,score\n";
+        }
     }
 
     void processFrame(const cv::Mat &image, const cv::Matx33d &K) {
@@ -238,14 +253,17 @@ class SimpleSlamOpt {
             if (estimatePoseE(prev.kps, curr.kps, tri_matches, K, rel, emask)) {
                 std::vector<cv::Point2f> pts1;
                 std::vector<cv::Point2f> pts2;
+                std::vector<int> tri_match_indices;
                 pts1.reserve(tri_matches.size());
                 pts2.reserve(tri_matches.size());
+                tri_match_indices.reserve(tri_matches.size());
                 for (std::size_t i = 0; i < tri_matches.size() && i < emask.size(); ++i) {
                     if (!emask[i]) {
                         continue;
                     }
                     pts1.push_back(prev.kps[tri_matches[i].queryIdx]);
                     pts2.push_back(curr.kps[tri_matches[i].trainIdx]);
+                    tri_match_indices.push_back(static_cast<int>(i));
                 }
 
                 std::vector<cv::Point3d> tri_points;
@@ -256,14 +274,44 @@ class SimpleSlamOpt {
                     std::max(0, config_.max_points - static_cast<int>(points_.size()));
                 const int add_n = std::min(slots, static_cast<int>(tri_points.size()));
                 for (int j = 0; j < add_n; ++j) {
+                    const int kept_idx = maskedIndex(tri_mask, j);
+                    const int match_idx = kept_idx >= 0 && kept_idx < static_cast<int>(tri_match_indices.size())
+                                              ? tri_match_indices[kept_idx]
+                                              : -1;
+                    if (match_idx >= 0 && match_idx < static_cast<int>(tri_matches.size())) {
+                        const auto &match = tri_matches[match_idx];
+                        writeAdmissionDetail(fid, "accept", used_pnp, inliers, match_idx, match,
+                                             prev.pose, curr.pose, prev.kps[match.queryIdx],
+                                             curr.kps[match.trainIdx], K, image.cols, image.rows,
+                                             &tri_points[j]);
+                    }
                     const int pid = static_cast<int>(points_.size());
                     MapPoint mp;
                     mp.pt = tri_points[j];
-                    mp.observations.push_back({prev.id, pts1[maskedIndex(tri_mask, j)]});
-                    mp.observations.push_back({curr.id, pts2[maskedIndex(tri_mask, j)]});
+                    mp.observations.push_back({prev.id, pts1[kept_idx]});
+                    mp.observations.push_back({curr.id, pts2[kept_idx]});
                     points_.push_back(std::move(mp));
-                    prev.uv_to_point[packUv(pts1[maskedIndex(tri_mask, j)])] = pid;
-                    curr.uv_to_point[packUv(pts2[maskedIndex(tri_mask, j)])] = pid;
+                    prev.uv_to_point[packUv(pts1[kept_idx])] = pid;
+                    curr.uv_to_point[packUv(pts2[kept_idx])] = pid;
+                }
+                if (admission_detail_) {
+                    for (int j = 0; j < static_cast<int>(tri_mask.size()); ++j) {
+                        if (tri_mask[j]) {
+                            continue;
+                        }
+                        if (j < 0 || j >= static_cast<int>(tri_match_indices.size())) {
+                            continue;
+                        }
+                        const int match_idx = tri_match_indices[j];
+                        if (match_idx < 0 || match_idx >= static_cast<int>(tri_matches.size())) {
+                            continue;
+                        }
+                        const auto &match = tri_matches[match_idx];
+                        writeAdmissionDetail(fid, "tri_fail", used_pnp, inliers, match_idx, match,
+                                             prev.pose, curr.pose, prev.kps[match.queryIdx],
+                                             curr.kps[match.trainIdx], K, image.cols, image.rows,
+                                             nullptr);
+                    }
                 }
                 points_added_this_frame = add_n;
                 tri_points_total_ += add_n;
@@ -556,6 +604,91 @@ class SimpleSlamOpt {
         }
     }
 
+    static bool projectPoint(const cv::Matx44d &pose, const cv::Matx33d &K,
+                             const cv::Point3d &point, cv::Point2f &uv, double &z) {
+        const cv::Matx33d R = poseRotation(pose);
+        const cv::Vec3d t = poseTranslation(pose);
+        const cv::Vec3d X(point.x, point.y, point.z);
+        const cv::Vec3d cam = R * X + t;
+        z = cam[2];
+        if (std::abs(z) <= 1e-12) {
+            return false;
+        }
+        uv.x = static_cast<float>(K(0, 0) * cam[0] / z + K(0, 2));
+        uv.y = static_cast<float>(K(1, 1) * cam[1] / z + K(1, 2));
+        return std::isfinite(uv.x) && std::isfinite(uv.y) && std::isfinite(z);
+    }
+
+    static double reprojectionError(const cv::Matx44d &pose, const cv::Matx33d &K,
+                                    const cv::Point3d &point, const cv::Point2f &observed,
+                                    double &z) {
+        cv::Point2f projected;
+        if (!projectPoint(pose, K, point, projected, z)) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return cv::norm(projected - observed);
+    }
+
+    static double parallaxDegrees(const cv::Matx44d &pose1, const cv::Matx44d &pose2,
+                                  const cv::Point3d &point) {
+        const cv::Point3d c1 = cameraCenter(pose1);
+        const cv::Point3d c2 = cameraCenter(pose2);
+        cv::Vec3d r1(point.x - c1.x, point.y - c1.y, point.z - c1.z);
+        cv::Vec3d r2(point.x - c2.x, point.y - c2.y, point.z - c2.z);
+        const double n1 = cv::norm(r1);
+        const double n2 = cv::norm(r2);
+        if (n1 <= 1e-12 || n2 <= 1e-12) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        double c = r1.dot(r2) / (n1 * n2);
+        c = std::max(-1.0, std::min(1.0, c));
+        return std::acos(c) * 180.0 / CV_PI;
+    }
+
+    static int imageCell(const cv::Point2f &uv, int width, int height) {
+        if (width <= 0 || height <= 0) {
+            return -1;
+        }
+        int gx = static_cast<int>(uv.x * 8.0 / static_cast<double>(width));
+        int gy = static_cast<int>(uv.y * 6.0 / static_cast<double>(height));
+        gx = std::max(0, std::min(7, gx));
+        gy = std::max(0, std::min(5, gy));
+        return gy * 8 + gx;
+    }
+
+    void writeAdmissionDetail(int frame_id, const char *decision, bool used_pnp, int inliers,
+                              int match_idx, const cv::DMatch &match,
+                              const cv::Matx44d &pose1, const cv::Matx44d &pose2,
+                              const cv::Point2f &uv1, const cv::Point2f &uv2,
+                              const cv::Matx33d &K, int width, int height,
+                              const cv::Point3d *point) {
+        if (!admission_detail_) {
+            return;
+        }
+        const cv::Point3d c1 = cameraCenter(pose1);
+        const cv::Point3d c2 = cameraCenter(pose2);
+        const double baseline = cv::norm(c1 - c2);
+        double reproj = std::numeric_limits<double>::quiet_NaN();
+        double parallax = std::numeric_limits<double>::quiet_NaN();
+        double depth = std::numeric_limits<double>::quiet_NaN();
+        double z1 = std::numeric_limits<double>::quiet_NaN();
+        double z2 = std::numeric_limits<double>::quiet_NaN();
+        if (point) {
+            const double e1 = reprojectionError(pose1, K, *point, uv1, z1);
+            const double e2 = reprojectionError(pose2, K, *point, uv2, z2);
+            reproj = 0.5 * (e1 + e2);
+            depth = 0.5 * (z1 + z2);
+            parallax = parallaxDegrees(pose1, pose2, *point);
+        }
+        const double track_disp = cv::norm(uv2 - uv1);
+        admission_detail_ << frame_id << ",cpp_desc," << decision << ","
+                          << (used_pnp ? 2 : 1) << "," << inliers << "," << match_idx << ","
+                          << match.queryIdx << "," << match.trainIdx << ","
+                          << imageCell(uv2, width, height) << "," << baseline << "," << reproj
+                          << "," << parallax << "," << depth << "," << z1 << "," << z2
+                          << ",0," << track_disp << "," << match.distance << "\n";
+    }
+
     void cullPoints() {
         if (points_.empty()) {
             return;
@@ -597,6 +730,7 @@ class SimpleSlamOpt {
     Config config_;
     cv::Ptr<cv::ORB> orb_;
     cv::Ptr<cv::BFMatcher> matcher_;
+    std::ofstream admission_detail_;
     std::vector<Frame> frames_;
     std::vector<MapPoint> points_;
     std::vector<FrameStat> frame_stats_;
@@ -612,7 +746,8 @@ static void printUsage() {
         << "                         [--use_pnp {0,1}] [--pnp_min_corr N]\n"
         << "                         [--inlier_min_for_tri N] [--kf_min_inliers N]\n"
         << "                         [--kf_max_rot_deg N] [--max_proc_w N]\n"
-        << "                         [--max_points N] [--cull_min_obs N] [positional_video]\n";
+        << "                         [--max_points N] [--cull_min_obs N]\n"
+        << "                         [--map_admission_detail_dump PATH] [positional_video]\n";
 }
 
 static std::string requireValue(int &index, int argc, char **argv, const std::string &arg) {
@@ -660,6 +795,8 @@ static Config parseArgs(int argc, char **argv) {
             cfg.max_points = std::stoi(requireValue(i, argc, argv, arg));
         } else if (arg == "--cull_min_obs") {
             cfg.cull_min_obs = std::stoi(requireValue(i, argc, argv, arg));
+        } else if (arg == "--map_admission_detail_dump") {
+            cfg.map_admission_detail_dump = requireValue(i, argc, argv, arg);
         } else if (!arg.empty() && arg[0] != '-' && positional_video.empty()) {
             positional_video = arg;
         } else {

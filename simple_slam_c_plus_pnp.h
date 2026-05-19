@@ -54,10 +54,42 @@ static int count_pnp_linear_inliers(const Map *map, const CornerVec *corners, co
     return inl;
 }
 
+static int count_pose_inliers(const Map *map, const CornerVec *corners, double fx, double fy,
+                              double cx, double cy, const Pose *pose);
+
+static int dlt_projection_to_pose(const double P[12], Pose *out_pose) {
+    double R[9] = {P[0], P[1], P[2], P[4], P[5], P[6], P[8], P[9], P[10]},
+           t[3] = {P[3], P[7], P[11]};
+    double norm = sqrt(R[6] * R[6] + R[7] * R[7] + R[8] * R[8]);
+    if (!isfinite(norm) || norm < 1e-12)
+        return 0;
+    double sc = 1.0 / norm;
+    if (P[11] * sc < 0)
+        sc = -sc;
+    for (int j = 0; j < 9; j++)
+        R[j] *= sc;
+    for (int j = 0; j < 3; j++)
+        t[j] *= sc;
+    double W[3], U[9], V[9], Ro[9];
+    svd_3x3(R, W, U, V);
+    double VT[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            VT[i * 3 + j] = V[j * 3 + i];
+    mat3_mul(U, VT, Ro);
+    if (mat3_det(Ro) < 0)
+        for (int j = 0; j < 9; j++)
+            Ro[j] = -Ro[j];
+    pose_from_rt(Ro, t, out_pose);
+    return 1;
+}
+
 static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx, double fy,
                              double cx, double cy, int dlt_iters, int dlt_pretest,
                              int dlt_pretest_margin, int min_obs, const unsigned char *point_ok,
-                             Pose *out_pose, int *out_inl) {
+                             int score_rigid, int validate_rigid,
+                             int validate_rigid_min_points, int normalize_world, Pose *out_pose,
+                             int *out_inl) {
     if (out_inl)
         *out_inl = 0;
     int n = 0;
@@ -81,16 +113,54 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
     double best_P[12];
     int best_inl = 0;
     int best_pre = 0;
+    Pose best_pose;
+    int best_pose_valid = 0;
     int iters = dlt_iters > 0 ? dlt_iters : 500;
-    srand(0);
+    srand(g_ransac_seed);
     for (int it = 0; it < iters; it++) {
         double AtA[144] = {0}, W[12], V[144], P[12];
+        double mean[3] = {0.0, 0.0, 0.0};
+        double scale = 1.0;
+        int sample_ids[6];
+        for (int i = 0; i < 6; i++)
+            sample_ids[i] = ids[rand() % n];
+        if (normalize_world) {
+            for (int i = 0; i < 6; i++) {
+                MapPoint p = map->data[corners->data[sample_ids[i]].pt_idx];
+                mean[0] += p.x;
+                mean[1] += p.y;
+                mean[2] += p.z;
+            }
+            mean[0] /= 6.0;
+            mean[1] /= 6.0;
+            mean[2] /= 6.0;
+            double rms = 0.0;
+            for (int i = 0; i < 6; i++) {
+                MapPoint p = map->data[corners->data[sample_ids[i]].pt_idx];
+                double dx = p.x - mean[0];
+                double dy = p.y - mean[1];
+                double dz = p.z - mean[2];
+                rms += dx * dx + dy * dy + dz * dz;
+            }
+            rms = sqrt(rms / 6.0);
+            if (!isfinite(rms) || rms < 1e-12)
+                continue;
+            scale = sqrt(3.0) / rms;
+        }
         for (int i = 0; i < 6; i++) {
-            int idx = ids[rand() % n];
+            int idx = sample_ids[i];
             MapPoint p = map->data[corners->data[idx].pt_idx];
+            double px = p.x;
+            double py = p.y;
+            double pz = p.z;
+            if (normalize_world) {
+                px = (px - mean[0]) * scale;
+                py = (py - mean[1]) * scale;
+                pz = (pz - mean[2]) * scale;
+            }
             double u = (corners->data[idx].x - cx) / fx, v = (corners->data[idx].y - cy) / fy;
-            double r1[12] = {p.x, p.y, p.z, 1,   0,   0,   0,   0,  -u*p.x, -u*p.y, -u*p.z, -u};
-            double r2[12] = {  0,   0,   0, 0, p.x, p.y, p.z, 1,   -v*p.x, -v*p.y, -v*p.z, -v};
+            double r1[12] = {px, py, pz, 1,  0,  0,  0, 0, -u*px, -u*py, -u*pz, -u};
+            double r2[12] = {0,  0,  0,  0, px, py, pz, 1, -v*px, -v*py, -v*pz, -v};
             for (int r = 0; r < 12; r++)
                 for (int c = 0; c < 12; c++)
                     AtA[r * 12 + c] += r1[r] * r1[c] + r2[r] * r2[c];
@@ -105,6 +175,20 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
             }
         for (int j = 0; j < 12; j++)
             P[j] = V[j * 12 + bi];
+        if (normalize_world) {
+            double Pn[12];
+            memcpy(Pn, P, sizeof(Pn));
+            for (int row = 0; row < 3; row++) {
+                int o = row * 4;
+                P[o + 0] = Pn[o + 0] * scale;
+                P[o + 1] = Pn[o + 1] * scale;
+                P[o + 2] = Pn[o + 2] * scale;
+                P[o + 3] = Pn[o + 3] -
+                           scale * (Pn[o + 0] * mean[0] +
+                                    Pn[o + 1] * mean[1] +
+                                    Pn[o + 2] * mean[2]);
+            }
+        }
         int pre_inl = n;
         if (dlt_pretest > 0) {
             pre_inl = count_pnp_linear_inliers(map, corners, ids, n, fx, fy, cx, cy, P,
@@ -113,38 +197,45 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
                 continue;
         }
         int inl = count_pnp_linear_inliers(map, corners, ids, n, fx, fy, cx, cy, P, 0);
-        if (inl > best_inl) {
-            best_inl = inl;
+        int score_inl = inl;
+        Pose cand_pose;
+        int cand_pose_valid = 0;
+        if (score_rigid) {
+            cand_pose_valid = dlt_projection_to_pose(P, &cand_pose);
+            score_inl = cand_pose_valid
+                            ? count_pose_inliers(map, corners, fx, fy, cx, cy, &cand_pose)
+                            : 0;
+        }
+        if (score_inl > best_inl) {
+            best_inl = score_inl;
             best_pre = pre_inl;
             memcpy(best_P, P, 12 * sizeof(double));
+            if (score_rigid && cand_pose_valid) {
+                best_pose = cand_pose;
+                best_pose_valid = 1;
+            }
         }
-        if (inl > n * 0.8)
+        if (score_inl > n * 0.8)
             break;
     }
     if (out_inl)
         *out_inl = best_inl;
     if (best_inl >= 12) {
-        double R[9] = {best_P[0], best_P[1], best_P[2], best_P[4], best_P[5],
-                       best_P[6], best_P[8], best_P[9], best_P[10]},
-               t[3] = {best_P[3], best_P[7], best_P[11]};
-        double sc = 1.0 / sqrt(R[6] * R[6] + R[7] * R[7] + R[8] * R[8]);
-        if (best_P[11] * sc < 0)
-            sc = -sc;
-        for (int j = 0; j < 9; j++)
-            R[j] *= sc;
-        for (int j = 0; j < 3; j++)
-            t[j] *= sc;
-        double W[3], U[9], V[9], Ro[9];
-        svd_3x3(R, W, U, V);
-        double VT[9];
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++)
-                VT[i * 3 + j] = V[j * 3 + i];
-        mat3_mul(U, VT, Ro);
-        if (mat3_det(Ro) < 0)
-            for (int j = 0; j < 9; j++)
-                Ro[j] = -Ro[j];
-        pose_from_rt(Ro, t, out_pose);
+        if (score_rigid && best_pose_valid) {
+            *out_pose = best_pose;
+        } else if (!dlt_projection_to_pose(best_P, out_pose)) {
+            free(ids);
+            return 0;
+        }
+        if (validate_rigid && !score_rigid && map->size >= validate_rigid_min_points) {
+            int rigid_inl = count_pose_inliers(map, corners, fx, fy, cx, cy, out_pose);
+            if (out_inl)
+                *out_inl = rigid_inl;
+            if (rigid_inl < 12) {
+                free(ids);
+                return 0;
+            }
+        }
         free(ids);
         return 1;
     }
@@ -375,9 +466,6 @@ static PnPScore score_pnp_pose(const Map *map, const CornerVec *corners, double 
     return score;
 }
 
-static int count_pose_inliers(const Map *map, const CornerVec *corners, double fx, double fy,
-                              double cx, double cy, const Pose *pose);
-
 static int estimate_pose_PnP_p3p_numeric(const Map *map, const CornerVec *corners, double fx,
                                          double fy, double cx, double cy, const Pose *predicted,
                                          int baseline_inliers, int iterations, double max_jump,
@@ -405,7 +493,7 @@ static int estimate_pose_PnP_p3p_numeric(const Map *map, const CornerVec *corner
     Pose best_pose;
     int best_inl = 0;
     int iters = iterations > 0 ? iterations : 500;
-    srand(0);
+    srand(g_ransac_seed);
     for (int it = 0; it < iters; it++) {
         int sample[4];
         sample_unique4(ids, n, sample);
