@@ -122,61 +122,6 @@ static void refine_map_point_against_observations(Map *map, int i, KFDB *db,
     }
 }
 
-static unsigned char *build_pnp_quality_mask(const KFDB *db, const Map *map, double fx, double fy,
-                                             double cx, double cy, double gate_px, int min_obs,
-                                             int window) {
-    if (gate_px <= 0.0 || map->size <= 0 || db->size <= 0)
-        return NULL;
-    if (min_obs < 1)
-        min_obs = 1;
-    if (window < 1 || window > db->size)
-        window = db->size;
-    unsigned char *ok = malloc((size_t)map->size);
-    unsigned short *total = calloc((size_t)map->size, sizeof(unsigned short));
-    unsigned short *bad = calloc((size_t)map->size, sizeof(unsigned short));
-    if (!ok || !total || !bad) {
-        free(ok);
-        free(total);
-        free(bad);
-        return NULL;
-    }
-    memset(ok, 1, (size_t)map->size);
-    double th2 = gate_px * gate_px;
-    int start = db->size - window;
-    if (start < 0)
-        start = 0;
-    for (int k = start; k < db->size; k++) {
-        const KFEntry *kf = &db->data[k];
-        double R[9], t[3];
-        pose_get_rotation(&kf->pose, R);
-        pose_get_translation(&kf->pose, t);
-        for (int j = 0; j < kf->corners.size; j++) {
-            int pi = kf->corners.data[j].pt_idx;
-            if (pi < 0 || pi >= map->size)
-                continue;
-            MapPoint p = map->data[pi];
-            double x = R[0] * p.x + R[1] * p.y + R[2] * p.z + t[0],
-                   y = R[3] * p.x + R[4] * p.y + R[5] * p.z + t[1],
-                   z = R[6] * p.x + R[7] * p.y + R[8] * p.z + t[2];
-            total[pi]++;
-            if (z < 0.1) {
-                bad[pi]++;
-                continue;
-            }
-            double u = fx * x / z + cx, v = fy * y / z + cy;
-            double du = kf->corners.data[j].x - u, dv = kf->corners.data[j].y - v;
-            if (du * du + dv * dv > th2)
-                bad[pi]++;
-        }
-    }
-    for (int pi = 0; pi < map->size; pi++)
-        if (total[pi] >= min_obs && bad[pi] == total[pi])
-            ok[pi] = 0;
-    free(total);
-    free(bad);
-    return ok;
-}
-
 static void global_ba(KFDB *db, Map *map, double fx, double fy, double cx, double cy,
                       int iters, int pose_lm_iters) {
     if (db->size < 3)

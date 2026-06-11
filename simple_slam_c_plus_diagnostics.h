@@ -31,73 +31,26 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"speed_profile\": \"%s\", "
             "\"ransac_seed\": %d, "
             "\"avg_inliers_after_first\": %f, \"kf_min_inliers\": %d, \"kf_period\": %d, "
-            "\"kf_min_interval\": %d, \"healthy_keyframes\": %d, "
-            "\"late_kf_cooldown\": %d, \"ba_interval\": %d, "
+            "\"kf_min_interval\": %d, \"ba_interval\": %d, "
             "\"ba_start_keyframes\": %d, \"ba_max_points\": %d, "
             "\"local_ba_fix_oldest\": %d, "
             "\"global_ba_interval\": %d, "
             "\"global_ba_start_keyframes\": %d, \"global_ba_max_points\": %d, "
-            "\"map_hygiene\": %d, "
-            "\"kf_warmup_frames\": %d, "
-            "\"new_point_obs\": %d, \"pnp_min_obs\": %d, \"pnp_start_frame\": %d, "
-            "\"delayed_init_frames\": %d, "
-            "\"candidate_tracks\": %d, \"candidate_min_obs\": %d, "
-            "\"candidate_min_age\": %d, \"candidate_grid_cols\": %d, "
-            "\"candidate_grid_rows\": %d, \"candidate_promote_per_cell\": %d, "
-            "\"candidate_max_fb_err\": %f, \"candidate_min_disp\": %f, "
-            "\"candidate_max_disp\": %f, "
-            "\"first_kf_observations\": %d, "
-            "\"unique_kf_observations\": %d, \"essential_cheirality_max\": %d, "
-            "\"tri_min_parallax_deg\": %f, \"tri_max_reproj_px\": %f, "
-            "\"tri_max_depth\": %f, \"tri_max_depth_pnp\": %f, "
-            "\"tri_max_depth_ratio\": %f, "
-            "\"tri_source_kf_gap\": %d, "
-            "\"pnp_pred_reproj_gate\": %f, "
-            "\"pnp_quality_gate_px\": %f, \"pnp_quality_min_obs\": %d, "
-            "\"pnp_quality_window\": %d, "
-            "\"obs_stat_gate_px\": %f, \"obs_stat_min_good\": %d, "
-            "\"obs_stat_max_bad_ratio\": %f, "
-            "\"pnp_p3p_fallback\": %d, \"pnp_p3p_observe\": %d, "
-            "\"pnp_p3p_iterations\": %d, "
-            "\"pnp_p3p_max_jump\": %f, \"pnp_p3p_min_inl2\": %d, "
-            "\"pnp_p3p_min_gain\": %d, \"pnp_p3p_max_mederr\": %f, "
-            "\"pnp_p3p_min_posz\": %f, \"pnp_dlt_iters\": %d, "
-            "\"pnp_dlt_pretest\": %d, \"pnp_dlt_pretest_margin\": %d, "
-            "\"pnp_score_rigid\": %d, \"pnp_validate_rigid\": %d, "
-            "\"pnp_validate_rigid_min_points\": %d, "
-            "\"pnp_normalize_world\": %d, "
+            "\"new_point_obs\": %d, \"pnp_min_obs\": %d, "
+            "\"essential_cheirality_max\": %d, "
+            "\"pnp_dlt_iters\": %d, "
             "\"pnp_low_e_fallback\": %d, \"pnp_low_e_max_inliers\": %d, "
             "\"pnp_low_e_min_inliers\": %d, \"pnp_low_e_min_gain\": %d, "
             "\"pnp_low_e_min_jump\": %f, "
             "\"pnp_low_e_min_map_points\": %d, "
             "\"pnp_low_e_min_pose_jump\": %f, "
-            "\"ffmpeg_gray\": %d, \"fast_corners\": %d, \"distributed_features\": %d, "
-            "\"pyramid_features\": %d, \"subpixel_features\": %d, "
-            "\"feature_min_dist\": %d, "
+            "\"ffmpeg_gray\": %d, "
             "\"max_points\": %d, \"lk_iters\": %d, \"lk_back_iters\": %d, "
             "\"pose_lm_iters\": %d, \"essential_iters\": %d, "
-            "\"descriptor_map_admission\": %d, \"descriptor_primary_admission\": %d, "
-            "\"descriptor_mutual_admission\": %d, "
-            "\"update_map_descriptors\": %d, "
             "\"oriented_brief\": %d, \"brief_patch_radius\": %d, "
-            "\"descriptor_admission_max_hamming\": %d, "
-            "\"descriptor_admission_ratio\": %f, \"descriptor_primary_map_cap\": %d, "
-            "\"descriptor_source_kf_gap\": %d, "
-            "\"triangulate_with_e_pose\": %d, "
-            "\"triangulate_relative_frame\": %d, "
-            "\"shape_e_inliers\": %d, \"e_shape_max_matches\": %d, "
-            "\"e_shape_grid_cap\": %d, \"e_shape_max_disp\": %f, "
-            "\"e_shape_max_fb_err\": %f, \"e_shape_target_disp\": %f, "
             "\"anchor_e_pose\": %d, \"anchor_max_features\": %d, "
             "\"anchor_max_hamming\": %d, \"anchor_mutual\": %d, "
             "\"anchor_ratio\": %f, "
-            "\"admission_ranked\": %d, \"admission_finite_only\": %d, "
-            "\"admission_batch_ranked\": %d, \"admission_batch_deferred\": %d, "
-            "\"admission_target_disp\": %f, "
-            "\"admission_fb_weight\": %f, "
-            "\"admission_min_inliers\": %d, "
-            "\"admission_pnp_min_inliers\": %d, "
-            "\"admission_max_new_points\": %d, \"admission_grid_cap\": %d, "
             "\"normalize_world_scale\": %d, "
             "\"output_smooth_alpha\": %f, "
             "\"output_smooth_outlier_alpha\": %f, "
@@ -118,59 +71,27 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"timeline\": [\n",
             s->size, pts, dur, cfg->video_path, cfg->proc_w, cfg->proc_h, kf, tri,
             cfg->speed_profile ? cfg->speed_profile : "", cfg->ransac_seed, av,
-            cfg->kf_min_inliers, cfg->kf_period, cfg->kf_min_interval, cfg->healthy_keyframes,
-            cfg->late_kf_cooldown, cfg->ba_interval, cfg->ba_start_keyframes,
+            cfg->kf_min_inliers, cfg->kf_period, cfg->kf_min_interval,
+            cfg->ba_interval, cfg->ba_start_keyframes,
             cfg->ba_max_points, cfg->local_ba_fix_oldest,
             cfg->global_ba_interval, cfg->global_ba_start_keyframes,
-            cfg->global_ba_max_points, cfg->map_hygiene,
-            cfg->kf_warmup_frames, cfg->new_point_obs, cfg->pnp_min_obs, cfg->pnp_start_frame,
-            cfg->delayed_init_frames, cfg->candidate_tracks, cfg->candidate_min_obs, cfg->candidate_min_age,
-            cfg->candidate_grid_cols, cfg->candidate_grid_rows, cfg->candidate_promote_per_cell,
-            cfg->candidate_max_fb_err, cfg->candidate_min_disp, cfg->candidate_max_disp,
-            cfg->first_kf_observations,
-            cfg->unique_kf_observations, cfg->essential_cheirality_max,
-            cfg->tri_min_parallax_deg, cfg->tri_max_reproj_px,
-            cfg->tri_max_depth, cfg->tri_max_depth_pnp,
-            cfg->tri_max_depth_ratio, cfg->tri_source_kf_gap,
-            cfg->pnp_pred_reproj_gate,
-            cfg->pnp_quality_gate_px, cfg->pnp_quality_min_obs, cfg->pnp_quality_window,
-            cfg->obs_stat_gate_px, cfg->obs_stat_min_good, cfg->obs_stat_max_bad_ratio,
-            cfg->pnp_p3p_fallback, cfg->pnp_p3p_observe, cfg->pnp_p3p_iterations,
-            cfg->pnp_p3p_max_jump, cfg->pnp_p3p_min_inl2, cfg->pnp_p3p_min_gain,
-            cfg->pnp_p3p_max_mederr, cfg->pnp_p3p_min_posz, cfg->pnp_dlt_iters, cfg->pnp_dlt_pretest,
-            cfg->pnp_dlt_pretest_margin, cfg->pnp_score_rigid,
-            cfg->pnp_validate_rigid, cfg->pnp_validate_rigid_min_points,
-            cfg->pnp_normalize_world,
+            cfg->global_ba_max_points,
+            cfg->new_point_obs, cfg->pnp_min_obs,
+            cfg->essential_cheirality_max,
+            cfg->pnp_dlt_iters,
             cfg->pnp_low_e_fallback, cfg->pnp_low_e_max_inliers,
             cfg->pnp_low_e_min_inliers, cfg->pnp_low_e_min_gain,
             cfg->pnp_low_e_min_jump,
             cfg->pnp_low_e_min_map_points,
             cfg->pnp_low_e_min_pose_jump,
-            cfg->ffmpeg_gray, cfg->fast_corners,
-            cfg->distributed_features, cfg->pyramid_features, cfg->subpixel_features,
-            cfg->feature_min_dist,
+            cfg->ffmpeg_gray,
             cfg->max_points, cfg->lk_iters, cfg->lk_back_iters, cfg->pose_lm_iters,
             cfg->essential_iters,
-            cfg->descriptor_map_admission, cfg->descriptor_primary_admission,
-            cfg->descriptor_mutual_admission, cfg->update_map_descriptors,
             cfg->oriented_brief,
             cfg->brief_patch_radius,
-            cfg->descriptor_admission_max_hamming,
-            cfg->descriptor_admission_ratio, cfg->descriptor_primary_map_cap,
-            cfg->descriptor_source_kf_gap,
-            cfg->triangulate_with_e_pose,
-            cfg->triangulate_relative_frame, cfg->shape_e_inliers,
-            cfg->e_shape_max_matches, cfg->e_shape_grid_cap,
-            cfg->e_shape_max_disp, cfg->e_shape_max_fb_err,
-            cfg->e_shape_target_disp, cfg->anchor_e_pose,
+            cfg->anchor_e_pose,
             cfg->anchor_max_features, cfg->anchor_max_hamming, cfg->anchor_mutual,
             cfg->anchor_ratio,
-            cfg->admission_ranked, cfg->admission_finite_only, cfg->admission_batch_ranked,
-            cfg->admission_batch_deferred,
-            cfg->admission_target_disp, cfg->admission_fb_weight,
-            cfg->admission_min_inliers,
-            cfg->admission_pnp_min_inliers,
-            cfg->admission_max_new_points, cfg->admission_grid_cap,
             cfg->normalize_world_scale, cfg->output_smooth_alpha,
             cfg->output_smooth_outlier_alpha, cfg->output_smooth_residual_k,
             cfg->output_smooth_window,
@@ -192,26 +113,13 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
                 "%d, \"points_total\": %d, \"method\": %d, \"tracked_count\": %d, "
                 "\"linked_points\": %d, \"linked_before_relink\": %d, \"relinked_points\": %d, "
                 "\"pnp_inliers\": %d, \"pred_lm_inliers\": %d, \"e_inliers\": %d, "
-                "\"pnp_fallback_used\": %d, \"pnp_p3p_attempted\": %d, "
-                "\"pnp_p3p_solved\": %d, \"pnp_p3p_accepted\": %d, "
-                "\"pnp_p3p_inliers\": %d, \"pnp_p3p_inliers2\": %d, "
-                "\"pnp_p3p_inliers3\": %d, \"pnp_p3p_inliers5\": %d, "
-                "\"pnp_p3p_mederr\": %f, \"pnp_p3p_posz\": %f, "
-                "\"pnp_p3p_jump\": %f, \"pnp_p3p_xyz\": [%f,%f,%f], "
                 "\"raw_xyz\": [%f,%f,%f], "
                 "\"trans_jump\": %f, \"xyz\": [%f,%f,%f]}%s\n",
                 s->data[i].frame_id, s->data[i].inliers, s->data[i].is_keyframe ? "true" : "false",
                 s->data[i].points_added, s->data[i].points_total, s->data[i].method,
                 s->data[i].tracked_count, s->data[i].linked_points, s->data[i].linked_before_relink,
                 s->data[i].relinked_points, s->data[i].pnp_inliers, s->data[i].pred_lm_inliers,
-                s->data[i].e_inliers, s->data[i].pnp_fallback_used,
-                s->data[i].pnp_p3p_attempted, s->data[i].pnp_p3p_solved,
-                s->data[i].pnp_p3p_accepted, s->data[i].pnp_p3p_inliers,
-                s->data[i].pnp_p3p_inliers2, s->data[i].pnp_p3p_inliers3,
-                s->data[i].pnp_p3p_inliers5, s->data[i].pnp_p3p_mederr,
-                s->data[i].pnp_p3p_posz, s->data[i].pnp_p3p_jump,
-                s->data[i].pnp_p3p_xyz[0], s->data[i].pnp_p3p_xyz[1],
-                s->data[i].pnp_p3p_xyz[2], s->data[i].raw_xyz[0],
+                s->data[i].e_inliers, s->data[i].raw_xyz[0],
                 s->data[i].raw_xyz[1], s->data[i].raw_xyz[2],
                 s->data[i].trans_jump, s->data[i].xyz[0],
                 s->data[i].xyz[1], s->data[i].xyz[2],

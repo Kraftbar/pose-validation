@@ -23,22 +23,15 @@ static void jacobi_12x12(double A[144], double W[12], double V[144]) {
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#define CANDIDATE_MAX_OBS 8
 #define ADMISSION_GRID_COLS 8
 #define ADMISSION_GRID_ROWS 6
 #define ADMISSION_GRID_CELLS (ADMISSION_GRID_COLS * ADMISSION_GRID_ROWS)
-#define ADMISSION_MATCH_RADIUS_PX 3.0
-#define ADMISSION_BATCH_INLIER_MULTIPLIER 4
-#define MAP_HYGIENE_WINDOW 5
-#define MAP_HYGIENE_REPROJ_PX 8.0
-#define MAP_HYGIENE_START_FRAME 200
 
 static unsigned int g_ransac_seed = 0;
 
 typedef struct {
     float x, y;
     int pt_idx;
-    int cand_idx;
     float fb_err;
     float track_disp;
 } Corner;
@@ -50,11 +43,6 @@ typedef struct {
     int frame_id, inliers, is_keyframe, points_added, points_total, method;
     int tracked_count, linked_points, linked_before_relink, relinked_points;
     int pnp_inliers, pred_lm_inliers, e_inliers;
-    int pnp_fallback_used;
-    int pnp_p3p_attempted, pnp_p3p_solved, pnp_p3p_accepted, pnp_p3p_inliers;
-    int pnp_p3p_inliers2, pnp_p3p_inliers3, pnp_p3p_inliers5;
-    double pnp_p3p_mederr, pnp_p3p_posz, pnp_p3p_jump;
-    double pnp_p3p_xyz[3];
     double trans_jump;
     double raw_xyz[3];
     double xyz[3];
@@ -127,63 +115,10 @@ typedef struct {
     Pose pose;
     int frame_id;
 } AnchorSet;
-typedef struct {
-    int frame_id;
-    Pose pose;
-    Corner corner;
-} CandidateObs;
-typedef struct {
-    int valid;
-    int first_frame;
-    int last_frame;
-    int obs;
-    int obs_count;
-    Pose anchor_pose;
-    Corner anchor_corner;
-    Corner last_corner;
-    CandidateObs history[CANDIDATE_MAX_OBS];
-    Brief256 desc;
-} TrackCandidate;
-typedef struct {
-    TrackCandidate *data;
-    int size, cap;
-} CandidateVec;
-typedef struct {
-    int cand_idx;
-    int corner_idx;
-    int cell;
-    double score;
-    double X[3];
-} CandidatePromotion;
-typedef struct {
-    CandidatePromotion *data;
-    int size, cap;
-} CandidatePromotionVec;
-typedef struct {
-    int match_idx;
-    double score;
-} AdmissionOrder;
-typedef struct {
-    int query_idx, train_idx, cell;
-    double score, reproj, parallax, depth;
-    double X[3], Xstat[3];
-    Brief256 desc;
-    Corner prev_corner, cur_corner;
-    Pose prev_pose, cur_pose;
-} AdmissionCandidate;
-typedef struct {
-    AdmissionCandidate *data;
-    int size, cap;
-} AdmissionCandidateVec;
 static double vec3_dist(const double a[3], const double b[3]);
 static void camera_center_from_pose(const Pose *pose, double c[3]);
 static int triangulate_point(const Pose *p1, const Pose *p2, Corner pt1, Corner pt2,
                              double fx, double fy, double cx, double cy, double X[3]);
-static int triangulation_quality_ok(const Pose *p1, const Pose *p2, Corner pt1, Corner pt2,
-                                    double fx, double fy, double cx, double cy,
-                                    const double X[3], double min_parallax_deg,
-                                    double max_reproj_px, double max_depth,
-                                    double max_depth_ratio);
 static void *xrealloc(void *ptr, size_t size);
 static void corner_vec_push(CornerVec *vec, Corner v);
 static void match_vec_push(MatchVec *vec, Match v);
@@ -191,16 +126,6 @@ static void match_vec_push(MatchVec *vec, Match v);
 #include "simple_slam_c_plus_frontend_descriptors.h"
 #include "simple_slam_c_plus_frontend_features.h"
 #include "simple_slam_c_plus_frontend_lk.h"
-
-static int admission_order_cmp_score_asc(const void *a, const void *b) {
-    const AdmissionOrder *oa = (const AdmissionOrder *)a;
-    const AdmissionOrder *ob = (const AdmissionOrder *)b;
-    if (oa->score < ob->score)
-        return -1;
-    if (oa->score > ob->score)
-        return 1;
-    return oa->match_idx - ob->match_idx;
-}
 
 static void *xrealloc(void *ptr, size_t size) {
     void *out = realloc(ptr, size);
@@ -337,116 +262,6 @@ static void mark_map_lifecycle_observed(MapLifecycleVec *v, int enabled, int map
         }
     }
 }
-static int candidate_vec_push(CandidateVec *v, TrackCandidate c) {
-    if (v->size == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 1024;
-        v->data = (TrackCandidate *)xrealloc(v->data, (size_t)v->cap * sizeof(TrackCandidate));
-    }
-    v->data[v->size] = c;
-    return v->size++;
-}
-static void candidate_promotion_vec_push(CandidatePromotionVec *v, CandidatePromotion p) {
-    if (v->size == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 256;
-        v->data = (CandidatePromotion *)xrealloc(v->data,
-                                                 (size_t)v->cap * sizeof(CandidatePromotion));
-    }
-    v->data[v->size++] = p;
-}
-static void admission_candidate_vec_push(AdmissionCandidateVec *v, AdmissionCandidate p) {
-    if (v->size == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 256;
-        v->data = (AdmissionCandidate *)xrealloc(v->data,
-                                                 (size_t)v->cap * sizeof(AdmissionCandidate));
-    }
-    v->data[v->size++] = p;
-}
-static int candidate_promotion_cmp_desc(const void *a, const void *b) {
-    const CandidatePromotion *pa = (const CandidatePromotion *)a;
-    const CandidatePromotion *pb = (const CandidatePromotion *)b;
-    if (pa->score < pb->score)
-        return 1;
-    if (pa->score > pb->score)
-        return -1;
-    return 0;
-}
-static int admission_candidate_cmp_score_asc(const void *a, const void *b) {
-    const AdmissionCandidate *pa = (const AdmissionCandidate *)a;
-    const AdmissionCandidate *pb = (const AdmissionCandidate *)b;
-    if (pa->score < pb->score)
-        return -1;
-    if (pa->score > pb->score)
-        return 1;
-    return pa->train_idx - pb->train_idx;
-}
-static void candidate_add_observation(TrackCandidate *tc, int frame_id, const Pose *pose,
-                                      Corner corner) {
-    if (!tc->valid)
-        return;
-    if (tc->obs_count > 0 && tc->history[tc->obs_count - 1].frame_id == frame_id)
-        return;
-    CandidateObs obs;
-    obs.frame_id = frame_id;
-    obs.pose = *pose;
-    obs.corner = corner;
-    obs.corner.pt_idx = -1;
-    obs.corner.cand_idx = -1;
-    if (tc->obs_count < CANDIDATE_MAX_OBS) {
-        tc->history[tc->obs_count++] = obs;
-    } else {
-        memmove(&tc->history[0], &tc->history[1],
-                (CANDIDATE_MAX_OBS - 1) * sizeof(CandidateObs));
-        tc->history[CANDIDATE_MAX_OBS - 1] = obs;
-    }
-}
-
-static int candidate_score_if_ready(CandidateVec *cands, int cand_idx, int frame_id,
-                                    const Config *cfg, double fx, double fy, double cx,
-                                    double cy, double X[3], double *score_out) {
-    if (cand_idx < 0 || cand_idx >= cands->size)
-        return 0;
-    TrackCandidate *tc = &cands->data[cand_idx];
-    if (!tc->valid)
-        return 0;
-    if (tc->obs < cfg->candidate_min_obs || frame_id - tc->first_frame < cfg->candidate_min_age)
-        return 0;
-    if (tc->obs_count < 2)
-        return 0;
-    int best_a = -1, best_b = -1;
-    double best_dist = -1.0;
-    for (int a = 0; a < tc->obs_count; a++) {
-        double ca[3];
-        camera_center_from_pose(&tc->history[a].pose, ca);
-        for (int b = a + 1; b < tc->obs_count; b++) {
-            double cb[3];
-            camera_center_from_pose(&tc->history[b].pose, cb);
-            double dist = vec3_dist(ca, cb);
-            if (dist > best_dist) {
-                best_dist = dist;
-                best_a = a;
-                best_b = b;
-            }
-        }
-    }
-    if (best_a < 0 || best_b < 0)
-        return 0;
-    CandidateObs *oa = &tc->history[best_a], *ob = &tc->history[best_b];
-    if (!triangulate_point(&oa->pose, &ob->pose, oa->corner, ob->corner, fx, fy, cx, cy, X))
-        return 0;
-    if ((cfg->tri_min_parallax_deg > 0.0 || cfg->tri_max_reproj_px > 0.0 ||
-         cfg->tri_max_depth > 0.0 || cfg->tri_max_depth_ratio > 0.0) &&
-        !triangulation_quality_ok(&oa->pose, &ob->pose, oa->corner, ob->corner,
-                                  fx, fy, cx, cy, X, cfg->tri_min_parallax_deg,
-                                  cfg->tri_max_reproj_px, cfg->tri_max_depth,
-                                  cfg->tri_max_depth_ratio))
-        return 0;
-    double dx = ob->corner.x - oa->corner.x, dy = ob->corner.y - oa->corner.y;
-    double pix_disp = sqrt(dx * dx + dy * dy);
-    if (score_out)
-        *score_out = best_dist * 1000.0 + pix_disp + 2.0 * (double)tc->obs;
-    return 1;
-}
-
 static void pose_identity(Pose *p) {
     memset(p->m, 0, sizeof(p->m));
     for (int i = 0; i < 4; i++)
@@ -781,142 +596,6 @@ static double reprojection_error_xyz(const Pose *pose, const double X[3], Corner
     return sqrt(dx * dx + dy * dy);
 }
 
-static int triangulation_quality_ok(const Pose *p1, const Pose *p2, Corner pt1, Corner pt2,
-                                    double fx, double fy, double cx, double cy,
-                                    const double X[3], double min_parallax_deg,
-                                    double max_reproj_px, double max_depth,
-                                    double max_depth_ratio) {
-    double z1 = 0.0, z2 = 0.0;
-    double e1 = reprojection_error_xyz(p1, X, pt1, fx, fy, cx, cy, &z1);
-    double e2 = reprojection_error_xyz(p2, X, pt2, fx, fy, cx, cy, &z2);
-    if (!isfinite(e1) || !isfinite(e2))
-        return 0;
-    if (max_reproj_px > 0.0 && (e1 > max_reproj_px || e2 > max_reproj_px))
-        return 0;
-    if (max_depth > 0.0 && (z1 > max_depth || z2 > max_depth))
-        return 0;
-    if (max_depth_ratio > 0.0) {
-        double mn = z1 < z2 ? z1 : z2, mx = z1 > z2 ? z1 : z2;
-        if (mn <= 0.0 || mx / mn > max_depth_ratio)
-            return 0;
-    }
-    if (min_parallax_deg > 0.0) {
-        double c1[3], c2[3], r1[3], r2[3];
-        camera_center_from_pose(p1, c1);
-        camera_center_from_pose(p2, c2);
-        for (int i = 0; i < 3; i++) {
-            r1[i] = X[i] - c1[i];
-            r2[i] = X[i] - c2[i];
-        }
-        vec3_normalize(r1);
-        vec3_normalize(r2);
-        double cs = vec3_dot(r1, r2);
-        if (cs > 1.0)
-            cs = 1.0;
-        if (cs < -1.0)
-            cs = -1.0;
-        double parallax_deg = acos(cs) * 180.0 / M_PI;
-        if (parallax_deg < min_parallax_deg)
-            return 0;
-    }
-    return 1;
-}
-
-static int find_near_corner(const CornerVec *corners, Corner p, double radius_px) {
-    double best = radius_px * radius_px;
-    int best_i = -1;
-    for (int i = 0; i < corners->size; i++) {
-        double dx = corners->data[i].x - p.x, dy = corners->data[i].y - p.y;
-        double d2 = dx * dx + dy * dy;
-        if (d2 <= best) {
-            best = d2;
-            best_i = i;
-        }
-    }
-    return best_i;
-}
-
-static void build_shaped_e_matches(const Config *cfg, const CornerVec *prev_pts,
-                                   const CornerVec *cur_pts, const MatchVec *matches,
-                                   int w, int h, MatchVec *out) {
-    out->size = 0;
-    if (!cfg->shape_e_inliers)
-        return;
-    int cell_counts[48] = {0};
-    MatchVec candidates = {0};
-    for (int i = 0; i < matches->size; i++) {
-        Match m = matches->data[i];
-        if (m.query_idx < 0 || m.query_idx >= prev_pts->size ||
-            m.train_idx < 0 || m.train_idx >= cur_pts->size)
-            continue;
-        Corner a = prev_pts->data[m.query_idx];
-        Corner b = cur_pts->data[m.train_idx];
-        double dx = (double)b.x - (double)a.x;
-        double dy = (double)b.y - (double)a.y;
-        double disp = sqrt(dx * dx + dy * dy);
-        if (cfg->e_shape_max_disp > 0.0 && disp > cfg->e_shape_max_disp)
-            continue;
-        if (cfg->e_shape_max_fb_err > 0.0 && b.fb_err > cfg->e_shape_max_fb_err)
-            continue;
-        double fb = b.fb_err > 0.0f ? b.fb_err : 0.0;
-        m.score = (float)(fabs(disp - cfg->e_shape_target_disp) + 10.0 * fb);
-        match_vec_push(&candidates, m);
-    }
-    if (candidates.size > 1)
-        qsort(candidates.data, (size_t)candidates.size, sizeof(Match), match_cmp_score_asc);
-    for (int i = 0; i < candidates.size; i++) {
-        Match m = candidates.data[i];
-        Corner b = cur_pts->data[m.train_idx];
-        int gx = (int)(b.x * 8.0 / (double)w);
-        int gy = (int)(b.y * 6.0 / (double)h);
-        if (gx < 0) gx = 0;
-        if (gy < 0) gy = 0;
-        if (gx > 7) gx = 7;
-        if (gy > 5) gy = 5;
-        int cell = gy * 8 + gx;
-        if (cfg->e_shape_grid_cap > 0 && cell_counts[cell] >= cfg->e_shape_grid_cap)
-            continue;
-        match_vec_push(out, m);
-        cell_counts[cell]++;
-        if (cfg->e_shape_max_matches > 0 && out->size >= cfg->e_shape_max_matches)
-            break;
-    }
-    free(candidates.data);
-}
-
-static int promote_candidate_if_ready(CandidateVec *cands, int cand_idx, int frame_id,
-                                      const Pose *pose, Corner current, double fx, double fy,
-                                      double cx, double cy, const Config *cfg, Map *map,
-                                      unsigned char *gray, int w, int h, int *pts, int *tri,
-                                      MapLifecycleVec *map_lifecycle,
-                                      int map_lifecycle_enabled) {
-    if (cand_idx < 0 || cand_idx >= cands->size)
-        return -1;
-    TrackCandidate *tc = &cands->data[cand_idx];
-    if (!tc->valid)
-        return -1;
-    candidate_add_observation(tc, frame_id, pose, current);
-    if (tc->obs < cfg->candidate_min_obs || frame_id - tc->first_frame < cfg->candidate_min_age)
-        return -1;
-    double X[3];
-    if (!candidate_score_if_ready(cands, cand_idx, frame_id, cfg, fx, fy, cx, cy, X, NULL))
-        return -1;
-    Brief256 d = {{0, 0, 0, 0}};
-    compute_brief(gray, w, h, current.x, current.y, &d);
-    int map_idx = map->size;
-    MapPoint mp = {X[0], X[1], X[2], cfg->new_point_obs > 2 ? cfg->new_point_obs : 2, 0, 0, d};
-    map_push(map, mp);
-    record_map_lifecycle(map_lifecycle, map_lifecycle_enabled, map_idx, frame_id,
-                         "candidate_ready", -1, -1, -1, NAN, NAN, NAN,
-                         current.fb_err, current.track_disp, NAN);
-    tc->valid = 0;
-    if (pts)
-        (*pts)++;
-    if (tri)
-        (*tri)++;
-    return map_idx;
-}
-
 // Project a 3x3 onto the essential-matrix manifold:
 //   E = U · diag(σ, σ, 0) · V^T,  with σ = (σ₁ + σ₂) / 2.
 // (Hartley & Zisserman §11.7.3.)
@@ -1177,27 +856,6 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static int create_deferred_candidate(CandidateVec *candidates, int frame_id,
-                                     const Pose *prev_pose, const Pose *cur_pose,
-                                     Corner prev_corner, Corner cur_corner,
-                                     const Brief256 *desc) {
-    TrackCandidate tc;
-    memset(&tc, 0, sizeof(tc));
-    tc.valid = 1;
-    tc.first_frame = frame_id - 1;
-    tc.last_frame = frame_id;
-    tc.obs = 2;
-    tc.anchor_pose = *prev_pose;
-    tc.anchor_corner = prev_corner;
-    tc.anchor_corner.pt_idx = -1;
-    tc.anchor_corner.cand_idx = -1;
-    tc.last_corner = cur_corner;
-    tc.desc = *desc;
-    candidate_add_observation(&tc, frame_id - 1, prev_pose, prev_corner);
-    candidate_add_observation(&tc, frame_id, cur_pose, cur_corner);
-    return candidate_vec_push(candidates, tc);
-}
-
 static int image_grid_cell(double x, double y, int w, int h, int cols, int rows) {
     if (cols < 1)
         cols = 1;
@@ -1219,8 +877,8 @@ static void scale_pose_translation(Pose *pose, double s) {
 }
 
 static void scale_world_state(double s, Map *map, KFDB *kf_db, AnchorSet *anchors,
-                              CandidateVec *candidates, FrameLite *prev, Pose *pose,
-                              Pose *lkf_pose, Pose *last_rel) {
+                              FrameLite *prev, Pose *pose, Pose *lkf_pose,
+                              Pose *last_rel) {
     if (!isfinite(s) || s <= 0.0 || fabs(s - 1.0) < 1e-12)
         return;
     for (int i = 0; i < map->size; i++) {
@@ -1230,14 +888,6 @@ static void scale_world_state(double s, Map *map, KFDB *kf_db, AnchorSet *anchor
     }
     for (int i = 0; i < kf_db->size; i++)
         scale_pose_translation(&kf_db->data[i].pose, s);
-    for (int i = 0; i < candidates->size; i++) {
-        TrackCandidate *tc = &candidates->data[i];
-        if (!tc->valid)
-            continue;
-        scale_pose_translation(&tc->anchor_pose, s);
-        for (int j = 0; j < tc->obs_count; j++)
-            scale_pose_translation(&tc->history[j].pose, s);
-    }
     scale_pose_translation(&anchors->pose, s);
     scale_pose_translation(&prev->pose, s);
     scale_pose_translation(pose, s);
@@ -1246,9 +896,8 @@ static void scale_world_state(double s, Map *map, KFDB *kf_db, AnchorSet *anchor
 }
 
 static void maybe_normalize_world_scale(const Config *cfg, Map *map, KFDB *kf_db,
-                                        AnchorSet *anchors, CandidateVec *candidates,
-                                        FrameLite *prev, Pose *pose, Pose *lkf_pose,
-                                        Pose *last_rel) {
+                                        AnchorSet *anchors, FrameLite *prev,
+                                        Pose *pose, Pose *lkf_pose, Pose *last_rel) {
     if (!cfg->normalize_world_scale || map->size < 100)
         return;
     double center[3];
@@ -1258,20 +907,8 @@ static void maybe_normalize_world_scale(const Config *cfg, Map *map, KFDB *kf_db
                        center[2] * center[2]);
     if (!isfinite(norm) || norm <= 1000.0)
         return;
-    scale_world_state(10.0 / norm, map, kf_db, anchors, candidates, prev, pose,
+    scale_world_state(10.0 / norm, map, kf_db, anchors, prev, pose,
                       lkf_pose, last_rel);
-}
-
-static void refresh_map_descriptors(Map *map, const CornerVec *corners,
-                                    const unsigned char *gray, int w, int h) {
-    for (int i = 0; i < corners->size; i++) {
-        int pi = corners->data[i].pt_idx;
-        if (pi < 0 || pi >= map->size || map->data[pi].obs <= 0)
-            continue;
-        Brief256 d;
-        if (compute_brief(gray, w, h, corners->data[i].x, corners->data[i].y, &d))
-            map->data[pi].desc = d;
-    }
 }
 
 #include "simple_slam_c_plus_diagnostics.h"
@@ -1310,7 +947,6 @@ int main(int argc, char **argv) {
     KFDB kf_db = {0};
     Map map = {0};
     MapLifecycleVec map_lifecycle = {0};
-    CandidateVec candidates = {0};
     AnchorSet anchors = {0};
     int frame_id = 0, pts = 0, tri = 0;
     int output_smooth_initialized = 0;
@@ -1347,7 +983,6 @@ int main(int argc, char **argv) {
         blur_3x3(cgray, w, h, cblur);
         prof.gray_blur += now_seconds() - t0;
         MatchVec matches = {0};
-        MatchVec shaped_e_matches = {0};
         MatchVec anchor_matches = {0};
         AnchorSet cur_anchors = {0};
         const MatchVec *active_e_matches = &matches;
@@ -1360,12 +995,10 @@ int main(int argc, char **argv) {
         int inl = 0, mkf = 0, added = 0, method = 0;
         int tracked_count = 0, linked_points = 0, linked_before_relink = 0, relinked_points = 0;
         int pnp_inliers = 0, pred_lm_inliers = 0, e_inliers = 0;
-        int pnp_fallback_used = 0;
-        PnPProbe pnp_p3p_probe = {0};
         double trans_jump = 0.0;
         if (frame_id == 0) {
             t0 = now_seconds();
-            extract_features_pure(&cfg, cblur, w, h, &curr.corners, cfg.max_points);
+            extract_features_pure(cblur, w, h, &curr.corners, cfg.max_points);
             prof.feature += now_seconds() - t0;
             mkf = 1;
             pose_identity(&pose);
@@ -1380,14 +1013,10 @@ int main(int argc, char **argv) {
                                   &lk_scratch, cfg.lk_iters, cfg.lk_back_iters);
             prof.lk += now_seconds() - t0;
             tracked_count = tracked.size;
-            if (cfg.shape_e_inliers) {
-                build_shaped_e_matches(&cfg, &prev.corners, &tracked, &matches, w, h,
-                                       &shaped_e_matches);
-                active_e_matches = &shaped_e_matches;
-            }
             if (cfg.anchor_e_pose && anchors.corners.size >= 8) {
+                t0 = now_seconds();
                 CornerVec anchor_cur_corners = {0};
-                extract_features_pure(&cfg, cblur, w, h, &anchor_cur_corners,
+                extract_features_pure(cblur, w, h, &anchor_cur_corners,
                                       cfg.anchor_max_features);
                 anchor_set_build(&cur_anchors, cblur, w, h, &anchor_cur_corners, &predicted,
                                  frame_id, cfg.anchor_max_features);
@@ -1400,6 +1029,7 @@ int main(int argc, char **argv) {
                     active_e_prev_pose = &anchors.pose;
                     active_e_matches = &anchor_matches;
                 }
+                prof.feature += now_seconds() - t0;
             }
 
             int _nlink = 0;
@@ -1414,14 +1044,6 @@ int main(int argc, char **argv) {
                 prof.relink += now_seconds() - t0;
             }
             linked_points += relinked_points;
-            if (cfg.pnp_pred_reproj_gate > 0.0) {
-                (void)gate_links_by_pose(&map, &tracked, fx, fy, cx, cy, &predicted,
-                                         cfg.pnp_pred_reproj_gate);
-                linked_points = 0;
-                for (int i = 0; i < tracked.size; i++)
-                    if (tracked.data[i].pt_idx >= 0)
-                        linked_points++;
-            }
             if (map.size > 1000 && linked_points >= 12) {
                 Pose pred_lm = predicted;
                 t0 = now_seconds();
@@ -1431,51 +1053,12 @@ int main(int argc, char **argv) {
             }
             Pose pnp_pose_for_dump;
             int has_pnp_pose_for_dump = 0;
-            unsigned char *pnp_point_ok = NULL;
             int pnp_ok = 0;
             int low_e_override = 0;
             Pose low_e_pose;
             t0 = now_seconds();
-            if (frame_id >= cfg.pnp_start_frame) {
-                pnp_point_ok = build_pnp_quality_mask(
-                    &kf_db, &map, fx, fy, cx, cy, cfg.pnp_quality_gate_px,
-                    cfg.pnp_quality_min_obs, cfg.pnp_quality_window);
-                unsigned char *obs_stat_ok = build_observation_stat_mask(
-                    &map, cfg.obs_stat_min_good, cfg.obs_stat_max_bad_ratio);
-                if (pnp_point_ok && obs_stat_ok) {
-                    for (int i = 0; i < map.size; i++)
-                        pnp_point_ok[i] = pnp_point_ok[i] && obs_stat_ok[i];
-                    free(obs_stat_ok);
-                } else if (obs_stat_ok) {
-                    pnp_point_ok = obs_stat_ok;
-                }
-            }
-            prof.pnp_quality += now_seconds() - t0;
-            t0 = now_seconds();
-            if (frame_id >= cfg.pnp_start_frame)
-                pnp_ok = estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, cfg.pnp_dlt_iters,
-                                           cfg.pnp_dlt_pretest, cfg.pnp_dlt_pretest_margin,
-                                           cfg.pnp_min_obs, pnp_point_ok,
-                                           cfg.pnp_score_rigid,
-                                           cfg.pnp_validate_rigid,
-                                           cfg.pnp_validate_rigid_min_points,
-                                           cfg.pnp_normalize_world, &pose, &pnp_inliers);
-            free(pnp_point_ok);
-            if (!pnp_ok && (cfg.pnp_p3p_fallback || cfg.pnp_p3p_observe)) {
-                Pose p3p_pose;
-                int p3p_inliers = 0;
-                int p3p_ok = estimate_pose_PnP_p3p_numeric(
-                    &map, &tracked, fx, fy, cx, cy, &predicted, pnp_inliers,
-                    cfg.pnp_p3p_iterations, cfg.pnp_p3p_max_jump, cfg.pnp_p3p_min_inl2,
-                    cfg.pnp_p3p_min_gain, cfg.pnp_p3p_max_mederr, cfg.pnp_p3p_min_posz,
-                    &p3p_pose, &p3p_inliers, &pnp_p3p_probe);
-                if (cfg.pnp_p3p_fallback && p3p_ok) {
-                    pose = p3p_pose;
-                    pnp_inliers = p3p_inliers;
-                    pnp_ok = 1;
-                    pnp_fallback_used = 1;
-                }
-            }
+            pnp_ok = estimate_pose_PnP(&map, &tracked, fx, fy, cx, cy, cfg.pnp_dlt_iters,
+                                       cfg.pnp_min_obs, &pose, &pnp_inliers);
             prof.pnp += now_seconds() - t0;
             if (pnp_ok) {
                 pnp_pose_for_dump = pose;
@@ -1580,810 +1163,118 @@ int main(int argc, char **argv) {
             dump_pnp_frame(diag.pnp_dump, frame_id, &map, &tracked, fx, fy, cx, cy, &predicted,
                            has_pnp_pose_for_dump ? &pnp_pose_for_dump : NULL, pnp_inliers,
                            has_pnp_pose_for_dump ? &pose : NULL);
-            mkf = should_make_keyframe(&cfg, frame_id, inl, linked_points,
+            mkf = should_make_keyframe(&cfg, frame_id, inl,
                                        rotation_degrees_between(&lkf_pose, &pose));
-            int kf_min_interval = keyframe_interval_for_frame(&cfg, frame_id);
-            if (mkf && kf_min_interval > 0 && kf_db.size > 0) {
+            if (mkf && cfg.kf_min_interval > 0 && kf_db.size > 0) {
                 int last_kf_frame = kf_db.data[kf_db.size - 1].frame_id;
-                if (frame_id - last_kf_frame < kf_min_interval)
+                if (frame_id - last_kf_frame < cfg.kf_min_interval)
                     mkf = 0;
             }
             if (mkf) {
                 if (inl >= 8) {
                     t0 = now_seconds();
-	                    int obs_seen_cap = map.size;
-	                    unsigned char *obs_seen = cfg.unique_kf_observations && obs_seen_cap > 0
-	                                                  ? calloc((size_t)obs_seen_cap, 1)
-	                                                  : NULL;
-	                    CandidatePromotionVec promotions = {0};
-	                    AdmissionCandidateVec admission_batch = {0};
-	                    int adm_candidates = 0, adm_accepted = 0;
-	                    double adm_sum_reproj = 0.0, adm_sum_parallax = 0.0, adm_sum_depth = 0.0;
-	                    double adm_min_depth = DBL_MAX, adm_max_depth = 0.0;
-	                    int adm_cell_counts[ADMISSION_GRID_CELLS] = {0};
-	                    int admission_allows_new = cfg.admission_min_inliers <= 0 ||
-	                                               inl >= cfg.admission_min_inliers;
-	                    if (cfg.admission_pnp_min_inliers > 0 && method == 2 &&
-	                        inl < cfg.admission_pnp_min_inliers)
-	                        admission_allows_new = 0;
-	                    Pose admission_pose = pose;
-	                    Pose admission_rel;
-	                    int has_admission_rel = 0;
-	                    const MatchVec *admission_e_matches =
-	                        cfg.shape_e_inliers ? &shaped_e_matches : &matches;
-	                    unsigned char *admission_mask =
-	                        (active_e_prev == &prev.corners && active_e_cur == &tracked &&
-	                         active_e_matches == admission_e_matches) ? mask : NULL;
-	                    unsigned char *owned_admission_mask = NULL;
-	                    if (cfg.triangulate_with_e_pose || cfg.triangulate_relative_frame ||
-	                        active_e_cur != &tracked) {
-	                        int adm_inl = 0;
-	                        if (estimate_pose_E(&prev.corners, &tracked, admission_e_matches,
-	                                            fx, fy, cx, cy,
-	                                            &admission_rel, cfg.essential_iters,
-	                                            cfg.essential_cheirality_max,
-	                                            &owned_admission_mask, &adm_inl)) {
-	                            write_e_inlier_pairs(diag.e_inlier_dump, frame_id, "admission_lk",
-	                                                 &prev.corners, &tracked, admission_e_matches,
-	                                                 owned_admission_mask, w, h);
-	                            has_admission_rel = 1;
-	                            if (cfg.triangulate_with_e_pose || cfg.triangulate_relative_frame)
-	                                pose_compose_relative(&admission_rel, &prev.pose, &admission_pose);
-	                            admission_mask = owned_admission_mask;
-	                        } else {
-	                            free(owned_admission_mask);
-	                            owned_admission_mask = NULL;
-	                        }
-	                    }
-	                    AdmissionOrder *admission_order = NULL;
-	                    if (admission_e_matches->size > 0) {
-	                        admission_order = (AdmissionOrder *)malloc(
-	                            (size_t)admission_e_matches->size * sizeof(AdmissionOrder));
-	                        if (!admission_order) {
-	                            fprintf(stderr, "out of memory\n");
-	                            exit(1);
-	                        }
-	                        for (int j = 0; j < admission_e_matches->size; j++) {
-	                            double score = (double)j;
-	                            if (cfg.admission_ranked) {
-	                                Match am = admission_e_matches->data[j];
-	                                if (am.train_idx >= 0 && am.train_idx < tracked.size) {
-	                                    Corner cc = tracked.data[am.train_idx];
-	                                    score = fabs((double)cc.track_disp -
-	                                                 cfg.admission_target_disp) +
-	                                            cfg.admission_fb_weight * (double)cc.fb_err;
-	                                } else {
-	                                    score = 1.0e30;
-	                                }
-	                            }
-	                            admission_order[j] = (AdmissionOrder){j, score};
-	                        }
-	                        if (cfg.admission_ranked && admission_e_matches->size > 1)
-	                            qsort(admission_order, (size_t)admission_e_matches->size,
-	                                  sizeof(AdmissionOrder), admission_order_cmp_score_asc);
-	                    }
-	                    for (int oi = 0; oi < admission_e_matches->size; oi++) {
-	                        int j = admission_order ? admission_order[oi].match_idx : oi;
-                        double X[3];
+                    int adm_candidates = 0, adm_accepted = 0;
+                    double adm_sum_reproj = 0.0, adm_sum_parallax = 0.0, adm_sum_depth = 0.0;
+                    double adm_min_depth = DBL_MAX, adm_max_depth = 0.0;
+                    Pose admission_pose = pose;
+                    unsigned char *admission_mask =
+                        (active_e_prev == &prev.corners && active_e_cur == &tracked &&
+                         active_e_matches == &matches) ? mask : NULL;
+                    unsigned char *owned_admission_mask = NULL;
+                    if (active_e_cur != &tracked) {
+                        // Pose E ran on anchors; re-estimate E on the LK matches to get
+                        // an inlier mask over prev->tracked correspondences for admission.
+                        Pose admission_rel;
+                        int adm_inl = 0;
+                        if (estimate_pose_E(&prev.corners, &tracked, &matches,
+                                            fx, fy, cx, cy, &admission_rel,
+                                            cfg.essential_iters,
+                                            cfg.essential_cheirality_max,
+                                            &owned_admission_mask, &adm_inl)) {
+                            write_e_inlier_pairs(diag.e_inlier_dump, frame_id, "admission_lk",
+                                                 &prev.corners, &tracked, &matches,
+                                                 owned_admission_mask, w, h);
+                            admission_mask = owned_admission_mask;
+                        } else {
+                            free(owned_admission_mask);
+                            owned_admission_mask = NULL;
+                        }
+                    }
+                    for (int j = 0; j < matches.size; j++) {
                         if (!admission_mask || !admission_mask[j])
                             continue;
-	                        Match am = admission_e_matches->data[j];
-	                        if (tracked.data[am.train_idx].pt_idx == -1) {
-	                            if (config_suppresses_lk_landmarks(&cfg))
-	                                continue;
-	                            if (!config_allows_new_landmarks(&cfg, frame_id))
-	                                continue;
-	                            if (!admission_allows_new)
-	                                continue;
-	                            adm_candidates++;
-		                            Corner pc = prev.corners.data[am.query_idx];
-		                            Corner cc = tracked.data[am.train_idx];
-	                            if (cfg.admission_batch_deferred && pc.cand_idx >= 0 &&
-	                                pc.cand_idx < candidates.size &&
-	                                candidates.data[pc.cand_idx].valid) {
-	                                int ci = pc.cand_idx;
-	                                candidates.data[ci].last_frame = frame_id;
-	                                candidates.data[ci].last_corner = cc;
-	                                if (candidates.data[ci].obs < 1000000)
-	                                    candidates.data[ci].obs++;
-	                                tracked.data[am.train_idx].cand_idx = ci;
-	                                candidate_add_observation(&candidates.data[ci], frame_id,
-	                                                          &admission_pose, cc);
-	                                double Xc[3], score = 0.0;
-	                                if (candidate_score_if_ready(&candidates, ci, frame_id,
-	                                                             &cfg, fx, fy, cx, cy, Xc,
-	                                                             &score)) {
-	                                    Brief256 _d = candidates.data[ci].desc;
-	                                    int map_idx = map.size;
-	                                    MapPoint _mp = {Xc[0], Xc[1], Xc[2],
-	                                                    cfg.new_point_obs > 2 ? cfg.new_point_obs : 2,
-	                                                    0,
-	                                                    0,
-	                                                    _d};
-	                                    map_push(&map, _mp);
-	                                    record_map_lifecycle(
-	                                        &map_lifecycle, map_lifecycle_enabled, map_idx,
-	                                        frame_id, "candidate_deferred", method, inl, -1,
-	                                        NAN, NAN, NAN, cc.fb_err, cc.track_disp, score);
-	                                    candidates.data[ci].valid = 0;
-	                                    tracked.data[am.train_idx].pt_idx = map_idx;
-	                                    tracked.data[am.train_idx].cand_idx = -1;
-	                                    pts++;
-	                                    added++;
-	                                    tri++;
-	                                    adm_accepted++;
-	                                }
-	                                continue;
-	                            }
-	                            int adm_cell = -1;
-	                            if (!cfg.candidate_tracks) {
-	                                adm_cell = image_grid_cell(cc.x, cc.y, w, h,
-	                                                           ADMISSION_GRID_COLS,
-	                                                           ADMISSION_GRID_ROWS);
-	                            }
-	                            if (!cfg.candidate_tracks && !cfg.admission_batch_ranked) {
-	                                if (cfg.admission_max_new_points > 0 &&
-	                                    adm_accepted >= cfg.admission_max_new_points)
-	                                    continue;
-	                                if (cfg.admission_grid_cap > 0 &&
-	                                    adm_cell_counts[adm_cell] >= cfg.admission_grid_cap)
-	                                    continue;
-	                            }
-		                            if (cfg.candidate_tracks) {
-	                                if ((cfg.candidate_max_fb_err > 0.0 &&
-	                                     cc.fb_err > cfg.candidate_max_fb_err) ||
-	                                    (cfg.candidate_min_disp > 0.0 &&
-	                                     cc.track_disp < cfg.candidate_min_disp) ||
-	                                    (cfg.candidate_max_disp > 0.0 &&
-	                                     cc.track_disp > cfg.candidate_max_disp))
-	                                    continue;
-	                                int ci = pc.cand_idx;
-	                                if (ci < 0 || ci >= candidates.size || !candidates.data[ci].valid) {
-	                                    TrackCandidate tc;
-	                                    memset(&tc, 0, sizeof(tc));
-	                                    tc.valid = 1;
-	                                    tc.first_frame = frame_id - 1;
-	                                    tc.last_frame = frame_id;
-	                                    tc.obs = 2;
-	                                    tc.anchor_pose = prev.pose;
-	                                    tc.anchor_corner = pc;
-	                                    tc.anchor_corner.pt_idx = -1;
-	                                    tc.anchor_corner.cand_idx = -1;
-	                                    tc.last_corner = cc;
-	                                    candidate_add_observation(&tc, frame_id - 1, &prev.pose, pc);
-	                                    compute_brief(pgray, w, h, pc.x, pc.y, &tc.desc);
-	                                    ci = candidate_vec_push(&candidates, tc);
-	                                } else {
-	                                    candidates.data[ci].last_frame = frame_id;
-	                                    candidates.data[ci].last_corner = cc;
-	                                    if (candidates.data[ci].obs < 1000000)
-	                                        candidates.data[ci].obs++;
-	                                }
-	                                tracked.data[am.train_idx].cand_idx = ci;
-	                                if (cfg.candidate_promote_per_cell > 0) {
-	                                    candidate_add_observation(&candidates.data[ci], frame_id,
-	                                                              &admission_pose, cc);
-	                                    double Xc[3], score = 0.0;
-	                                    if (candidate_score_if_ready(&candidates, ci, frame_id,
-	                                                                 &cfg, fx, fy, cx, cy, Xc,
-	                                                                 &score)) {
-	                                        int gx = (int)(cc.x * cfg.candidate_grid_cols / (double)w);
-	                                        int gy = (int)(cc.y * cfg.candidate_grid_rows / (double)h);
-	                                        if (gx < 0) gx = 0;
-	                                        if (gy < 0) gy = 0;
-	                                        if (gx >= cfg.candidate_grid_cols) gx = cfg.candidate_grid_cols - 1;
-	                                        if (gy >= cfg.candidate_grid_rows) gy = cfg.candidate_grid_rows - 1;
-	                                        CandidatePromotion cp = {ci,
-	                                                                 am.train_idx,
-	                                                                 gy * cfg.candidate_grid_cols + gx,
-	                                                                 score,
-	                                                                 {Xc[0], Xc[1], Xc[2]}};
-	                                        candidate_promotion_vec_push(&promotions, cp);
-	                                    }
-	                                } else {
-	                                    int promoted = promote_candidate_if_ready(
-	                                        &candidates, ci, frame_id, &admission_pose, cc, fx, fy, cx, cy,
-	                                        &cfg, &map, cblur, w, h, &pts, &tri,
-	                                        &map_lifecycle, map_lifecycle_enabled);
-	                                    if (promoted >= 0) {
-	                                        tracked.data[am.train_idx].pt_idx = promoted;
-	                                        tracked.data[am.train_idx].cand_idx = -1;
-	                                        added++;
-	                                    }
-	                                }
-	                            } else {
-	                                Pose id_pose;
-	                                const Pose *stat_p1 = &prev.pose, *stat_p2 = &admission_pose;
-	                                double Xstat[3] = {0.0, 0.0, 0.0};
-	                                int tri_ok = 0;
-	                                if (cfg.triangulate_relative_frame && has_admission_rel) {
-	                                    pose_identity(&id_pose);
-	                                    tri_ok = triangulate_point(&id_pose, &admission_rel, pc, cc,
-	                                                               fx, fy, cx, cy, Xstat);
-	                                    if (tri_ok)
-	                                        camera_point_to_world(&prev.pose, Xstat, X);
-	                                    stat_p1 = &id_pose;
-	                                    stat_p2 = &admission_rel;
-	                                } else {
-	                                    tri_ok = triangulate_point(&prev.pose, &admission_pose, pc, cc,
-	                                                               fx, fy, cx, cy, X);
-	                                    memcpy(Xstat, X, sizeof(Xstat));
-	                                }
-	                                if (!tri_ok) {
-	                                    write_map_admission_detail(
-	                                        diag.map_admission_detail_dump, frame_id, "lk",
-	                                        "tri_fail", method, inl, j, am.query_idx,
-	                                        am.train_idx, adm_cell, stat_p1, stat_p2, NAN, NAN,
-	                                        NAN, NAN, NAN, cc.fb_err, cc.track_disp,
-	                                        admission_order ? admission_order[oi].score : 0.0);
-	                                    continue;
-	                                }
-	                                if ((cfg.tri_min_parallax_deg > 0.0 ||
-	                                     cfg.tri_max_reproj_px > 0.0 ||
-	                                     cfg.tri_max_depth > 0.0 ||
-	                                     cfg.tri_max_depth_ratio > 0.0) &&
-	                                    !triangulation_quality_ok(
-	                                        stat_p1, stat_p2, pc, cc, fx, fy, cx, cy, Xstat,
-	                                        cfg.tri_min_parallax_deg,
-	                                        cfg.tri_max_reproj_px,
-	                                        cfg.tri_max_depth,
-	                                        cfg.tri_max_depth_ratio))
-	                                    continue;
-	                                Brief256 _d = {{0, 0, 0, 0}};
-	                                compute_brief(cblur, w, h, cc.x, cc.y, &_d);
-	                                double z1 = 0.0, z2 = 0.0;
-	                                double e1 = reprojection_error_xyz(stat_p1, Xstat, pc, fx, fy, cx, cy, &z1);
-	                                double e2 = reprojection_error_xyz(stat_p2, Xstat, cc, fx, fy, cx, cy, &z2);
-	                                double depth = 0.5 * (z1 + z2);
-	                                double reproj = 0.5 * (e1 + e2);
-	                                double parallax = triangulation_parallax_deg(stat_p1, stat_p2, Xstat);
-	                                if (cfg.admission_finite_only &&
-	                                    (!isfinite(e1) || !isfinite(e2) || !isfinite(depth) ||
-	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2]))) {
-	                                    write_map_admission_detail(
-	                                        diag.map_admission_detail_dump, frame_id, "lk",
-	                                        "finite_reject", method, inl, j, am.query_idx,
-	                                        am.train_idx, adm_cell, stat_p1, stat_p2, reproj,
-	                                        parallax, depth, z1, z2, cc.fb_err, cc.track_disp,
-	                                        admission_order ? admission_order[oi].score : 0.0);
-	                                    continue;
-	                                }
-	                                if (cfg.tri_max_depth_pnp > 0.0 && method == 2 &&
-	                                    (!isfinite(depth) || depth > cfg.tri_max_depth_pnp)) {
-	                                    write_map_admission_detail(
-	                                        diag.map_admission_detail_dump, frame_id, "lk",
-	                                        "pnp_depth_reject", method, inl, j, am.query_idx,
-	                                        am.train_idx, adm_cell, stat_p1, stat_p2, reproj,
-	                                        parallax, depth, z1, z2, cc.fb_err, cc.track_disp,
-	                                        admission_order ? admission_order[oi].score : 0.0);
-	                                    continue;
-	                                }
-	                                if (cfg.admission_batch_ranked) {
-	                                    double score = isfinite(reproj) ? reproj : 1.0e30;
-	                                    AdmissionCandidate ac = {am.query_idx,
-	                                                             am.train_idx,
-	                                                             adm_cell,
-	                                                             score,
-	                                                             reproj,
-	                                                             parallax,
-	                                                             depth,
-	                                                             {X[0], X[1], X[2]},
-	                                                             {Xstat[0], Xstat[1], Xstat[2]},
-	                                                             _d,
-	                                                             pc,
-	                                                             cc,
-	                                                             prev.pose,
-	                                                             admission_pose};
-	                                    admission_candidate_vec_push(&admission_batch, ac);
-	                                    continue;
-	                                }
-	                                tracked.data[am.train_idx].pt_idx = map.size;
-	                                tracked.data[am.train_idx].cand_idx = -1;
-	                                if (cfg.first_kf_observations && kf_db.size == 0)
-	                                    prev.corners.data[am.query_idx].pt_idx = map.size;
-	                                adm_sum_reproj += reproj;
-	                                adm_sum_parallax += parallax;
-	                                adm_sum_depth += depth;
-	                                if (depth < adm_min_depth)
-	                                    adm_min_depth = depth;
-	                                if (depth > adm_max_depth)
-	                                    adm_max_depth = depth;
-	                                adm_accepted++;
-	                                if (adm_cell >= 0)
-	                                    adm_cell_counts[adm_cell]++;
-	                                write_map_admission_detail(
-	                                    diag.map_admission_detail_dump, frame_id, "lk", "accept",
-	                                    method, inl, j, am.query_idx, am.train_idx, adm_cell,
-	                                    stat_p1, stat_p2, reproj, parallax, depth, z1, z2,
-	                                    cc.fb_err, cc.track_disp,
-	                                    admission_order ? admission_order[oi].score : 0.0);
-	                                MapPoint _mp = {X[0], X[1], X[2],
-	                                                cfg.first_kf_observations && kf_db.size == 0
-	                                                    ? 2
-	                                                    : cfg.new_point_obs,
-	                                                0,
-	                                                0,
-	                                                _d};
-	                                map_push(&map, _mp);
-	                                record_map_lifecycle(
-	                                    &map_lifecycle, map_lifecycle_enabled,
-	                                    tracked.data[am.train_idx].pt_idx, frame_id, "lk",
-	                                    method, inl, adm_cell, reproj, parallax, depth,
-	                                    cc.fb_err, cc.track_disp,
-	                                    admission_order ? admission_order[oi].score : 0.0);
-	                                pts++;
-	                                added++;
-	                                tri++;
-	                            }
-	                        } else {
-	                            int pi = tracked.data[am.train_idx].pt_idx;
-	                            if (!obs_seen || pi >= obs_seen_cap || !obs_seen[pi]) {
-	                                map.data[pi].obs++;
-	                                mark_map_lifecycle_observed(&map_lifecycle,
-	                                                            map_lifecycle_enabled,
-	                                                            pi, frame_id);
-                                if (obs_seen && pi < obs_seen_cap)
-                                    obs_seen[pi] = 1;
-	                            }
-	                        }
-	                    }
-	                    if (admission_batch.size > 0) {
-	                        qsort(admission_batch.data, (size_t)admission_batch.size,
-	                              sizeof(AdmissionCandidate), admission_candidate_cmp_score_asc);
-	                        int batch_cap = inl > 0 ? ADMISSION_BATCH_INLIER_MULTIPLIER * inl
-	                                                : admission_batch.size;
-	                        if (cfg.admission_max_new_points > 0 &&
-	                            cfg.admission_max_new_points < batch_cap)
-	                            batch_cap = cfg.admission_max_new_points;
-	                        int batch_added = 0;
-	                        for (int bi = 0; bi < admission_batch.size && batch_added < batch_cap; bi++) {
-	                            AdmissionCandidate *ac = &admission_batch.data[bi];
-	                            if (!isfinite(ac->score) || !isfinite(ac->depth) ||
-	                                !isfinite(ac->X[0]) || !isfinite(ac->X[1]) ||
-	                                !isfinite(ac->X[2]))
-	                                continue;
-	                            if (ac->train_idx < 0 || ac->train_idx >= tracked.size ||
-	                                tracked.data[ac->train_idx].pt_idx != -1)
-	                                continue;
-	                            if (cfg.admission_grid_cap > 0 && ac->cell >= 0 &&
-	                                adm_cell_counts[ac->cell] >= cfg.admission_grid_cap)
-	                                continue;
-	                            if (cfg.admission_batch_deferred) {
-	                                int ci = create_deferred_candidate(&candidates, frame_id,
-	                                                                   &ac->prev_pose,
-	                                                                   &ac->cur_pose,
-	                                                                   ac->prev_corner,
-	                                                                   ac->cur_corner,
-	                                                                   &ac->desc);
-	                                tracked.data[ac->train_idx].cand_idx = ci;
-	                                if (ac->cell >= 0)
-	                                    adm_cell_counts[ac->cell]++;
-	                                batch_added++;
-	                                continue;
-	                            }
-	                            int map_idx = map.size;
-	                            tracked.data[ac->train_idx].pt_idx = map_idx;
-	                            tracked.data[ac->train_idx].cand_idx = -1;
-	                            if (cfg.first_kf_observations && kf_db.size == 0 &&
-	                                ac->query_idx >= 0 && ac->query_idx < prev.corners.size)
-	                                prev.corners.data[ac->query_idx].pt_idx = map_idx;
-	                            adm_sum_reproj += ac->reproj;
-	                            adm_sum_parallax += ac->parallax;
-	                            adm_sum_depth += ac->depth;
-	                            if (ac->depth < adm_min_depth)
-	                                adm_min_depth = ac->depth;
-	                            if (ac->depth > adm_max_depth)
-	                                adm_max_depth = ac->depth;
-	                            adm_accepted++;
-	                            if (ac->cell >= 0)
-	                                adm_cell_counts[ac->cell]++;
-	                            double bz1 = 0.0, bz2 = 0.0;
-	                            (void)reprojection_error_xyz(&ac->prev_pose, ac->Xstat,
-	                                                          ac->prev_corner, fx, fy, cx, cy,
-	                                                          &bz1);
-	                            (void)reprojection_error_xyz(&ac->cur_pose, ac->Xstat,
-	                                                          ac->cur_corner, fx, fy, cx, cy,
-	                                                          &bz2);
-	                            write_map_admission_detail(
-	                                diag.map_admission_detail_dump, frame_id, "lk_batch",
-	                                "accept", method, inl, -1, ac->query_idx, ac->train_idx,
-	                                ac->cell, &ac->prev_pose, &ac->cur_pose, ac->reproj,
-	                                ac->parallax, ac->depth, bz1, bz2,
-	                                ac->cur_corner.fb_err, ac->cur_corner.track_disp, ac->score);
-	                            MapPoint _mp = {ac->X[0], ac->X[1], ac->X[2],
-	                                            cfg.first_kf_observations && kf_db.size == 0
-	                                                ? 2
-	                                                : cfg.new_point_obs,
-	                                            0,
-	                                            0,
-	                                            ac->desc};
-	                            map_push(&map, _mp);
-	                            record_map_lifecycle(
-	                                &map_lifecycle, map_lifecycle_enabled, map_idx,
-	                                frame_id, "lk_batch", method, inl, ac->cell, ac->reproj,
-	                                ac->parallax, ac->depth, ac->cur_corner.fb_err,
-	                                ac->cur_corner.track_disp, ac->score);
-	                            pts++;
-	                            added++;
-	                            tri++;
-	                            batch_added++;
-	                        }
-	                    }
-	                    free(admission_batch.data);
-	                    free(admission_order);
-	                    if (admission_allows_new && config_suppresses_lk_landmarks(&cfg)) {
-	                        CornerVec desc_cur = {0};
-	                        extract_features_pure(&cfg, cblur, w, h, &desc_cur, cfg.max_points);
-	                        const CornerVec *desc_src_corners = &prev.corners;
-	                        const unsigned char *desc_src_gray = pgray;
-	                        const Pose *desc_src_pose = &prev.pose;
-	                        const char *desc_dump_kind = "admission_desc";
-	                        KFEntry *desc_src_kf = NULL;
-	                        int desc_source_ready = cfg.descriptor_source_kf_gap <= 0;
-	                        if (cfg.descriptor_primary_admission &&
-	                            cfg.descriptor_source_kf_gap > 0 && kf_db.size > 0) {
-	                            int src_idx = -1;
-	                            for (int ki = kf_db.size - 1; ki >= 0; ki--) {
-	                                if (frame_id - kf_db.data[ki].frame_id >=
-	                                    cfg.descriptor_source_kf_gap) {
-	                                    src_idx = ki;
-	                                    break;
-	                                }
-	                            }
-	                            if (src_idx >= 0) {
-	                                KFEntry *src = &kf_db.data[src_idx];
-	                                desc_src_corners = &src->corners;
-	                                desc_src_gray = src->gray.data;
-	                                desc_src_pose = &src->pose;
-	                                desc_dump_kind = "admission_desc_kf";
-	                                desc_src_kf = src;
-	                                desc_source_ready = 1;
-	                            }
-	                        }
-	                        if (cfg.descriptor_primary_admission &&
-	                            cfg.delayed_init_frames > 0) {
-	                            desc_source_ready = 0;
-	                            if (frame_id >= cfg.delayed_init_frames && kf_db.size > 0) {
-	                                KFEntry *src = &kf_db.data[0];
-	                                desc_src_corners = &src->corners;
-	                                desc_src_gray = src->gray.data;
-	                                desc_src_pose = &src->pose;
-	                                desc_dump_kind = "admission_desc_init";
-	                                desc_src_kf = src;
-	                                desc_source_ready = 1;
-	                            }
-	                        }
-	                        MatchVec desc_matches = {0};
-	                        if (desc_source_ready)
-	                            build_brief_descriptor_matches(
-	                                desc_src_gray, cblur, w, h, desc_src_corners, &desc_cur,
-	                                cfg.descriptor_admission_max_hamming,
-	                                cfg.descriptor_admission_ratio,
-	                                cfg.descriptor_mutual_admission, &desc_matches);
-	                        unsigned char *desc_mask = NULL;
-	                        int desc_inl = 0;
-	                        Pose desc_rel;
-	                        int desc_e_ok = estimate_pose_E(
-	                            desc_src_corners, &desc_cur, &desc_matches, fx, fy, cx, cy,
-	                            &desc_rel, cfg.essential_iters, cfg.essential_cheirality_max,
-	                            &desc_mask, &desc_inl);
-	                        if (desc_e_ok) {
-	                            write_e_inlier_pairs(diag.e_inlier_dump, frame_id, desc_dump_kind,
-	                                                 desc_src_corners, &desc_cur, &desc_matches,
-	                                                 desc_mask, w, h);
-	                            Pose desc_admission_pose = admission_pose;
-	                            if (cfg.triangulate_with_e_pose ||
-	                                cfg.descriptor_primary_admission)
-	                                pose_compose_relative(&desc_rel, desc_src_pose,
-	                                                      &desc_admission_pose);
-	                            int desc_add_cap = INT_MAX;
-	                            if (cfg.descriptor_primary_admission &&
-	                                cfg.descriptor_primary_map_cap > 0) {
-	                                desc_add_cap = cfg.descriptor_primary_map_cap - map.size;
-	                                if (desc_add_cap < 0)
-	                                    desc_add_cap = 0;
-	                            }
-	                            if (cfg.admission_max_new_points > 0 &&
-	                                cfg.admission_max_new_points < desc_add_cap)
-	                                desc_add_cap = cfg.admission_max_new_points;
-	                            int desc_added = 0;
-	                            for (int j = 0; j < desc_matches.size; j++) {
-	                                if (!desc_mask || !desc_mask[j])
-	                                    continue;
-	                                if (desc_added >= desc_add_cap)
-	                                    break;
-	                                Match dm = desc_matches.data[j];
-	                                if (dm.query_idx < 0 || dm.query_idx >= desc_src_corners->size ||
-	                                    dm.train_idx < 0 || dm.train_idx >= desc_cur.size)
-	                                    continue;
-	                                if (desc_src_corners->data[dm.query_idx].pt_idx != -1)
-	                                    continue;
-	                                adm_candidates++;
-	                                Corner pc = desc_src_corners->data[dm.query_idx];
-	                                Corner cc = desc_cur.data[dm.train_idx];
-	                                int cur_idx = find_near_corner(&tracked, cc,
-	                                                               ADMISSION_MATCH_RADIUS_PX);
-	                                if (cur_idx >= 0 && tracked.data[cur_idx].pt_idx != -1)
-	                                    continue;
-	                                double X[3];
-	                                double Xstat[3] = {0.0, 0.0, 0.0};
-	                                Pose id_pose;
-	                                const Pose *stat_p1 = desc_src_pose,
-	                                           *stat_p2 = &desc_admission_pose;
-	                                int tri_ok = 0;
-	                                if (cfg.triangulate_relative_frame) {
-	                                    pose_identity(&id_pose);
-	                                    tri_ok = triangulate_point(&id_pose, &desc_rel, pc, cc,
-	                                                               fx, fy, cx, cy, Xstat);
-	                                    if (tri_ok)
-	                                        camera_point_to_world(desc_src_pose, Xstat, X);
-	                                    stat_p1 = &id_pose;
-	                                    stat_p2 = &desc_rel;
-	                                } else {
-	                                    tri_ok = triangulate_point(desc_src_pose, &desc_admission_pose,
-	                                                               pc, cc, fx, fy, cx, cy, X);
-	                                    memcpy(Xstat, X, sizeof(Xstat));
-	                                }
-	                                if (!tri_ok) {
-	                                    write_map_admission_detail(
-	                                        diag.map_admission_detail_dump, frame_id,
-	                                        desc_dump_kind, "tri_fail", method, inl, j,
-	                                        dm.query_idx, dm.train_idx, -1, stat_p1, stat_p2,
-	                                        NAN, NAN, NAN, NAN, NAN, cc.fb_err,
-	                                        cc.track_disp, dm.score);
-	                                    continue;
-	                                }
-	                                if ((cfg.tri_min_parallax_deg > 0.0 ||
-	                                     cfg.tri_max_reproj_px > 0.0 ||
-	                                     cfg.tri_max_depth > 0.0 ||
-	                                     cfg.tri_max_depth_ratio > 0.0) &&
-	                                    !triangulation_quality_ok(
-	                                        stat_p1, stat_p2, pc, cc, fx, fy, cx, cy, Xstat,
-	                                        cfg.tri_min_parallax_deg,
-	                                        cfg.tri_max_reproj_px,
-	                                        cfg.tri_max_depth,
-	                                        cfg.tri_max_depth_ratio))
-	                                    continue;
-	                                Brief256 _d = {{0, 0, 0, 0}};
-	                                compute_brief(cblur, w, h, cc.x, cc.y, &_d);
-	                                int map_idx = map.size;
-	                                if (cur_idx < 0) {
-	                                    cur_idx = tracked.size;
-	                                    cc.pt_idx = -1;
-	                                    cc.cand_idx = -1;
-	                                    cc.fb_err = 0.0f;
-	                                    cc.track_disp = 0.0f;
-	                                    corner_vec_push(&tracked, cc);
-	                                }
-	                                tracked.data[cur_idx].pt_idx = map_idx;
-	                                tracked.data[cur_idx].cand_idx = -1;
-	                                if (cfg.first_kf_observations && kf_db.size == 0 &&
-	                                    desc_src_corners == &prev.corners)
-	                                    prev.corners.data[dm.query_idx].pt_idx = map_idx;
-	                                if (desc_src_kf)
-	                                    desc_src_kf->corners.data[dm.query_idx].pt_idx = map_idx;
-	                                double z1 = 0.0, z2 = 0.0;
-	                                double e1 = reprojection_error_xyz(stat_p1, Xstat, pc, fx, fy, cx, cy, &z1);
-	                                double e2 = reprojection_error_xyz(stat_p2, Xstat, cc, fx, fy, cx, cy, &z2);
-	                                double depth = 0.5 * (z1 + z2);
-	                                double reproj = 0.5 * (e1 + e2);
-	                                double parallax = triangulation_parallax_deg(stat_p1, stat_p2, Xstat);
-	                                if (cfg.admission_finite_only &&
-	                                    (!isfinite(e1) || !isfinite(e2) || !isfinite(depth) ||
-	                                     !isfinite(X[0]) || !isfinite(X[1]) || !isfinite(X[2]))) {
-	                                    write_map_admission_detail(
-	                                        diag.map_admission_detail_dump, frame_id,
-	                                        desc_dump_kind, "finite_reject", method, inl, j,
-	                                        dm.query_idx, dm.train_idx, -1, stat_p1, stat_p2,
-	                                        reproj, parallax, depth, z1, z2, cc.fb_err,
-	                                        cc.track_disp, dm.score);
-	                                    continue;
-	                                }
-	                                adm_sum_reproj += reproj;
-	                                adm_sum_parallax += parallax;
-	                                adm_sum_depth += depth;
-	                                if (depth < adm_min_depth)
-	                                    adm_min_depth = depth;
-	                                if (depth > adm_max_depth)
-	                                    adm_max_depth = depth;
-	                                adm_accepted++;
-	                                desc_added++;
-	                                write_map_admission_detail(
-	                                    diag.map_admission_detail_dump, frame_id, desc_dump_kind,
-	                                    "accept", method, inl, j, dm.query_idx, dm.train_idx,
-	                                    -1, stat_p1, stat_p2, reproj, parallax, depth, z1, z2,
-	                                    cc.fb_err, cc.track_disp, dm.score);
-	                                MapPoint _mp = {X[0], X[1], X[2],
-	                                                cfg.first_kf_observations && kf_db.size == 0
-	                                                    ? 2
-	                                                    : cfg.new_point_obs,
-	                                                0,
-	                                                0,
-	                                                _d};
-	                                map_push(&map, _mp);
-	                                record_map_lifecycle(
-	                                    &map_lifecycle, map_lifecycle_enabled, map_idx,
-	                                    frame_id, desc_dump_kind, method, inl, -1,
-	                                    reproj, parallax, depth, cc.fb_err,
-	                                    cc.track_disp, dm.score);
-	                                pts++;
-	                                added++;
-	                                tri++;
-	                            }
-	                        }
-	                        free(desc_mask);
-	                        free(desc_matches.data);
-	                        free(desc_cur.data);
-	                    }
-	                    Pose summary_id_pose;
-	                    const Pose *summary_p1 = &prev.pose, *summary_p2 = &admission_pose;
-	                    if (cfg.triangulate_relative_frame && has_admission_rel) {
-	                        pose_identity(&summary_id_pose);
-	                        summary_p1 = &summary_id_pose;
-	                        summary_p2 = &admission_rel;
-	                    }
-	                    write_map_admission_summary(diag.map_admission_dump, frame_id, adm_candidates,
-	                                                adm_accepted, summary_p1, summary_p2,
-	                                                fx, fy, cx, cy,
-	                                                adm_sum_reproj, adm_sum_parallax,
-	                                                adm_sum_depth, adm_min_depth, adm_max_depth);
-	                    free(owned_admission_mask);
-	                    if (promotions.size > 0) {
-	                        int cells = cfg.candidate_grid_cols * cfg.candidate_grid_rows;
-	                        int *cell_counts = calloc((size_t)cells, sizeof(int));
-	                        qsort(promotions.data, (size_t)promotions.size,
-	                              sizeof(CandidatePromotion), candidate_promotion_cmp_desc);
-	                        for (int pi = 0; pi < promotions.size; pi++) {
-	                            CandidatePromotion *cp = &promotions.data[pi];
-	                            if (cp->cell < 0 || cp->cell >= cells ||
-	                                cell_counts[cp->cell] >= cfg.candidate_promote_per_cell)
-	                                continue;
-	                            if (cp->cand_idx < 0 || cp->cand_idx >= candidates.size ||
-	                                !candidates.data[cp->cand_idx].valid)
-	                                continue;
-	                            if (cp->corner_idx < 0 || cp->corner_idx >= tracked.size ||
-	                                tracked.data[cp->corner_idx].pt_idx != -1)
-	                                continue;
-	                            Corner cc = tracked.data[cp->corner_idx];
-	                            Brief256 _d = {{0, 0, 0, 0}};
-	                            compute_brief(cblur, w, h, cc.x, cc.y, &_d);
-	                            int map_idx = map.size;
-	                            MapPoint _mp = {cp->X[0], cp->X[1], cp->X[2],
-	                                            cfg.new_point_obs > 2 ? cfg.new_point_obs : 2,
-	                                            0,
-	                                            0,
-	                                            _d};
-	                            map_push(&map, _mp);
-	                            record_map_lifecycle(
-	                                &map_lifecycle, map_lifecycle_enabled, map_idx,
-	                                frame_id, "candidate_grid", method, inl, cp->cell,
-	                                NAN, NAN, NAN, cc.fb_err, cc.track_disp, cp->score);
-	                            candidates.data[cp->cand_idx].valid = 0;
-	                            tracked.data[cp->corner_idx].pt_idx = map_idx;
-	                            tracked.data[cp->corner_idx].cand_idx = -1;
-	                            cell_counts[cp->cell]++;
-	                            pts++;
-	                            added++;
-	                            tri++;
-	                        }
-	                        free(cell_counts);
-	                    }
-	                    free(promotions.data);
-		                    free(obs_seen);
-	                    if (cfg.tri_source_kf_gap > 0 && kf_db.size > 0 &&
-	                        config_allows_new_landmarks(&cfg, frame_id) &&
-	                        frame_id % cfg.tri_source_kf_gap == 0) {
-	                        int src_idx = -1;
-	                        for (int ki = kf_db.size - 1; ki >= 0; ki--) {
-	                            if (frame_id - kf_db.data[ki].frame_id >= cfg.tri_source_kf_gap) {
-	                                src_idx = ki;
-	                                break;
-	                            }
-	                        }
-	                        if (src_idx >= 0) {
-	                            KFEntry *src = &kf_db.data[src_idx];
-	                            CornerVec src_subset = {0};
-	                            int src_cap = src->corners.size < 250 ? src->corners.size : 250;
-	                            int *src_orig = malloc((size_t)src_cap * sizeof(int));
-	                            for (int si = 0; si < src_cap; si++) {
-	                                src_orig[si] = si;
-	                                corner_vec_push(&src_subset, src->corners.data[si]);
-	                            }
-	                            CornerVec kf_tracked = {0};
-	                            MatchVec kf_matches = {0};
-	                            track_corners_pure_lk(src->gray.data, cblur, w, h, &src_subset,
-	                                                  &kf_tracked, &kf_matches, &lk_scratch,
-	                                                  cfg.lk_iters, cfg.lk_back_iters);
-	                            unsigned char *src_mask = NULL;
-	                            int src_inl = 0;
-	                            Pose src_rel;
-	                            int src_e_ok = estimate_pose_E(&src_subset, &kf_tracked,
-	                                                          &kf_matches, fx, fy, cx, cy,
-	                                                          &src_rel, cfg.essential_iters,
-	                                                          cfg.essential_cheirality_max,
-	                                                          &src_mask, &src_inl);
-	                            if (src_e_ok && src_inl >= 8) {
-	                                for (int j = 0; j < kf_matches.size; j++) {
-	                                    if (!src_mask || !src_mask[j])
-	                                        continue;
-	                                    int qi = kf_matches.data[j].query_idx;
-	                                    int ti = kf_matches.data[j].train_idx;
-	                                    int orig_qi = src_orig[qi];
-	                                    if (src->corners.data[orig_qi].pt_idx != -1)
-	                                        continue;
-	                                    Corner cur_corner = kf_tracked.data[ti];
-	                                    int cur_idx = find_near_corner(&tracked, cur_corner,
-	                                                                   ADMISSION_MATCH_RADIUS_PX);
-	                                    if (cur_idx >= 0 && tracked.data[cur_idx].pt_idx != -1)
-	                                        continue;
-	                                    double X[3];
-	                                    if (!triangulate_point(&src->pose, &pose,
-	                                                           src->corners.data[orig_qi], cur_corner,
-	                                                           fx, fy, cx, cy, X))
-	                                        continue;
-	                                    if ((cfg.tri_min_parallax_deg > 0.0 ||
-	                                         cfg.tri_max_reproj_px > 0.0 ||
-	                                         cfg.tri_max_depth > 0.0 ||
-	                                         cfg.tri_max_depth_ratio > 0.0) &&
-	                                        !triangulation_quality_ok(
-	                                            &src->pose, &pose, src->corners.data[orig_qi],
-	                                            cur_corner, fx, fy, cx, cy, X,
-	                                            cfg.tri_min_parallax_deg,
-	                                            cfg.tri_max_reproj_px,
-	                                            cfg.tri_max_depth,
-	                                            cfg.tri_max_depth_ratio))
-	                                        continue;
-	                                    if (cur_idx < 0) {
-	                                        cur_idx = tracked.size;
-	                                        cur_corner.pt_idx = -1;
-	                                        cur_corner.cand_idx = -1;
-	                                        cur_corner.fb_err = 0.0f;
-	                                        cur_corner.track_disp = 0.0f;
-	                                        corner_vec_push(&tracked, cur_corner);
-	                                    }
-	                                    Brief256 _d = {{0, 0, 0, 0}};
-	                                    compute_brief(cblur, w, h, cur_corner.x, cur_corner.y, &_d);
-	                                    int new_idx = map.size;
-	                                    double src_z1 = 0.0, src_z2 = 0.0;
-	                                    double src_e1 = reprojection_error_xyz(
-	                                        &src->pose, X, src->corners.data[orig_qi],
-	                                        fx, fy, cx, cy, &src_z1);
-	                                    double src_e2 = reprojection_error_xyz(
-	                                        &pose, X, cur_corner, fx, fy, cx, cy, &src_z2);
-	                                    double src_depth = 0.5 * (src_z1 + src_z2);
-	                                    double src_reproj = 0.5 * (src_e1 + src_e2);
-	                                    double src_parallax =
-	                                        triangulation_parallax_deg(&src->pose, &pose, X);
-	                                    tracked.data[cur_idx].pt_idx = new_idx;
-	                                    src->corners.data[orig_qi].pt_idx = new_idx;
-	                                    MapPoint _mp = {X[0], X[1], X[2],
-	                                                    cfg.new_point_obs > 2 ? cfg.new_point_obs : 2,
-	                                                    0,
-	                                                    0,
-	                                                    _d};
-	                                    map_push(&map, _mp);
-	                                    record_map_lifecycle(
-	                                        &map_lifecycle, map_lifecycle_enabled, new_idx,
-	                                        frame_id, "tri_source_kf", 1, src_inl, -1,
-	                                        src_reproj, src_parallax, src_depth,
-	                                        cur_corner.fb_err, cur_corner.track_disp, 0.0);
-	                                    pts++;
-	                                    added++;
-	                                    tri++;
-	                                }
-	                            }
-	                            free(src_mask);
-	                            free(kf_matches.data);
-	                            free(kf_tracked.data);
-	                            free(src_orig);
-	                            free(src_subset.data);
-	                        }
-	                    }
-	                    prof.triangulate += now_seconds() - t0;
-	                }
+                        Match am = matches.data[j];
+                        if (tracked.data[am.train_idx].pt_idx == -1) {
+                            adm_candidates++;
+                            Corner pc = prev.corners.data[am.query_idx];
+                            Corner cc = tracked.data[am.train_idx];
+                            int adm_cell = image_grid_cell(cc.x, cc.y, w, h,
+                                                           ADMISSION_GRID_COLS,
+                                                           ADMISSION_GRID_ROWS);
+                            double X[3];
+                            if (!triangulate_point(&prev.pose, &admission_pose, pc, cc,
+                                                   fx, fy, cx, cy, X)) {
+                                write_map_admission_detail(
+                                    diag.map_admission_detail_dump, frame_id, "lk",
+                                    "tri_fail", method, inl, j, am.query_idx,
+                                    am.train_idx, adm_cell, &prev.pose, &admission_pose,
+                                    NAN, NAN, NAN, NAN, NAN, cc.fb_err, cc.track_disp,
+                                    (double)j);
+                                continue;
+                            }
+                            Brief256 _d = {{0, 0, 0, 0}};
+                            compute_brief(cblur, w, h, cc.x, cc.y, &_d);
+
+                            double z1 = 0.0, z2 = 0.0;
+                            double e1 = reprojection_error_xyz(&prev.pose, X, pc, fx, fy, cx, cy, &z1);
+                            double e2 = reprojection_error_xyz(&admission_pose, X, cc, fx, fy, cx, cy, &z2);
+                            double depth    = 0.5 * (z1 + z2);
+                            double reproj   = 0.5 * (e1 + e2);
+                            double parallax = triangulation_parallax_deg(&prev.pose, &admission_pose, X);
+
+                            tracked.data[am.train_idx].pt_idx = map.size;
+                            adm_sum_reproj += reproj;
+                            adm_sum_parallax += parallax;
+                            adm_sum_depth += depth;
+                            if (depth < adm_min_depth)
+                                adm_min_depth = depth;
+                            if (depth > adm_max_depth)
+                                adm_max_depth = depth;
+                            adm_accepted++;
+                            write_map_admission_detail(
+                                diag.map_admission_detail_dump, frame_id, "lk", "accept",
+                                method, inl, j, am.query_idx, am.train_idx, adm_cell,
+                                &prev.pose, &admission_pose, reproj, parallax, depth, z1, z2,
+                                cc.fb_err, cc.track_disp, (double)j);
+                            MapPoint _mp = {X[0], X[1], X[2], cfg.new_point_obs, 0, 0, _d};
+                            map_push(&map, _mp);
+                            record_map_lifecycle(
+                                &map_lifecycle, map_lifecycle_enabled,
+                                tracked.data[am.train_idx].pt_idx, frame_id, "lk",
+                                method, inl, adm_cell, reproj, parallax, depth,
+                                cc.fb_err, cc.track_disp, (double)j);
+                            pts++;
+                            added++;
+                            tri++;
+                        } else {
+                            int pi = tracked.data[am.train_idx].pt_idx;
+                            map.data[pi].obs++;
+                            mark_map_lifecycle_observed(&map_lifecycle,
+                                                        map_lifecycle_enabled,
+                                                        pi, frame_id);
+                        }
+                    }
+                    write_map_admission_summary(diag.map_admission_dump, frame_id, adm_candidates,
+                                                adm_accepted, &prev.pose, &admission_pose,
+                                                fx, fy, cx, cy,
+                                                adm_sum_reproj, adm_sum_parallax,
+                                                adm_sum_depth, adm_min_depth, adm_max_depth);
+                    free(owned_admission_mask);
+                    prof.triangulate += now_seconds() - t0;
+                }
                 if (tracked.size < (cfg.max_points * 3) / 5) {
                     t0 = now_seconds();
-                    extract_features_pure(&cfg, cblur, w, h, &tracked, cfg.max_points);
+                    extract_features_pure(cblur, w, h, &tracked, cfg.max_points);
                     prof.refill += now_seconds() - t0;
                 }
                 t0 = now_seconds();
@@ -2398,20 +1289,6 @@ int main(int argc, char **argv) {
                     }
                 }
                 prof.loop += now_seconds() - t0;
-                update_observation_stats(&map, &tracked, fx, fy, cx, cy, &pose,
-                                         cfg.obs_stat_gate_px);
-                if (cfg.first_kf_observations && kf_db.size == 0 && added > 0) {
-                    KFEntry pe;
-                    gen_thumbnail(pgray, w, h, pe.thumb);
-                    pe.frame_id = frame_id - 1;
-                    pe.pose = prev.pose;
-                    pe.corners.size = prev.corners.size;
-                    pe.corners.data = malloc((size_t)prev.corners.size * sizeof(Corner));
-                    memcpy(pe.corners.data, prev.corners.data,
-                           (size_t)prev.corners.size * sizeof(Corner));
-                    pe.gray = image_gray_clone(pgray, w, h);
-                    kfdb_push(&kf_db, pe);
-                }
                 KFEntry e;
                 memcpy(e.thumb, thumb, 256);
                 e.frame_id = frame_id;
@@ -2443,14 +1320,6 @@ int main(int argc, char **argv) {
                         prof.ba += prof.ba_local;
                     }
                 }
-                if (cfg.map_hygiene && frame_id >= MAP_HYGIENE_START_FRAME) {
-                    t0 = now_seconds();
-                    int win_start = kf_db.size - MAP_HYGIENE_WINDOW;
-                    if (win_start < 0) win_start = 0;
-                    cull_map_points_window(&kf_db, &map, win_start, kf_db.size,
-                                           fx, fy, cx, cy, MAP_HYGIENE_REPROJ_PX);
-                    prof.map_hygiene += now_seconds() - t0;
-                }
                 if (config_allows_global_ba(&cfg, kf_db.size, map.size)) {
                     t0 = now_seconds();
                     global_ba(&kf_db, &map, fx, fy, cx, cy, 3, cfg.pose_lm_iters);
@@ -2474,10 +1343,8 @@ int main(int argc, char **argv) {
             pose_inverse(&prev.pose, &inv_prev);
             pose_compose_relative(&pose, &inv_prev, &last_rel);
         }
-        if (cfg.update_map_descriptors && frame_id > 0)
-            refresh_map_descriptors(&map, &tracked, cblur, w, h);
-        maybe_normalize_world_scale(&cfg, &map, &kf_db, &anchors, &candidates,
-                                    &prev, &pose, &lkf_pose, &last_rel);
+        maybe_normalize_world_scale(&cfg, &map, &kf_db, &anchors, &prev, &pose,
+                                    &lkf_pose, &last_rel);
         double c[3];
         camera_center_from_pose(&pose, c);
         double out_c[3] = {c[0], c[1], c[2]};
@@ -2580,20 +1447,6 @@ int main(int argc, char **argv) {
                                                 pnp_inliers,
                                                 pred_lm_inliers,
                                                 e_inliers,
-                                                pnp_fallback_used,
-                                                pnp_p3p_probe.attempted,
-                                                pnp_p3p_probe.solved,
-                                                pnp_p3p_probe.accepted,
-                                                pnp_p3p_probe.inliers,
-                                                pnp_p3p_probe.inliers2,
-                                                pnp_p3p_probe.inliers3,
-                                                pnp_p3p_probe.inliers5,
-                                                pnp_p3p_probe.median_error,
-                                                pnp_p3p_probe.positive_depth_ratio,
-                                                pnp_p3p_probe.predicted_jump,
-                                                {pnp_p3p_probe.center[0],
-                                                 pnp_p3p_probe.center[1],
-                                                 pnp_p3p_probe.center[2]},
                                                 trans_jump,
                                                 {c[0], c[1], c[2]},
                                                 {out_c[0], out_c[1], out_c[2]}});
@@ -2606,7 +1459,6 @@ int main(int argc, char **argv) {
         prev = curr;
         memset(&curr, 0, sizeof(curr));
         free(matches.data);
-        free(shaped_e_matches.data);
         free(anchor_matches.data);
         anchor_set_free(&cur_anchors);
         free(mask);
@@ -2625,7 +1477,6 @@ int main(int argc, char **argv) {
     lk_scratch_free(&lk_scratch);
     free(profile.data);
     free(stats.data);
-    free(candidates.data);
     free(map_lifecycle.data);
     anchor_set_free(&anchors);
     kfdb_free(&kf_db);

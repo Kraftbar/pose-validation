@@ -81,7 +81,7 @@ static int verify_loop(KFDB *db, int lidx, const unsigned char *cgray, int w, in
             }
         if (best_ncc > 0.95) {
             match_vec_push(&matches, (Match){i, cpts.size, 0});
-            corner_vec_push(&cpts, (Corner){(float)best_x, (float)best_y, -1, -1, 0.0f, 0.0f});
+            corner_vec_push(&cpts, (Corner){(float)best_x, (float)best_y, -1, 0.0f, 0.0f});
         }
     }
     Pose rel;

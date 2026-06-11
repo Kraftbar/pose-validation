@@ -5,11 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define HEALTHY_KF_MIN_LINKED 80
-#define HEALTHY_KF_START_FRAME 200
-#define LATE_KF_COOLDOWN_START_FRAME 200
-#define LATE_KF_MIN_INTERVAL 2
-
 typedef struct {
     const char *video_path;
     double seconds, timeout;
@@ -28,23 +23,10 @@ typedef struct {
     int max_points;
     int new_point_obs;
     int pnp_min_obs;
-    int pnp_start_frame;
-    int delayed_init_frames;
-    int candidate_tracks;
-    int candidate_min_obs;
-    int candidate_min_age;
-    int candidate_grid_cols;
-    int candidate_grid_rows;
-    int candidate_promote_per_cell;
-    double candidate_max_fb_err;
-    double candidate_min_disp;
-    double candidate_max_disp;
     int joint_ba;
     int proc_w, proc_h;
     int kf_period;
     int kf_min_interval;
-    int healthy_keyframes;
-    int late_kf_cooldown;
     int ba_interval;
     int ba_start_keyframes;
     int ba_max_points;
@@ -52,39 +34,8 @@ typedef struct {
     int global_ba_interval;
     int global_ba_start_keyframes;
     int global_ba_max_points;
-    int map_hygiene;
-    int kf_warmup_frames;
-    int first_kf_observations;
-    int unique_kf_observations;
     int essential_cheirality_max;
-    double tri_min_parallax_deg;
-    double tri_max_reproj_px;
-    double tri_max_depth;
-    double tri_max_depth_pnp;
-    double tri_max_depth_ratio;
-    int tri_source_kf_gap;
-    double pnp_pred_reproj_gate;
-    double pnp_quality_gate_px;
-    int pnp_quality_min_obs;
-    int pnp_quality_window;
-    double obs_stat_gate_px;
-    int obs_stat_min_good;
-    double obs_stat_max_bad_ratio;
-    int pnp_p3p_fallback;
-    int pnp_p3p_observe;
-    int pnp_p3p_iterations;
-    double pnp_p3p_max_jump;
-    int pnp_p3p_min_inl2;
-    int pnp_p3p_min_gain;
-    double pnp_p3p_max_mederr;
-    double pnp_p3p_min_posz;
     int pnp_dlt_iters;
-    int pnp_dlt_pretest;
-    int pnp_dlt_pretest_margin;
-    int pnp_score_rigid;
-    int pnp_validate_rigid;
-    int pnp_validate_rigid_min_points;
-    int pnp_normalize_world;
     int pnp_low_e_fallback;
     int pnp_low_e_max_inliers;
     int pnp_low_e_min_inliers;
@@ -93,48 +44,17 @@ typedef struct {
     int pnp_low_e_min_map_points;
     double pnp_low_e_min_pose_jump;
     int ffmpeg_gray;
-    int fast_corners;
-    int distributed_features;
-    int pyramid_features;
-    int subpixel_features;
-    int feature_min_dist;
     int lk_iters;
     int lk_back_iters;
     int pose_lm_iters;
     int essential_iters;
-    int descriptor_map_admission;
-    int descriptor_primary_admission;
-    int descriptor_mutual_admission;
-    int update_map_descriptors;
     int oriented_brief;
     int brief_patch_radius;
-    int descriptor_admission_max_hamming;
-    double descriptor_admission_ratio;
-    int descriptor_primary_map_cap;
-    int descriptor_source_kf_gap;
-    int triangulate_with_e_pose;
-    int triangulate_relative_frame;
-    int shape_e_inliers;
-    int e_shape_max_matches;
-    int e_shape_grid_cap;
-    double e_shape_max_disp;
-    double e_shape_max_fb_err;
-    double e_shape_target_disp;
     int anchor_e_pose;
     int anchor_max_features;
     int anchor_max_hamming;
     int anchor_mutual;
     double anchor_ratio;
-    int admission_ranked;
-    int admission_finite_only;
-    int admission_batch_ranked;
-    int admission_batch_deferred;
-    double admission_target_disp;
-    double admission_fb_weight;
-    int admission_min_inliers;
-    int admission_pnp_min_inliers;
-    int admission_max_new_points;
-    int admission_grid_cap;
     int normalize_world_scale;
     double output_smooth_alpha;
     double output_smooth_outlier_alpha;
@@ -186,40 +106,14 @@ static void apply_speed_profile(Config *c, const char *name) {
     }
 }
 
-static int config_uses_descriptor_admission(const Config *c) {
-    return c->descriptor_map_admission || c->descriptor_primary_admission;
-}
-
-static int config_suppresses_lk_landmarks(const Config *c) {
-    return config_uses_descriptor_admission(c) && !c->candidate_tracks;
-}
-
-static int config_allows_new_landmarks(const Config *c, int frame_id) {
-    return c->delayed_init_frames <= 0 || frame_id >= c->delayed_init_frames;
-}
-
-static int should_make_keyframe(const Config *c, int frame_id, int inliers,
-                                int linked_points, double rot_deg) {
-    if (frame_id <= c->kf_warmup_frames)
-        return 1;
+static int should_make_keyframe(const Config *c, int frame_id, int inliers, double rot_deg) {
     if (rot_deg > c->kf_max_rot_deg)
         return 1;
     if (frame_id % c->kf_period == 0)
         return 1;
-    if (inliers < c->kf_min_inliers) {
-        if (!c->healthy_keyframes || frame_id < HEALTHY_KF_START_FRAME)
-            return 1;
-        return linked_points >= HEALTHY_KF_MIN_LINKED;
-    }
+    if (inliers < c->kf_min_inliers)
+        return 1;
     return 0;
-}
-
-static int keyframe_interval_for_frame(const Config *c, int frame_id) {
-    int interval = c->kf_min_interval;
-    if (c->late_kf_cooldown && frame_id >= LATE_KF_COOLDOWN_START_FRAME &&
-        interval < LATE_KF_MIN_INTERVAL)
-        interval = LATE_KF_MIN_INTERVAL;
-    return interval;
 }
 
 static int config_allows_ba(const Config *c, int keyframes, int map_points) {
@@ -257,10 +151,6 @@ static Config parse_args(int argc, char **argv) {
         .max_points = 1000,
         .new_point_obs = 1,
         .pnp_min_obs = 2,
-        .candidate_min_obs = 3,
-        .candidate_min_age = 5,
-        .candidate_grid_cols = 4,
-        .candidate_grid_rows = 3,
         .proc_w = 640,
         .proc_h = 480,
         .kf_period = 20,
@@ -269,21 +159,7 @@ static Config parse_args(int argc, char **argv) {
         .local_ba_fix_oldest = 0,
         .global_ba_interval = 10,
         .essential_cheirality_max = 32,
-        .pnp_quality_min_obs = 2,
-        .pnp_quality_window = 5,
-        .obs_stat_max_bad_ratio = 1.0,
-        .pnp_p3p_iterations = 500,
-        .pnp_p3p_max_jump = 500000.0,
-        .pnp_p3p_min_inl2 = 16,
-        .pnp_p3p_min_gain = 10,
-        .pnp_p3p_max_mederr = 15.0,
-        .pnp_p3p_min_posz = 0.8,
         .pnp_dlt_iters = 500,
-        .pnp_dlt_pretest_margin = 2,
-        .pnp_score_rigid = 0,
-        .pnp_validate_rigid = 0,
-        .pnp_validate_rigid_min_points = 0,
-        .pnp_normalize_world = 0,
         .pnp_low_e_max_inliers = 16,
         .pnp_low_e_min_inliers = 24,
         .pnp_low_e_min_gain = 8,
@@ -295,25 +171,13 @@ static Config parse_args(int argc, char **argv) {
         .lk_back_iters = 5,
         .pose_lm_iters = 10,
         .essential_iters = 500,
-        .descriptor_admission_max_hamming = 80,
-        .descriptor_admission_ratio = 0.80,
-        .update_map_descriptors = 0,
         .oriented_brief = 1,
         .brief_patch_radius = 0,
-        .pyramid_features = 1,
-        .descriptor_primary_map_cap = 15000,
-        .e_shape_max_matches = 64,
-        .e_shape_grid_cap = 2,
-        .e_shape_max_disp = 14.0,
-        .e_shape_max_fb_err = 0.20,
-        .e_shape_target_disp = 8.0,
         .anchor_e_pose = 1,
         .anchor_max_features = 600,
         .anchor_max_hamming = 80,
         .anchor_mutual = 0,
         .anchor_ratio = 0.80,
-        .admission_target_disp = 12.0,
-        .admission_fb_weight = 10.0,
         .normalize_world_scale = 0,
         .output_smooth_alpha = 0.040,
         .output_smooth_outlier_alpha = 0.003,
@@ -373,50 +237,10 @@ static Config parse_args(int argc, char **argv) {
             c.new_point_obs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pnp_min_obs") && i + 1 < argc)
             c.pnp_min_obs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_start_frame") && i + 1 < argc)
-            c.pnp_start_frame = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--delayed_init_frames") && i + 1 < argc)
-            c.delayed_init_frames = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_tracks"))
-            c.candidate_tracks = 1;
-        else if (!strcmp(argv[i], "--descriptor_map_admission"))
-            c.descriptor_map_admission = 1;
-        else if (!strcmp(argv[i], "--descriptor_primary_admission")) {
-            c.descriptor_primary_admission = 1;
-            c.descriptor_map_admission = 1;
-        }
-        else if (!strcmp(argv[i], "--descriptor_mutual_admission"))
-            c.descriptor_mutual_admission = 1;
-        else if (!strcmp(argv[i], "--update_map_descriptors"))
-            c.update_map_descriptors = 1;
         else if (!strcmp(argv[i], "--oriented_brief"))
             c.oriented_brief = 1;
         else if (!strcmp(argv[i], "--brief_patch_radius") && i + 1 < argc)
             c.brief_patch_radius = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--descriptor_admission_max_hamming") && i + 1 < argc)
-            c.descriptor_admission_max_hamming = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--descriptor_admission_ratio") && i + 1 < argc)
-            c.descriptor_admission_ratio = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--descriptor_primary_map_cap") && i + 1 < argc)
-            c.descriptor_primary_map_cap = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--descriptor_source_kf_gap") && i + 1 < argc)
-            c.descriptor_source_kf_gap = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--triangulate_with_e_pose"))
-            c.triangulate_with_e_pose = 1;
-        else if (!strcmp(argv[i], "--triangulate_relative_frame"))
-            c.triangulate_relative_frame = 1;
-        else if (!strcmp(argv[i], "--shape_e_inliers"))
-            c.shape_e_inliers = 1;
-        else if (!strcmp(argv[i], "--e_shape_max_matches") && i + 1 < argc)
-            c.e_shape_max_matches = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--e_shape_grid_cap") && i + 1 < argc)
-            c.e_shape_grid_cap = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--e_shape_max_disp") && i + 1 < argc)
-            c.e_shape_max_disp = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--e_shape_max_fb_err") && i + 1 < argc)
-            c.e_shape_max_fb_err = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--e_shape_target_disp") && i + 1 < argc)
-            c.e_shape_target_disp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--anchor_e_pose"))
             c.anchor_e_pose = 1;
         else if (!strcmp(argv[i], "--anchor_max_features") && i + 1 < argc)
@@ -427,28 +251,6 @@ static Config parse_args(int argc, char **argv) {
             c.anchor_mutual = 1;
         else if (!strcmp(argv[i], "--anchor_ratio") && i + 1 < argc)
             c.anchor_ratio = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_ranked"))
-            c.admission_ranked = 1;
-        else if (!strcmp(argv[i], "--admission_finite_only"))
-            c.admission_finite_only = 1;
-        else if (!strcmp(argv[i], "--admission_batch_ranked"))
-            c.admission_batch_ranked = 1;
-        else if (!strcmp(argv[i], "--admission_batch_deferred")) {
-            c.admission_batch_deferred = 1;
-            c.admission_batch_ranked = 1;
-        }
-        else if (!strcmp(argv[i], "--admission_target_disp") && i + 1 < argc)
-            c.admission_target_disp = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_fb_weight") && i + 1 < argc)
-            c.admission_fb_weight = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_min_inliers") && i + 1 < argc)
-            c.admission_min_inliers = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_pnp_min_inliers") && i + 1 < argc)
-            c.admission_pnp_min_inliers = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_max_new_points") && i + 1 < argc)
-            c.admission_max_new_points = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--admission_grid_cap") && i + 1 < argc)
-            c.admission_grid_cap = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--normalize_world_scale"))
             c.normalize_world_scale = 1;
         else if (!strcmp(argv[i], "--output_smooth_alpha") && i + 1 < argc)
@@ -483,30 +285,10 @@ static Config parse_args(int argc, char **argv) {
             c.output_smooth_low_link_count = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--output_smooth_low_link_include_current") && i + 1 < argc)
             c.output_smooth_low_link_include_current = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_min_obs") && i + 1 < argc)
-            c.candidate_min_obs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_min_age") && i + 1 < argc)
-            c.candidate_min_age = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_grid_cols") && i + 1 < argc)
-            c.candidate_grid_cols = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_grid_rows") && i + 1 < argc)
-            c.candidate_grid_rows = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_promote_per_cell") && i + 1 < argc)
-            c.candidate_promote_per_cell = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_max_fb_err") && i + 1 < argc)
-            c.candidate_max_fb_err = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_min_disp") && i + 1 < argc)
-            c.candidate_min_disp = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--candidate_max_disp") && i + 1 < argc)
-            c.candidate_max_disp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--kf_period") && i + 1 < argc)
             c.kf_period = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--kf_min_interval") && i + 1 < argc)
             c.kf_min_interval = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--healthy_keyframes"))
-            c.healthy_keyframes = 1;
-        else if (!strcmp(argv[i], "--late_kf_cooldown"))
-            c.late_kf_cooldown = 1;
         else if (!strcmp(argv[i], "--ba_interval") && i + 1 < argc)
             c.ba_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ba_start_keyframes") && i + 1 < argc)
@@ -521,81 +303,10 @@ static Config parse_args(int argc, char **argv) {
             c.global_ba_start_keyframes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--global_ba_max_points") && i + 1 < argc)
             c.global_ba_max_points = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--map_hygiene"))
-            c.map_hygiene = 1;
-        else if (!strcmp(argv[i], "--kf_warmup_frames") && i + 1 < argc)
-            c.kf_warmup_frames = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--first_kf_observations"))
-            c.first_kf_observations = 1;
-        else if (!strcmp(argv[i], "--unique_kf_observations"))
-            c.unique_kf_observations = 1;
         else if (!strcmp(argv[i], "--essential_cheirality_max") && i + 1 < argc)
             c.essential_cheirality_max = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_min_parallax_deg") && i + 1 < argc)
-            c.tri_min_parallax_deg = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_max_reproj_px") && i + 1 < argc)
-            c.tri_max_reproj_px = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_max_depth") && i + 1 < argc)
-            c.tri_max_depth = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_max_depth_pnp") && i + 1 < argc)
-            c.tri_max_depth_pnp = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_max_depth_ratio") && i + 1 < argc)
-            c.tri_max_depth_ratio = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--tri_source_kf_gap") && i + 1 < argc)
-            c.tri_source_kf_gap = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_pred_reproj_gate") && i + 1 < argc)
-            c.pnp_pred_reproj_gate = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_quality_gate_px") && i + 1 < argc)
-            c.pnp_quality_gate_px = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_quality_min_obs") && i + 1 < argc)
-            c.pnp_quality_min_obs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_quality_window") && i + 1 < argc)
-            c.pnp_quality_window = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--obs_stat_gate_px") && i + 1 < argc)
-            c.obs_stat_gate_px = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--obs_stat_min_good") && i + 1 < argc)
-            c.obs_stat_min_good = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--obs_stat_max_bad_ratio") && i + 1 < argc)
-            c.obs_stat_max_bad_ratio = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_fallback"))
-            c.pnp_p3p_fallback = 1;
-        else if (!strcmp(argv[i], "--pnp_p3p_observe"))
-            c.pnp_p3p_observe = 1;
-        else if (!strcmp(argv[i], "--pnp_solver") && i + 1 < argc) {
-            const char *name = argv[++i];
-            if (!strcmp(name, "dlt"))
-                c.pnp_p3p_fallback = 0;
-            else if (!strcmp(name, "p3p-numeric"))
-                c.pnp_p3p_fallback = 1;
-            else
-                fprintf(stderr, "unknown --pnp_solver %s (expected dlt or p3p-numeric)\n", name);
-        }
-        else if (!strcmp(argv[i], "--pnp_p3p_iterations") && i + 1 < argc)
-            c.pnp_p3p_iterations = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_max_jump") && i + 1 < argc)
-            c.pnp_p3p_max_jump = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_min_inl2") && i + 1 < argc)
-            c.pnp_p3p_min_inl2 = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_min_gain") && i + 1 < argc)
-            c.pnp_p3p_min_gain = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_max_mederr") && i + 1 < argc)
-            c.pnp_p3p_max_mederr = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_p3p_min_posz") && i + 1 < argc)
-            c.pnp_p3p_min_posz = atof(argv[++i]);
         else if (!strcmp(argv[i], "--pnp_dlt_iters") && i + 1 < argc)
             c.pnp_dlt_iters = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_dlt_pretest") && i + 1 < argc)
-            c.pnp_dlt_pretest = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_dlt_pretest_margin") && i + 1 < argc)
-            c.pnp_dlt_pretest_margin = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_score_rigid"))
-            c.pnp_score_rigid = 1;
-        else if (!strcmp(argv[i], "--pnp_validate_rigid"))
-            c.pnp_validate_rigid = 1;
-        else if (!strcmp(argv[i], "--pnp_validate_rigid_min_points") && i + 1 < argc)
-            c.pnp_validate_rigid_min_points = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pnp_normalize_world"))
-            c.pnp_normalize_world = 1;
         else if (!strcmp(argv[i], "--pnp_low_e_fallback"))
             c.pnp_low_e_fallback = 1;
         else if (!strcmp(argv[i], "--no_pnp_low_e_fallback"))
@@ -614,16 +325,6 @@ static Config parse_args(int argc, char **argv) {
             c.pnp_low_e_min_pose_jump = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ffmpeg_gray"))
             c.ffmpeg_gray = 1;
-        else if (!strcmp(argv[i], "--fast_corners"))
-            c.fast_corners = 1;
-        else if (!strcmp(argv[i], "--distributed_features"))
-            c.distributed_features = 1;
-        else if (!strcmp(argv[i], "--pyramid_features"))
-            c.pyramid_features = 1;
-        else if (!strcmp(argv[i], "--subpixel_features"))
-            c.subpixel_features = 1;
-        else if (!strcmp(argv[i], "--feature_min_dist") && i + 1 < argc)
-            c.feature_min_dist = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lk_iters") && i + 1 < argc)
             c.lk_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lk_back_iters") && i + 1 < argc)
@@ -653,96 +354,14 @@ static Config parse_args(int argc, char **argv) {
         c.new_point_obs = 0;
     if (c.pnp_min_obs < 0)
         c.pnp_min_obs = 0;
-    if (c.pnp_start_frame < 0)
-        c.pnp_start_frame = 0;
-    if (c.delayed_init_frames < 0)
-        c.delayed_init_frames = 0;
-    if (c.candidate_min_obs < 2)
-        c.candidate_min_obs = 2;
-    if (c.candidate_min_age < 1)
-        c.candidate_min_age = 1;
-    if (c.candidate_grid_cols < 1)
-        c.candidate_grid_cols = 1;
-    if (c.candidate_grid_rows < 1)
-        c.candidate_grid_rows = 1;
-    if (c.candidate_promote_per_cell < 0)
-        c.candidate_promote_per_cell = 0;
-    if (c.candidate_max_fb_err < 0.0)
-        c.candidate_max_fb_err = 0.0;
-    if (c.candidate_min_disp < 0.0)
-        c.candidate_min_disp = 0.0;
-    if (c.candidate_max_disp < 0.0)
-        c.candidate_max_disp = 0.0;
-    if (c.descriptor_admission_max_hamming < 0)
-        c.descriptor_admission_max_hamming = 0;
-    if (c.descriptor_admission_ratio < 0.0)
-        c.descriptor_admission_ratio = 0.0;
-    if (c.descriptor_admission_ratio > 1.0)
-        c.descriptor_admission_ratio = 1.0;
     if (c.brief_patch_radius < 0)
         c.brief_patch_radius = 0;
     if (c.brief_patch_radius > 2)
         c.brief_patch_radius = 2;
-    if (c.descriptor_primary_map_cap < 0)
-        c.descriptor_primary_map_cap = 0;
-    if (c.descriptor_source_kf_gap < 0)
-        c.descriptor_source_kf_gap = 0;
-    if (c.kf_warmup_frames < 0)
-        c.kf_warmup_frames = 0;
     if (c.essential_cheirality_max < 0)
         c.essential_cheirality_max = 32;
-    if (c.tri_min_parallax_deg < 0.0)
-        c.tri_min_parallax_deg = 0.0;
-    if (c.tri_max_reproj_px < 0.0)
-        c.tri_max_reproj_px = 0.0;
-    if (c.tri_max_depth < 0.0)
-        c.tri_max_depth = 0.0;
-    if (c.tri_max_depth_pnp < 0.0)
-        c.tri_max_depth_pnp = 0.0;
-    if (c.tri_max_depth_ratio < 0.0)
-        c.tri_max_depth_ratio = 0.0;
-    if (c.tri_source_kf_gap < 0)
-        c.tri_source_kf_gap = 0;
-    if (c.candidate_tracks) {
-        if (c.tri_min_parallax_deg == 0.0)
-            c.tri_min_parallax_deg = 0.5;
-        if (c.tri_max_reproj_px == 0.0)
-            c.tri_max_reproj_px = 8.0;
-    }
-    if (c.pnp_pred_reproj_gate < 0.0)
-        c.pnp_pred_reproj_gate = 0.0;
-    if (c.pnp_quality_gate_px < 0.0)
-        c.pnp_quality_gate_px = 0.0;
-    if (c.pnp_quality_min_obs < 1)
-        c.pnp_quality_min_obs = 1;
-    if (c.pnp_quality_window < 1)
-        c.pnp_quality_window = 1;
-    if (c.obs_stat_gate_px < 0.0)
-        c.obs_stat_gate_px = 0.0;
-    if (c.obs_stat_min_good < 0)
-        c.obs_stat_min_good = 0;
-    if (c.obs_stat_max_bad_ratio < 0.0)
-        c.obs_stat_max_bad_ratio = 0.0;
-    if (c.obs_stat_max_bad_ratio > 1.0)
-        c.obs_stat_max_bad_ratio = 1.0;
-    if (c.pnp_p3p_iterations < 1)
-        c.pnp_p3p_iterations = 1;
-    if (c.pnp_p3p_max_jump < 0.0)
-        c.pnp_p3p_max_jump = 0.0;
-    if (c.pnp_p3p_min_inl2 < 0)
-        c.pnp_p3p_min_inl2 = 0;
-    if (c.pnp_p3p_max_mederr < 0.0)
-        c.pnp_p3p_max_mederr = 0.0;
-    if (c.pnp_p3p_min_posz < 0.0)
-        c.pnp_p3p_min_posz = 0.0;
     if (c.pnp_dlt_iters < 1)
         c.pnp_dlt_iters = 1;
-    if (c.pnp_dlt_pretest < 0)
-        c.pnp_dlt_pretest = 0;
-    if (c.pnp_dlt_pretest_margin < 0)
-        c.pnp_dlt_pretest_margin = 0;
-    if (c.pnp_validate_rigid_min_points < 0)
-        c.pnp_validate_rigid_min_points = 0;
     if (c.pnp_low_e_max_inliers < 0)
         c.pnp_low_e_max_inliers = 0;
     if (c.pnp_low_e_min_inliers < 0)
@@ -763,16 +382,6 @@ static Config parse_args(int argc, char **argv) {
         c.pose_lm_iters = 1;
     if (c.essential_iters < 1)
         c.essential_iters = 1;
-    if (c.e_shape_max_matches < 0)
-        c.e_shape_max_matches = 0;
-    if (c.e_shape_grid_cap < 0)
-        c.e_shape_grid_cap = 0;
-    if (c.e_shape_max_disp < 0.0)
-        c.e_shape_max_disp = 0.0;
-    if (c.e_shape_max_fb_err < 0.0)
-        c.e_shape_max_fb_err = 0.0;
-    if (c.e_shape_target_disp < 0.0)
-        c.e_shape_target_disp = 0.0;
     if (c.anchor_max_features < 0)
         c.anchor_max_features = 0;
     if (c.anchor_max_hamming < 0)
@@ -781,20 +390,6 @@ static Config parse_args(int argc, char **argv) {
         c.anchor_ratio = 0.0;
     if (c.anchor_ratio > 1.0)
         c.anchor_ratio = 1.0;
-    if (c.feature_min_dist < 0)
-        c.feature_min_dist = 0;
-    if (c.admission_target_disp < 0.0)
-        c.admission_target_disp = 0.0;
-    if (c.admission_fb_weight < 0.0)
-        c.admission_fb_weight = 0.0;
-    if (c.admission_min_inliers < 0)
-        c.admission_min_inliers = 0;
-    if (c.admission_pnp_min_inliers < 0)
-        c.admission_pnp_min_inliers = 0;
-    if (c.admission_max_new_points < 0)
-        c.admission_max_new_points = 0;
-    if (c.admission_grid_cap < 0)
-        c.admission_grid_cap = 0;
     if (c.output_smooth_alpha < 0.0)
         c.output_smooth_alpha = 0.0;
     if (c.output_smooth_alpha > 1.0)

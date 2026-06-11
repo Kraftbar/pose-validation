@@ -19,14 +19,17 @@ static int compute_brief(const unsigned char *g, int w, int h, float fx, float f
         return 0;
     double ct = 1.0, st = 0.0;
     if (g_oriented_brief) {
-        double m10 = 0.0, m01 = 0.0;
+        // Intensity-centroid moments; integer sums are exact (|m| << 2^53),
+        // so this matches the previous double accumulation bit for bit.
+        long m10i = 0, m01i = 0;
         for (int dy = -12; dy <= 12; dy++) {
             for (int dx = -12; dx <= 12; dx++) {
-                unsigned char v = g[(cy + dy) * w + (cx + dx)];
-                m10 += (double)dx * (double)v;
-                m01 += (double)dy * (double)v;
+                int v = g[(cy + dy) * w + (cx + dx)];
+                m10i += dx * v;
+                m01i += dy * v;
             }
         }
+        double m10 = (double)m10i, m01 = (double)m01i;
         double norm = sqrt(m10 * m10 + m01 * m01);
         if (norm > 1e-9) {
             ct = m10 / norm;
@@ -109,93 +112,6 @@ static int brief_relink(const unsigned char *g, int w, int h, CornerVec *tracked
         }
     }
     return relinked;
-}
-
-static void build_brief_descriptor_matches(const unsigned char *prev_gray,
-                                           const unsigned char *cur_gray,
-                                           int w, int h,
-                                           const CornerVec *prev_pts,
-                                           const CornerVec *cur_pts,
-                                           int max_hamming, double ratio,
-                                           int mutual,
-                                           MatchVec *out) {
-    out->size = 0;
-    if (prev_pts->size <= 0 || cur_pts->size <= 0)
-        return;
-
-    Brief256 *prev_desc = (Brief256 *)malloc((size_t)prev_pts->size * sizeof(Brief256));
-    Brief256 *cur_desc = (Brief256 *)malloc((size_t)cur_pts->size * sizeof(Brief256));
-    unsigned char *prev_valid = (unsigned char *)calloc((size_t)prev_pts->size, 1);
-    unsigned char *cur_valid = (unsigned char *)calloc((size_t)cur_pts->size, 1);
-    if (!prev_desc || !cur_desc || !prev_valid || !cur_valid) {
-        fprintf(stderr, "out of memory\n");
-        exit(1);
-    }
-    for (int i = 0; i < prev_pts->size; i++)
-        prev_valid[i] = compute_brief(prev_gray, w, h, prev_pts->data[i].x,
-                                      prev_pts->data[i].y, &prev_desc[i]) ? 1 : 0;
-    for (int i = 0; i < cur_pts->size; i++)
-        cur_valid[i] = compute_brief(cur_gray, w, h, cur_pts->data[i].x,
-                                     cur_pts->data[i].y, &cur_desc[i]) ? 1 : 0;
-    int *reverse_best = NULL;
-    if (mutual) {
-        reverse_best = (int *)malloc((size_t)cur_pts->size * sizeof(int));
-        if (!reverse_best) {
-            fprintf(stderr, "out of memory\n");
-            exit(1);
-        }
-        for (int j = 0; j < cur_pts->size; j++) {
-            reverse_best[j] = -1;
-            if (!cur_valid[j])
-                continue;
-            int best = 257, best_idx = -1;
-            for (int i = 0; i < prev_pts->size; i++) {
-                if (!prev_valid[i])
-                    continue;
-                int d = brief_hamming(&cur_desc[j], &prev_desc[i]);
-                if (d < best) {
-                    best = d;
-                    best_idx = i;
-                }
-            }
-            reverse_best[j] = best_idx;
-        }
-    }
-
-    for (int i = 0; i < prev_pts->size; i++) {
-        if (!prev_valid[i])
-            continue;
-        int best = 257, second = 257, best_idx = -1;
-        for (int j = 0; j < cur_pts->size; j++) {
-            if (!cur_valid[j])
-                continue;
-            int d = brief_hamming(&prev_desc[i], &cur_desc[j]);
-            if (d < best) {
-                second = best;
-                best = d;
-                best_idx = j;
-            } else if (d < second) {
-                second = d;
-            }
-        }
-        if (best_idx < 0)
-            continue;
-        if (max_hamming > 0 && best > max_hamming)
-            continue;
-        if (ratio > 0.0 && second < 257 && (double)best >= ratio * (double)second)
-            continue;
-        if (mutual && reverse_best && reverse_best[best_idx] != i)
-            continue;
-        match_vec_push(out, (Match){i, best_idx, (float)best});
-    }
-    if (out->size > 1)
-        qsort(out->data, (size_t)out->size, sizeof(Match), match_cmp_score_asc);
-
-    free(reverse_best);
-    free(prev_desc);
-    free(cur_desc);
-    free(prev_valid);
-    free(cur_valid);
 }
 
 static void anchor_set_free(AnchorSet *a) {

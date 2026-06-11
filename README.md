@@ -71,7 +71,7 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `pure_c_plus` | **0.5716 m** | `python` | 0.6759 m |
+| `test_freiburgdesk525` | `pure_c_plus` | **0.5716 m** | `python` | 0.6870 m |
 | `test_freiburgroom525` | `pure_c_plus` | **1.1799 m** | `cpp` | 1.5452 m |
 | `test_freiburgrpy525` | `pure_c_plus` | **0.0920 m** | `cpp` | 0.0977 m |
 | `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_plus` | 0.1763 m |
@@ -80,19 +80,19 @@ Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 0.6759 | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7572 | **0.5716** |
-| `test_freiburgroom525` | 1.8656 | 1.5452 | 1.8689 | 1.8689 | 1.8518 | 1.8680 | **1.1799** |
-| `test_freiburgrpy525` | 0.0983 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0920** |
-| `test_freiburgxyz525` | 0.1787 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1763 |
+| `test_freiburgdesk525` | 0.6870 | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7577 | **0.5716** |
+| `test_freiburgroom525` | 1.8659 | 1.5452 | 1.8689 | 1.8689 | 1.8518 | 1.8682 | **1.1799** |
+| `test_freiburgrpy525` | 0.0982 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0920** |
+| `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1763 |
 
 Runtime matrix from the same sweep, in seconds:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 15.699 | 7.156 | 30.445 | 32.621 | 40.567 | 30.870 | 35.259 |
-| `test_freiburgroom525` | 15.699 | 7.753 | 31.780 | 25.709 | 43.343 | 33.513 | 43.263 |
-| `test_freiburgrpy525` | 17.169 | 8.404 | 25.277 | 15.746 | 56.450 | 35.441 | 42.380 |
-| `test_freiburgxyz525` | 19.785 | 8.855 | 50.412 | 64.899 | 36.157 | 35.948 | 42.012 |
+| `test_freiburgdesk525` | 16.186 | 7.158 | 31.732 | 32.998 | 41.830 | 31.046 | 28.565 |
+| `test_freiburgroom525` | 15.817 | 7.664 | 32.534 | 27.003 | 45.591 | 36.195 | 34.443 |
+| `test_freiburgrpy525` | 17.895 | 8.646 | 25.527 | 16.560 | 57.018 | 37.569 | 34.583 |
+| `test_freiburgxyz525` | 20.286 | 9.060 | 52.415 | 64.216 | 36.901 | 40.237 | 36.284 |
 
 Mean ATE over the four GT datasets:
 
@@ -100,11 +100,11 @@ Mean ATE over the four GT datasets:
 |------|---------------|---------|-----------|
 | `pure_c_plus` | **0.5050** | **3** | 1 |
 | `cpp` | 0.6338 | 1 | 2 |
-| `python` | 0.7046 | 0 | 1 |
+| `python` | 0.7075 | 0 | 1 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
 | `c` | 0.7258 | 0 | 0 |
 | `pure_c` | 0.7258 | 0 | 0 |
-| `pure_c_orb` | 0.7260 | 0 | 0 |
+| `pure_c_orb` | 0.7262 | 0 | 0 |
 
 ## Benchmark Discipline
 
@@ -405,6 +405,11 @@ Current conclusion:
 
 Do not retry these rejected surgical fixes without a materially new hypothesis:
 
+Note (2026-06-11): the rejected opt-in flags and their code paths were removed
+from `pure_c_plus` in an experiment-residue cleanup (see Design Direction).
+The trial records below stay as the institutional memory; the implementations
+are recoverable from git history at commit `8df5dc7` and earlier.
+
 | Trial | Result |
 |-------|--------|
 | Trust-region LM in `refine_pose_lm` | Regressed all sequences; reduction-ratio retry collapsed map density and moved room to 1.8676. |
@@ -466,6 +471,7 @@ Do not retry these rejected surgical fixes without a materially new hypothesis:
 | Map lifecycle dump (`--map_lifecycle_dump`) | Per-map-point CSV for birth source/method/stats plus final `obs`, `good_obs`, `bad_obs`, last-seen frame, span, and staleness, with `tools/analyze_map_lifecycle.py` for GT-joined summaries. On the current promoted profile, 30s room and desk reproduced 1.6234/0.7327. Default culling leaves all points alive, so lifetime must be read through observation span/staleness: room had median span 6 frames and 14373/16443 points stale by >=100 frames; desk had the same median span and 9286/11031 stale. Room high-error birth frames still correlate with large depth, but desk has similar stale/short-lived high-depth points without >2 m frame errors. This is a better diagnostic view, not a standalone culling/admission policy. Runs: `runs/pure_c_iter/lifecycle_room/`, `runs/pure_c_iter/lifecycle_desk/`. |
 | Lifecycle batch-rule sweep | `tools/sweep_lifecycle_batch_rules.py` tests birth-frame batch predicates against room and desk lifecycle dumps. Future-aware rules using span/staleness can look selective, but they are not live policy candidates. With `--live_only`, the best zero-desk rule (`rows>=100 & med_depth>750k & med_inliers<=60`) catches only 7/66 bad room birth batches, while looser rules catch more room failures but flag desk batches too. This is useful triage, but it does not by itself justify another hard gate. |
 | Live lifecycle batch guard (removed) | A temporary opt-in buffered direct LK admissions and rejected batches matching the best zero-desk live-only lifecycle rule: at least 100 accepted candidates, median depth above 750k, and inliers <=60. The live result did not transfer: it rejected 2079 candidates over 11 room frames, cut the map to 13954 points, and regressed room 30s from 1.6234 to 1.8255. The code was removed. Run: `runs/pure_c_iter/batch_guard_live_room/`. |
+| Descriptor-confidence observation weighting (`--desc_weight_pnp`, `--desc_weight_ba`, `--desc_weight_gate`, `--desc_weight_scale`, `--refine_point_huber`) | Per-corner appearance confidence `weight = exp(-scale * hamming(map_desc, current BRIEF))` fed into PnP LM refinement, local-BA robust weights, a hard BA observation gate, and an optional Huber-ish robust weight in map-point refinement. Every mechanism regressed full 30s desk/room in isolation and in combination (baseline 0.5716/1.1799): all-on 0.6877/1.6057, BA-weight only 0.6943/1.5510, PnP-weight only 0.7026/1.2689, gate-0.5 only 0.7094/1.2525, point-refine Huber only 0.7143/1.5415. The drift-detector reformulation (weight vs per-frame refreshed descriptors via `--update_map_descriptors`) also failed: refresh alone 0.7219/1.2126, refresh+BA-weight 0.6938/1.4415, refresh+gate 0.6889/1.3677. Two conclusions: BRIEF distance to the stored map descriptor grows with viewpoint change, so weighting by it suppresses exactly the wide-baseline observations that constrain geometry best; and map-point refinement is so sensitive that even a plain Huber robust weight there (no descriptors involved) was the worst desk regression of the set. The experiment code was removed after rejection; the probes ran via temporary opt-in knobs whose off-state reproduced canonical ATE exactly. Runs: `runs/pure_c_iter/desc_weight/`. |
 | Trace crossover diagnostic | `tools/analyze_trace_crossover.py` compares two GT-aligned traces, finds sustained frame-error crossovers, and prints rolling delta windows plus pose/map health and inferred keyframe reasons around the crossover. On canonical room, `pure_c_plus` beats C++ strongly in 51:80 (30-frame mean delta -1.196 m), then becomes persistently worse at frame 130 with margin 0.05 for 12 frames. The worst room window is 537:566 (mean delta +1.386 m), driven by low-inlier PnP/E jump frames such as 504, 497, 342, and 208. That window has 14 plus keyframes, 11 inferred from low inliers, but the earlier 115:145 crossover context also has 12/15 low-inlier keyframes while plus is still better than C++, so low-inlier keyframes alone are not the missing signal. Desk's worst 30-frame gap is smaller (+0.365 m at 534:563), and rpy/xyz rolling deltas are only centimeter-scale. This points at room-specific long-run pose/keyframe-map dynamics, not a broad all-sequence scalar fix. |
 | Trace state-window diagnostic | `tools/analyze_trace_state_windows.py` summarizes rolling live-state windows from the metrics JSON: method counts, low-inlier PnP, keyframe reasons, point growth, jump counts, and linked support. The strongest current window-level signal is not a single low-inlier or jump frame, but high recent map growth plus repeated large jumps: `points_added>=1000 & jump500k>=4` flags 46 room windows with 12 high-error windows and 634 high-error room frame hits, while it flags only non-tail desk/rpy/xyz windows under the current diagnostic thresholds. This is still not a live policy by itself because overlapping windows exaggerate counts and suppressing those additions may change the trajectory, but it is a better next hypothesis than direct depth/jump/inlier gates. |
 | Rolling state-window admission guard (removed) | Temporary opt-in used the live prior-30-frame version of the best state-window signal: suppress new landmark admission when the previous 30 frames had at least 1000 added points and at least four `trans_jump > 500k` frames. The timing looked plausible offline: room triggers at 352:365 and 556:585, desk only at 550:558 with no desk tail hits. The live result still did not transfer: room 30s regressed from 1.6234 to 1.6540, although max error fell 6.6242 -> 5.7169 and the map only shrank 16443 -> 16289 points. Code removed. Run: `runs/pure_c_iter/state_window_guard_room/`. |
@@ -528,6 +534,48 @@ the active accuracy target; LOC is only a tiebreaker during this phase.
 Phase 2 starts once the raw-state path, not just the smoothed output trajectory,
 is within about `0.02 m` mean ATE of `cpp`. At that point, reduce and simplify
 the implementation while preserving the validated GT numbers.
+
+Experiment-residue cleanup (2026-06-11): `pure_c_plus` was reduced from 6498 to
+3949 LOC by deleting the code paths behind rejected opt-in flags, with the
+default (promoted) behavior preserved exactly — the full `--all_gt` sweep
+reproduces canonical ATE and identical map point counts on all four GT
+sequences. Removed flag families: `--candidate_*` track promotion,
+`--descriptor_*` admission variants, `--tri_*` triangulation gates,
+`--admission_*` ranking/batch/deferral, `--shape_e_inliers`/`--e_shape_*`,
+`--pnp_p3p_*` numeric P3P, `--pnp_quality_*`/`--obs_stat_*`/
+`--pnp_pred_reproj_gate` masks, `--pnp_score_rigid`/`--pnp_validate_rigid`/
+`--pnp_normalize_world`/`--pnp_dlt_pretest*`, `--fast_corners`/
+`--subpixel_features`/`--feature_min_dist`/`--distributed_features` (the
+two-level pyramid + grid selection is now the only frontend path),
+`--healthy_keyframes`/`--late_kf_cooldown`/`--map_hygiene`/
+`--kf_warmup_frames`/`--first_kf_observations`/`--unique_kf_observations`,
+`--update_map_descriptors`, `--pnp_start_frame`, and `--delayed_init_frames`.
+The `Corner.cand_idx` field, the candidate/admission data structures, and the
+per-frame `pnp_p3p_*` timeline keys in the metrics JSON were removed with them.
+All diagnostics dumps (`--pnp_dump`, `--track_dump`, `--map_admission_*`,
+`--map_lifecycle_dump`, `--e_inlier_dump`) and the BA/anchor/smoother knobs
+remain. Raw-state robustness work (the active blocker) is unaffected; removed
+implementations are recoverable from commit `8df5dc7`.
+
+Bit-exact speed pass (2026-06-12): two output-preserving optimizations make
+`pure_c_plus` roughly 20% faster on the full sweep (room 43.3 s -> 34.4 s, desk
+35.3 s -> 28.6 s in the canonical tables). Harris candidate collection now
+precomputes per-pixel gradient products once instead of recomputing them in
+each of the nine overlapping structure-tensor windows (identical float
+accumulation order), and the BRIEF orientation centroid accumulates its
+moments in integers (the previous double accumulation was already exact, so
+the values match bit for bit). Both changes were verified by per-frame
+`xyz`/`raw_xyz` byte comparison against the pre-change binary, not just ATE.
+A separable rewrite of `blur_3x3` was tried and reverted: bit-exact but slower
+(2.99 s -> 5.31 s on room) because the uint16 intermediate costs more memory
+traffic than the 9-tap recompute saved. Profiling notes for future passes: the
+anchor-E block dominates frame time (extraction ~7.8 s of which the candidate
+qsort is the floor — replacing `qsort` changes float-tie ordering and is NOT
+bit-exact, so that is an algorithm-change experiment, not an optimization);
+LK bilinear sampling (~6 s) could hoist the interpolation weights once per
+iteration since all 49 window samples share the same fractional offsets, but
+the rewrite must preserve `get_pixel_bilinear`'s out-of-bounds-returns-0
+behavior for the ±1 gradient probes at the image border.
 
 Code style is deliberately "math on paper": matrices laid out as grids, one
 equation per line, sparse comments where they clarify non-obvious numerical

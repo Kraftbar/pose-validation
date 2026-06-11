@@ -161,7 +161,7 @@ static void track_corners_pure_lk(const unsigned char *p_g, const unsigned char 
         float fb_err = (dx + back_dx) * (dx + back_dx) + (dy + back_dy) * (dy + back_dy);
         float tx = p.x + dx, ty = p.y + dy;
         if (fb_err < 0.5f && tx >= 2 && tx < w - 2 && ty >= 2 && ty < h - 2) {
-            res[i] = (Corner){tx, ty, p.pt_idx, p.cand_idx, fb_err, sqrtf(dx * dx + dy * dy)};
+            res[i] = (Corner){tx, ty, p.pt_idx, fb_err, sqrtf(dx * dx + dy * dy)};
             ok[i] = 1;
         }
     }
