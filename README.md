@@ -71,7 +71,7 @@ Latest canonical 30-second GT sweep:
 
 | Sequence | Best Impl | Best ATE RMSE | Runner-up | Runner-up ATE RMSE |
 |----------|-----------|---------------|-----------|--------------------|
-| `test_freiburgdesk525` | `pure_c_plus` | **0.5716 m** | `python` | 0.6870 m |
+| `test_freiburgdesk525` | `pure_c_plus` | **0.5716 m** | `python` | 0.6777 m |
 | `test_freiburgroom525` | `pure_c_plus` | **1.1799 m** | `cpp` | 1.5452 m |
 | `test_freiburgrpy525` | `pure_c_plus` | **0.0920 m** | `cpp` | 0.0977 m |
 | `test_freiburgxyz525` | `cpp` | **0.1729 m** | `pure_c_plus` | 0.1763 m |
@@ -80,19 +80,19 @@ Full 4x7 ATE matrix:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 0.6870 | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7577 | **0.5716** |
-| `test_freiburgroom525` | 1.8659 | 1.5452 | 1.8689 | 1.8689 | 1.8518 | 1.8682 | **1.1799** |
-| `test_freiburgrpy525` | 0.0982 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0920** |
-| `test_freiburgxyz525` | 0.1789 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1790 | 0.1763 |
+| `test_freiburgdesk525` | 0.6777 | 0.7194 | 0.7569 | 0.7569 | 0.7198 | 0.7570 | **0.5716** |
+| `test_freiburgroom525` | 1.8660 | 1.5452 | 1.8689 | 1.8689 | 1.8518 | 1.8690 | **1.1799** |
+| `test_freiburgrpy525` | 0.0983 | 0.0977 | 0.0998 | 0.0998 | 0.0992 | 0.0998 | **0.0920** |
+| `test_freiburgxyz525` | 0.1785 | **0.1729** | 0.1777 | 0.1777 | 0.1782 | 0.1789 | 0.1763 |
 
 Runtime matrix from the same sweep, in seconds:
 
 | Sequence | `python` | `cpp` | `c` | `pure_c` | `pure_c_brief` | `pure_c_orb` | `pure_c_plus` |
 |----------|----------|-------|-----|----------|-----------------|--------------|---------------|
-| `test_freiburgdesk525` | 16.186 | 7.158 | 31.732 | 32.998 | 41.830 | 31.046 | 28.565 |
-| `test_freiburgroom525` | 15.817 | 7.664 | 32.534 | 27.003 | 45.591 | 36.195 | 34.443 |
-| `test_freiburgrpy525` | 17.895 | 8.646 | 25.527 | 16.560 | 57.018 | 37.569 | 34.583 |
-| `test_freiburgxyz525` | 20.286 | 9.060 | 52.415 | 64.216 | 36.901 | 40.237 | 36.284 |
+| `test_freiburgdesk525` | 14.225 | 6.619 | 28.810 | 24.524 | 37.688 | 28.720 | 21.012 |
+| `test_freiburgroom525` | 15.684 | 7.318 | 29.674 | 20.061 | 39.276 | 30.103 | 24.841 |
+| `test_freiburgrpy525` | 15.722 | 7.606 | 23.317 | 12.398 | 52.009 | 31.585 | 24.782 |
+| `test_freiburgxyz525` | 17.840 | 8.245 | 47.109 | 47.312 | 32.935 | 33.550 | 24.821 |
 
 Mean ATE over the four GT datasets:
 
@@ -100,7 +100,7 @@ Mean ATE over the four GT datasets:
 |------|---------------|---------|-----------|
 | `pure_c_plus` | **0.5050** | **3** | 1 |
 | `cpp` | 0.6338 | 1 | 2 |
-| `python` | 0.7075 | 0 | 1 |
+| `python` | 0.7051 | 0 | 1 |
 | `pure_c_brief` | 0.7123 | 0 | 0 |
 | `c` | 0.7258 | 0 | 0 |
 | `pure_c` | 0.7258 | 0 | 0 |
@@ -282,14 +282,48 @@ the values match bit for bit). Both changes were verified by per-frame
 `xyz`/`raw_xyz` byte comparison against the pre-change binary, not just ATE.
 A separable rewrite of `blur_3x3` was tried and reverted: bit-exact but slower
 (2.99 s -> 5.31 s on room) because the uint16 intermediate costs more memory
-traffic than the 9-tap recompute saved. Profiling notes for future passes: the
-anchor-E block dominates frame time (extraction ~7.8 s of which the candidate
-qsort is the floor — replacing `qsort` changes float-tie ordering and is NOT
-bit-exact, so that is an algorithm-change experiment, not an optimization);
-LK bilinear sampling (~6 s) could hoist the interpolation weights once per
-iteration since all 49 window samples share the same fractional offsets, but
-the rewrite must preserve `get_pixel_bilinear`'s out-of-bounds-returns-0
-behavior for the ±1 gradient probes at the image border.
+traffic than the 9-tap recompute saved.
+
+LK template hoist (2026-06-12): the third bit-exact pass cut LK tracking from
+5.19 s to 3.36 s on room 30s by sampling each point's template window
+(gradients `Ix`/`Iy` and reference intensities) once per pyramid level instead
+of on every solver iteration — those five of the six bilinear probes per
+window sample depend only on the fixed template position, so only the moving
+`cg`/`p_g` probe stays in the iteration loop. The skip-guard set and float
+accumulation order are unchanged, verified by per-frame `xyz`/`raw_xyz`
+byte-identity on all four 30s sequences. The originally proposed
+shared-bilinear-weight variant was rejected during design: `(lx + l_dx) + x`
+can round when the sum crosses a binade, so the 49 window samples do NOT
+provably share one fractional offset, and per-sample weights were kept for the
+remaining probe. Canonical `pure_c_plus` runtimes after this pass:
+24.2/29.8/30.0/29.8 s for desk/room/rpy/xyz.
+
+Hotspot pass (2026-06-12, second batch): four more bit-exact changes, again
+verified by per-frame `xyz`/`raw_xyz` byte-identity on all four 30s sequences
+plus a clean full sweep. Fine instrumentation first corrected the earlier
+profiling note: the candidate qsort is only ~0.44 s of the ~5.5 s anchor
+extraction — the real costs were the nonmax scan (~3.0 s) and the Jacobi
+eigensolver (~5.9 s of PnP plus shares of essential/triangulate via
+`svd_3x3`; ~87M rotations per room run). The changes: (1) nonmax suppression
+is now a separable 7x7 sliding max — "no neighbor strictly greater" is exactly
+"window max <= val", and max is comparison-only, so the boolean is unchanged;
+(2) `jacobi_nxn` uses a two-pass pivot search (unrolled value-only max
+reduction, then first row-major index holding that value — the same pair the
+branchy argmax picked) and a stack buffer for n <= 12; (3) Harris scratch
+buffers are persistent (they sit above the glibc mmap threshold, so per-call
+malloc/free paid page faults every frame; reuse is safe because every cell
+read is written first on each call); (4) PnP inlier counting bails once even
+counting every remaining candidate cannot beat the best hypothesis (neither
+the best-update nor the 0.8n break can change). Probes that did NOT help and
+were dropped: `sincos` (glibc small-angle sin/cos are already cheap; atan2
+dominates and is value-determining), removing `collapse(2)`, and `omp simd`
+on the response loops (already at their memory/vector floor). Canonical
+`pure_c_plus` runtimes after this pass: 21.0/24.8/24.8/24.8 s — and the
+shared `jacobi_nxn` fix speeds up `c`/`pure_c`/`pure_c_brief`/`pure_c_orb`
+for free (e.g. `pure_c` xyz 61.6 -> 47.3 s). Remaining room 30s hotspots:
+Jacobi trig (~2.8 s, atan2-bound and value-determining), Harris response
+(~2.3 s, fixed accumulation order), BRIEF anchor build (~1.8 s), and
+`gray_blur` (~2.5 s, separable rewrite already tried and rejected).
 
 Code style is deliberately "math on paper": matrices laid out as grids, one
 equation per line, sparse comments where they clarify non-obvious numerical

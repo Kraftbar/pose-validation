@@ -89,23 +89,40 @@ static void track_corners_pure_lk(const unsigned char *p_g, const unsigned char 
             }
             float lx = p.x * sc, ly = p.y * sc;
             float l_dx = dx * sc, l_dy = dy * sc;
+
+            // The template window around (lx, ly) is fixed for all iterations
+            // of this level; only the cg probe at the updated position moves.
+            // Sample its gradients and intensities once instead of per
+            // iteration (same expressions, so the values are bit-identical).
+            float tIx[49], tIy[49], tI[49];
+            int t_ok[49];
+            for (int y = -3; y <= 3; y++)
+                for (int x = -3; x <= 3; x++) {
+                    int k = (y + 3) * 7 + (x + 3);
+                    float cur_x = lx + x, cur_y = ly + y;
+                    t_ok[k] =
+                        !(cur_x < 1 || cur_x >= lw - 1 || cur_y < 1 || cur_y >= lh - 1);
+                    if (!t_ok[k])
+                        continue;
+                    tIx[k] = (get_pixel_bilinear(pg, lw, lh, cur_x + 1, cur_y) -
+                              get_pixel_bilinear(pg, lw, lh, cur_x - 1, cur_y)) *
+                             0.5f;
+                    tIy[k] = (get_pixel_bilinear(pg, lw, lh, cur_x, cur_y + 1) -
+                              get_pixel_bilinear(pg, lw, lh, cur_x, cur_y - 1)) *
+                             0.5f;
+                    tI[k] = get_pixel_bilinear(pg, lw, lh, cur_x, cur_y);
+                }
             for (int it = 0; it < lk_iters; it++) {
                 float G[4] = {0}, b[2] = {0};
                 for (int y = -3; y <= 3; y++)
                     for (int x = -3; x <= 3; x++) {
-                        float cur_x = lx + x, cur_y = ly + y, nxt_x = lx + l_dx + x,
-                              nxt_y = ly + l_dy + y;
-                        if (cur_x < 1 || cur_x >= lw - 1 || cur_y < 1 || cur_y >= lh - 1 ||
-                            nxt_x < 1 || nxt_x >= lw - 1 || nxt_y < 1 || nxt_y >= lh - 1)
+                        int k = (y + 3) * 7 + (x + 3);
+                        float nxt_x = lx + l_dx + x, nxt_y = ly + l_dy + y;
+                        if (!t_ok[k] || nxt_x < 1 || nxt_x >= lw - 1 || nxt_y < 1 ||
+                            nxt_y >= lh - 1)
                             continue;
-                        float Ix = (get_pixel_bilinear(pg, lw, lh, cur_x + 1, cur_y) -
-                                    get_pixel_bilinear(pg, lw, lh, cur_x - 1, cur_y)) *
-                                   0.5f;
-                        float Iy = (get_pixel_bilinear(pg, lw, lh, cur_x, cur_y + 1) -
-                                    get_pixel_bilinear(pg, lw, lh, cur_x, cur_y - 1)) *
-                                   0.5f;
-                        float It = get_pixel_bilinear(cg, lw, lh, nxt_x, nxt_y) -
-                                   get_pixel_bilinear(pg, lw, lh, cur_x, cur_y);
+                        float Ix = tIx[k], Iy = tIy[k];
+                        float It = get_pixel_bilinear(cg, lw, lh, nxt_x, nxt_y) - tI[k];
                         G[0] += Ix * Ix;
                         G[1] += Ix * Iy;
                         G[3] += Iy * Iy;
@@ -127,23 +144,38 @@ static void track_corners_pure_lk(const unsigned char *p_g, const unsigned char 
             dy = l_dy / sc;
         }
         float back_dx = -dx, back_dy = -dy;
+
+        // Same hoist for the backward check: the template window around the
+        // forward-tracked position (p.x + dx, p.y + dy) is fixed; only the
+        // p_g probe moves with the backward flow.
+        float bIx[49], bIy[49], bI[49];
+        int b_ok[49];
+        for (int y = -3; y <= 3; y++)
+            for (int x = -3; x <= 3; x++) {
+                int k = (y + 3) * 7 + (x + 3);
+                float cur_x = p.x + dx + x, cur_y = p.y + dy + y;
+                b_ok[k] = !(cur_x < 1 || cur_x >= w - 1 || cur_y < 1 || cur_y >= h - 1);
+                if (!b_ok[k])
+                    continue;
+                bIx[k] = (get_pixel_bilinear(c_g, w, h, cur_x + 1, cur_y) -
+                          get_pixel_bilinear(c_g, w, h, cur_x - 1, cur_y)) *
+                         0.5f;
+                bIy[k] = (get_pixel_bilinear(c_g, w, h, cur_x, cur_y + 1) -
+                          get_pixel_bilinear(c_g, w, h, cur_x, cur_y - 1)) *
+                         0.5f;
+                bI[k] = get_pixel_bilinear(c_g, w, h, cur_x, cur_y);
+            }
         for (int it = 0; it < lk_back_iters; it++) {
             float G[4] = {0}, b[2] = {0};
             for (int y = -3; y <= 3; y++)
                 for (int x = -3; x <= 3; x++) {
-                    float cur_x = p.x + dx + x, cur_y = p.y + dy + y,
-                          nxt_x = p.x + dx + back_dx + x, nxt_y = p.y + dy + back_dy + y;
-                    if (cur_x < 1 || cur_x >= w - 1 || cur_y < 1 || cur_y >= h - 1 || nxt_x < 1 ||
-                        nxt_x >= w - 1 || nxt_y < 1 || nxt_y >= h - 1)
+                    int k = (y + 3) * 7 + (x + 3);
+                    float nxt_x = p.x + dx + back_dx + x, nxt_y = p.y + dy + back_dy + y;
+                    if (!b_ok[k] || nxt_x < 1 || nxt_x >= w - 1 || nxt_y < 1 ||
+                        nxt_y >= h - 1)
                         continue;
-                    float Ix = (get_pixel_bilinear(c_g, w, h, cur_x + 1, cur_y) -
-                                get_pixel_bilinear(c_g, w, h, cur_x - 1, cur_y)) *
-                               0.5f;
-                    float Iy = (get_pixel_bilinear(c_g, w, h, cur_x, cur_y + 1) -
-                                get_pixel_bilinear(c_g, w, h, cur_x, cur_y - 1)) *
-                               0.5f;
-                    float It = get_pixel_bilinear(p_g, w, h, nxt_x, nxt_y) -
-                               get_pixel_bilinear(c_g, w, h, cur_x, cur_y);
+                    float Ix = bIx[k], Iy = bIy[k];
+                    float It = get_pixel_bilinear(p_g, w, h, nxt_x, nxt_y) - bI[k];
                     G[0] += Ix * Ix;
                     G[1] += Ix * Iy;
                     G[3] += Iy * Iy;

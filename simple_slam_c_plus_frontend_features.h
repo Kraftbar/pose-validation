@@ -72,13 +72,19 @@ static void corner_score_vec_push(CornerScore **data, int *size, int *cap, Corne
 
 static void collect_harris_candidates(const unsigned char *g, int w, int h, float scale,
                                       CornerScore **cand, int *cand_size, int *cand_cap) {
-    float *s = calloc((size_t)w * h, sizeof(float));
-    float *gxx = malloc((size_t)w * h * sizeof(float));
-    float *gyy = malloc((size_t)w * h * sizeof(float));
-    float *gxy = malloc((size_t)w * h * sizeof(float));
-    if (!s || !gxx || !gyy || !gxy) {
-        fprintf(stderr, "out of memory\n");
-        exit(1);
+    // Persistent scratch: these buffers sit above the glibc mmap threshold, so
+    // a fresh malloc/free per call costs page faults every frame. Reuse is safe
+    // without clearing because every cell read below is written first on this
+    // call (responses cover [2,h-2)x[2,w-2) and all later reads stay inside).
+    static float *s = NULL, *gxx = NULL, *gyy = NULL, *gxy = NULL;
+    static size_t scratch_cap = 0;
+    if ((size_t)w * h > scratch_cap) {
+        scratch_cap = (size_t)w * h;
+        s = (float *)xrealloc(s, scratch_cap * sizeof(float));
+        gxx = (float *)xrealloc(gxx, scratch_cap * sizeof(float));
+        gyy = (float *)xrealloc(gyy, scratch_cap * sizeof(float));
+        gxy = (float *)xrealloc(gxy, scratch_cap * sizeof(float));
+        memset(s, 0, scratch_cap * sizeof(float));
     }
 
     // Per-pixel gradient products, computed once and reused by all nine
@@ -109,22 +115,41 @@ static void collect_harris_candidates(const unsigned char *g, int w, int h, floa
             float det = Ixx * Iyy - Ixy * Ixy, tr = Ixx + Iyy;
             s[y * w + x] = 0.5f * (tr - sqrtf(tr * tr - 4.0f * det + 1e-6f));
         }
-    free(gxx);
-    free(gyy);
-    free(gxy);
+    // Separable 7x7 sliding max for nonmax suppression; gxx/gyy are dead after
+    // the response pass and are reused as the two max planes. The suppression
+    // test "no neighbor strictly greater" is exactly "window max <= val", and
+    // max is comparison-only, so this is the same boolean as the direct scan.
+    float *hmax = gxx, *wmax = gyy;
+#pragma omp parallel for
+    for (int y = 2; y < h - 2; y++)
+        for (int x = 5; x < w - 5; x++) {
+            float m = s[y * w + x - 3];
+            for (int j = -2; j <= 3; j++) {
+                float v = s[y * w + x + j];
+                if (v > m)
+                    m = v;
+            }
+            hmax[y * w + x] = m;
+        }
+#pragma omp parallel for
+    for (int y = 5; y < h - 5; y++)
+        for (int x = 5; x < w - 5; x++) {
+            float m = hmax[(y - 3) * w + x];
+            for (int i = -2; i <= 3; i++) {
+                float v = hmax[(y + i) * w + x];
+                if (v > m)
+                    m = v;
+            }
+            wmax[y * w + x] = m;
+        }
     for (int y = 5; y < h - 5; y++)
         for (int x = 5; x < w - 5; x++) {
             float val = s[y * w + x];
             if (val < 0.1f)
                 continue;
-            int ok = 1;
-            for (int i = -3; i <= 3 && ok; i++)
-                for (int j = -3; j <= 3; j++)
-                    if (s[(y + i) * w + x + j] > val) {
-                        ok = 0;
-                        break;
-                    }
-            if (ok) {
+            if (wmax[y * w + x] > val)
+                continue;
+            {
                 // Score-weighted centroid over the 3x3 neighborhood.
                 float sum = 0, sx = 0, sy = 0;
                 for (int i = -1; i <= 1; i++)
@@ -143,7 +168,6 @@ static void collect_harris_candidates(const unsigned char *g, int w, int h, floa
                 }
             }
         }
-    free(s);
 }
 
 // Two-level Harris pyramid with grid-balanced selection (the promoted profile).

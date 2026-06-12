@@ -8,27 +8,51 @@
 // Jacobi eigendecomposition of a symmetric n×n matrix:  A · V = V · diag(W).
 // Iteratively rotates out the largest off-diagonal element until convergence.
 static void jacobi_nxn(const double *A, int n, double *W, double *V) {
-    double *M = malloc(n * n * sizeof(double));
+    double Mbuf[144];
+    double *M = n <= 12 ? Mbuf : malloc(n * n * sizeof(double));
     memcpy(M, A, n * n * sizeof(double));
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++)
             V[i * n + j] = (i == j) ? 1.0 : 0.0;
     }
     for (int iter = 0; iter < 100; iter++) {
-        double max_offdiag = 0.0;
-        int p = 0, q = 1;
+        // Two-pass pivot search. The branchy single-pass argmax serializes on
+        // its index updates; a value-only reduction compiles to branchless max
+        // and four lanes hide its latency. The maximum of a set is the same in
+        // any order, and the follow-up scan takes the first row-major entry
+        // holding that value — exactly the pair the single-pass scan picked.
+        double m0 = 0.0, m1 = 0.0, m2 = 0.0, m3 = 0.0;
         for (int i = 0; i < n - 1; i++) {
-            for (int j = i + 1; j < n; j++) {
-                double val = fabs(M[i * n + j]);
-                if (val > max_offdiag) {
-                    max_offdiag = val;
-                    p = i;
-                    q = j;
-                }
+            const double *row = M + i * n;
+            int j = i + 1;
+            for (; j + 3 < n; j += 4) {
+                double v0 = fabs(row[j]), v1 = fabs(row[j + 1]),
+                       v2 = fabs(row[j + 2]), v3 = fabs(row[j + 3]);
+                m0 = v0 > m0 ? v0 : m0;
+                m1 = v1 > m1 ? v1 : m1;
+                m2 = v2 > m2 ? v2 : m2;
+                m3 = v3 > m3 ? v3 : m3;
+            }
+            for (; j < n; j++) {
+                double v = fabs(row[j]);
+                m0 = v > m0 ? v : m0;
             }
         }
+        double max_offdiag = m0;
+        if (m1 > max_offdiag) max_offdiag = m1;
+        if (m2 > max_offdiag) max_offdiag = m2;
+        if (m3 > max_offdiag) max_offdiag = m3;
         if (max_offdiag < 1e-15)
             break;
+        int p = 0, q = 1, found = 0;
+        for (int i = 0; i < n - 1 && !found; i++)
+            for (int j = i + 1; j < n; j++)
+                if (fabs(M[i * n + j]) == max_offdiag) {
+                    p = i;
+                    q = j;
+                    found = 1;
+                    break;
+                }
         double app = M[p * n + p], aqq = M[q * n + q], apq = M[p * n + q];
         double phi = 0.5 * atan2(2.0 * apq, aqq - app);
         double c = cos(phi), s = sin(phi);
@@ -50,7 +74,8 @@ static void jacobi_nxn(const double *A, int n, double *W, double *V) {
     }
     for (int i = 0; i < n; i++)
         W[i] = M[i * n + i];
-    free(M);
+    if (M != Mbuf)
+        free(M);
 }
 
 // SVD of a 3×3 matrix:  A = U · diag(W) · V^T.

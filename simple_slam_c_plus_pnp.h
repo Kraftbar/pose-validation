@@ -3,7 +3,7 @@
 
 static int count_pnp_linear_inliers(const Map *map, const CornerVec *corners, const int *ids,
                                     int n, double fx, double fy, double cx, double cy,
-                                    const double P[12]) {
+                                    const double P[12], int best_so_far) {
     double R[9] = {P[0], P[1], P[2], P[4], P[5], P[6], P[8], P[9], P[10]},
            t[3] = {P[3], P[7], P[11]};
     double norm = sqrt(R[6] * R[6] + R[7] * R[7] + R[8] * R[8]);
@@ -19,6 +19,12 @@ static int count_pnp_linear_inliers(const Map *map, const CornerVec *corners, co
     int limit = n;
     int inl = 0;
     for (int j = 0; j < limit; j++) {
+        // Once even counting every remaining candidate cannot beat the best
+        // hypothesis, the exact count no longer matters: the RANSAC loop only
+        // uses it for "inl > best" (false either way) and "inl > 0.8 n" (the
+        // loop would already have broken if best exceeded that), so bail out.
+        if (inl + (limit - j) <= best_so_far)
+            return inl;
         MapPoint p = map->data[corners->data[ids[j]].pt_idx];
         double cx_p = R[0] * p.x + R[1] * p.y + R[2] * p.z + t[0],
                cy_p = R[3] * p.x + R[4] * p.y + R[5] * p.z + t[1],
@@ -115,7 +121,7 @@ static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx
             }
         for (int j = 0; j < 12; j++)
             P[j] = V[j * 12 + bi];
-        int inl = count_pnp_linear_inliers(map, corners, ids, n, fx, fy, cx, cy, P);
+        int inl = count_pnp_linear_inliers(map, corners, ids, n, fx, fy, cx, cy, P, best_inl);
         if (inl > best_inl) {
             best_inl = inl;
             memcpy(best_P, P, 12 * sizeof(double));
