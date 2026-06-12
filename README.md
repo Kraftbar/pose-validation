@@ -239,12 +239,21 @@ walks the centers. Two map-anchored scale calibrations were then rejected
 (see the trials log): `--tri_map_scale` at the triangulation level and
 `--e_step_map_scale` at the pose-composition level. Both improved room 8s
 (~0.31 vs 0.34) and regressed both sequences at 30s, because a relative
-anchor rides on the drifting map instead of stopping the drift. Conclusion:
-relative (map-anchored) scale calibration is ruled out at both levels; a fix
-for the scale feedback needs a signal that does not itself derive from the
-drifting map/pose state — e.g. enforcing inter-frame translation-magnitude
-continuity through the E handoffs, or making PnP the actual primary method so
-E never free-runs for hundreds of consecutive frames.
+anchor rides on the drifting map instead of stopping the drift. A third probe
+(`--e_step_continuity`, see the trials log) then ruled out the non-map
+temporal prior as well: rescaling E steps to the rolling median step
+magnitude contained the alignment scale but regressed ATE in every variant
+(hard override room 8s 0.618, gated 0.485 vs 0.338 baseline; gated 30s
+room 1.405 / desk 0.639). The series exposed why: under Sim3 alignment the
+scale runaway acts as implicit error weighting — the exploded late section
+dominates the fit and hides early errors, so canonical ATE partially
+*benefits* from the pathology. Conclusions: scale calibration alone (map
+anchored or temporal) is ruled out; any scale fix must land together with a
+genuine geometry improvement or reported ATE gets worse. The remaining
+direction is structural: make PnP genuinely primary (E currently free-runs
+~90% of frames after frame 100) so the uncalibrated E step never compounds —
+which loops back to map quality, since PnP loses primacy exactly because the
+map it solves against is born bad.
 
 Do not retry rejected surgical fixes without a materially new hypothesis: the
 full trial-by-trial log (100 entries with numbers, run folders, and
