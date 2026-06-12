@@ -51,7 +51,7 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             "\"anchor_e_pose\": %d, \"anchor_max_features\": %d, "
             "\"anchor_max_hamming\": %d, \"anchor_mutual\": %d, "
             "\"anchor_ratio\": %f, "
-            "\"normalize_world_scale\": %d, "
+            "\"normalize_world_scale\": %d, \"tri_map_scale\": %d, "
             "\"output_smooth_alpha\": %f, "
             "\"output_smooth_outlier_alpha\": %f, "
             "\"output_smooth_residual_k\": %f, "
@@ -92,7 +92,7 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
             cfg->anchor_e_pose,
             cfg->anchor_max_features, cfg->anchor_max_hamming, cfg->anchor_mutual,
             cfg->anchor_ratio,
-            cfg->normalize_world_scale, cfg->output_smooth_alpha,
+            cfg->normalize_world_scale, cfg->tri_map_scale, cfg->output_smooth_alpha,
             cfg->output_smooth_outlier_alpha, cfg->output_smooth_residual_k,
             cfg->output_smooth_window,
             cfg->output_smooth_unstable_alpha,

@@ -218,6 +218,26 @@ Current conclusion:
 - Future raw-pose improvements should compare both `xyz` and `raw_xyz`, because
   smoothing can hide but not remove map-state pathologies.
 
+### Birth-geometry finding (2026-06-12)
+
+Fresh admission-detail dumps on the current profile pinned the bad-birth
+mechanism. The E-inlier mask that gates admission certifies the *re-estimated
+E geometry* (Sampson threshold 1e-4 normalized, ~5 px), but triangulation then
+uses the *world pose pair* — a different geometry. Accepted-birth depth tracks
+the world baseline almost exactly (corr 0.947 in log space), 82% of room
+births triangulate across a baseline above 1e4 world units at ~90 px birth
+reprojection, and the rare baseline<1 births are C++-quality (depth ~1.1,
+0.56 px). Both room and desk show the same consecutive-frame world-baseline
+explosion (~2 -> 1e5 within 200 frames, ~15%/frame compounding during
+unstable stretches), so scale runaway alone does not separate the sequences.
+Anchoring new births to the current map scale via the E pose
+(`--tri_map_scale`, see the trials log) contained the scale at 8s but not at
+30s and regressed reported ATE on both sequences: the anchor is relative, so
+it propagates pose-side drift instead of stopping it. The next materially new
+hypothesis must address the *pose-side* scale feedback (PnP translations
+against the deep-skewed map re-amplifying scale each frame), not triangulation
+in isolation.
+
 Do not retry rejected surgical fixes without a materially new hypothesis: the
 full trial-by-trial log (100 entries with numbers, run folders, and
 conclusions) lives in `docs/rejected_trials.md`. The headline dead ends: LM

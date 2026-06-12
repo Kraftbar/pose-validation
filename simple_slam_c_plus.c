@@ -579,6 +579,23 @@ static int triangulate_point(const Pose *p1, const Pose *p2, Corner pt1, Corner 
     return (isfinite(X[0]) && z1 > 0 && z2 > 0);
 }
 
+static double pose_point_depth(const Pose *pose, const double X[3]) {
+    double R[9], t[3];
+    pose_get_rotation(pose, R);
+    pose_get_translation(pose, t);
+
+    return R[6]*X[0] + R[7]*X[1] + R[8]*X[2] + t[2];
+}
+
+static int cmp_double_asc(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    if (da < db)
+        return -1;
+    if (da > db)
+        return 1;
+    return 0;
+}
+
 static double reprojection_error_xyz(const Pose *pose, const double X[3], Corner corner,
                                      double fx, double fy, double cx, double cy, double *out_depth) {
     double R[9], t[3];
@@ -1177,14 +1194,17 @@ int main(int argc, char **argv) {
                     double adm_sum_reproj = 0.0, adm_sum_parallax = 0.0, adm_sum_depth = 0.0;
                     double adm_min_depth = DBL_MAX, adm_max_depth = 0.0;
                     Pose admission_pose = pose;
+                    Pose admission_rel;
+                    int have_admission_rel = 0;
                     unsigned char *admission_mask =
                         (active_e_prev == &prev.corners && active_e_cur == &tracked &&
                          active_e_matches == &matches) ? mask : NULL;
                     unsigned char *owned_admission_mask = NULL;
-                    if (active_e_cur != &tracked) {
+                    if (active_e_cur != &tracked || cfg.tri_map_scale) {
                         // Pose E ran on anchors; re-estimate E on the LK matches to get
                         // an inlier mask over prev->tracked correspondences for admission.
-                        Pose admission_rel;
+                        // The map-scale triangulation path also re-estimates so its
+                        // relative pose and mask come from the same geometry.
                         int adm_inl = 0;
                         if (estimate_pose_E(&prev.corners, &tracked, &matches,
                                             fx, fy, cx, cy, &admission_rel,
@@ -1195,10 +1215,63 @@ int main(int argc, char **argv) {
                                                  &prev.corners, &tracked, &matches,
                                                  owned_admission_mask, w, h);
                             admission_mask = owned_admission_mask;
+                            have_admission_rel = 1;
                         } else {
                             free(owned_admission_mask);
                             owned_admission_mask = NULL;
                         }
+                    }
+                    if (cfg.tri_map_scale && have_admission_rel && admission_mask) {
+                        // The world pose pair drifts in scale, so triangulating against
+                        // it bakes the drift into every new landmark (birth depth tracks
+                        // the world baseline almost exactly). The E relative pose carries
+                        // the geometry the inlier mask actually certifies but with an
+                        // arbitrary translation scale; recover that scale from the depth
+                        // ratios of already-linked map points and triangulate new
+                        // landmarks against the rescaled E pose instead.
+                        Pose e_pose;
+                        pose_compose_relative(&admission_rel, &prev.pose, &e_pose);
+                        double *ratios = (double *)malloc((size_t)matches.size * sizeof(double));
+                        int n_ratios = 0;
+                        if (!ratios) {
+                            fprintf(stderr, "out of memory\n");
+                            exit(1);
+                        }
+                        for (int j = 0; j < matches.size; j++) {
+                            if (!admission_mask[j])
+                                continue;
+                            Match am = matches.data[j];
+                            int pi = tracked.data[am.train_idx].pt_idx;
+                            if (pi == -1)
+                                continue;
+                            double Xe[3];
+                            if (!triangulate_point(&prev.pose, &e_pose,
+                                                   prev.corners.data[am.query_idx],
+                                                   tracked.data[am.train_idx],
+                                                   fx, fy, cx, cy, Xe))
+                                continue;
+                            double Xm[3] = {map.data[pi].x, map.data[pi].y, map.data[pi].z};
+
+                            double z_tri = pose_point_depth(&e_pose, Xe);
+                            double z_map = pose_point_depth(&e_pose, Xm);
+                            if (z_tri > 1e-9 && z_map > 1e-9 &&
+                                isfinite(z_tri) && isfinite(z_map))
+                                ratios[n_ratios++] = z_map / z_tri;
+                        }
+                        if (n_ratios >= 8) {
+                            qsort(ratios, (size_t)n_ratios, sizeof(double), cmp_double_asc);
+                            double s = ratios[n_ratios / 2];
+
+                            // Scaling the relative translation by s scales the whole
+                            // two-view triangulation by s about the previous camera
+                            // center, so new births land at the linked points' scale.
+                            Pose rel_scaled = admission_rel;
+                            rel_scaled.m[3]  *= s;
+                            rel_scaled.m[7]  *= s;
+                            rel_scaled.m[11] *= s;
+                            pose_compose_relative(&rel_scaled, &prev.pose, &admission_pose);
+                        }
+                        free(ratios);
                     }
                     for (int j = 0; j < matches.size; j++) {
                         if (!admission_mask || !admission_mask[j])

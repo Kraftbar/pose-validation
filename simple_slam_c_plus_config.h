@@ -56,6 +56,7 @@ typedef struct {
     int anchor_mutual;
     double anchor_ratio;
     int normalize_world_scale;
+    int tri_map_scale;
     double output_smooth_alpha;
     double output_smooth_outlier_alpha;
     double output_smooth_residual_k;
@@ -179,6 +180,7 @@ static Config parse_args(int argc, char **argv) {
         .anchor_mutual = 0,
         .anchor_ratio = 0.80,
         .normalize_world_scale = 0,
+        .tri_map_scale = 0,
         .output_smooth_alpha = 0.040,
         .output_smooth_outlier_alpha = 0.003,
         .output_smooth_residual_k = 3.50,
@@ -253,6 +255,8 @@ static Config parse_args(int argc, char **argv) {
             c.anchor_ratio = atof(argv[++i]);
         else if (!strcmp(argv[i], "--normalize_world_scale"))
             c.normalize_world_scale = 1;
+        else if (!strcmp(argv[i], "--tri_map_scale"))
+            c.tri_map_scale = 1;
         else if (!strcmp(argv[i], "--output_smooth_alpha") && i + 1 < argc)
             c.output_smooth_alpha = atof(argv[++i]);
         else if (!strcmp(argv[i], "--output_smooth_outlier_alpha") && i + 1 < argc)
