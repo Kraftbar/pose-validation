@@ -1,8 +1,10 @@
 # AGENTS.md
 
 Agent-facing rules for this repo. Read `README.md` first for the project guide:
-implementations, benchmark commands, GT dataset list, diagnostics, current
-blockers, rejected trials, and build notes.
+implementations, benchmark commands, GT dataset list, current blockers, and
+build notes. Long-form records live in `docs/`: `docs/rejected_trials.md`
+(every rejected trial with numbers) and `docs/diagnostics.md` (dump/replay
+cookbook).
 
 ## Source of Truth
 
@@ -40,7 +42,7 @@ Use these first when summarizing benchmark state:
 - Watch for silent regressions on other sequences. A neutral ATE with a large
   map-density drop elsewhere is a signal the change trades one failure mode for
   another.
-- Record rejected trials with numbers in `README.md`.
+- Record rejected trials with numbers in `docs/rejected_trials.md`.
 
 ## Parallel Benchmarks
 
@@ -77,7 +79,8 @@ their natural run-to-run variance.
 - Code style is "math on paper": matrices laid out as grids, one equation per
   line, no broad `clang-format` churn.
 - Do not retry rejected `pure_c_plus` room fixes without a materially new
-  hypothesis. README lists the current blocker and rejected attempts.
+  hypothesis. README lists the current blocker; `docs/rejected_trials.md`
+  lists the rejected attempts.
 - The BRIEF loop-detector work is parked on branch `feat/brief-loop-detector`.
 
 ## Git Workflow
