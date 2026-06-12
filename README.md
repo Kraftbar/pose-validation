@@ -230,13 +230,21 @@ reprojection, and the rare baseline<1 births are C++-quality (depth ~1.1,
 0.56 px). Both room and desk show the same consecutive-frame world-baseline
 explosion (~2 -> 1e5 within 200 frames, ~15%/frame compounding during
 unstable stretches), so scale runaway alone does not separate the sequences.
-Anchoring new births to the current map scale via the E pose
-(`--tri_map_scale`, see the trials log) contained the scale at 8s but not at
-30s and regressed reported ATE on both sequences: the anchor is relative, so
-it propagates pose-side drift instead of stopping it. The next materially new
-hypothesis must address the *pose-side* scale feedback (PnP translations
-against the deep-skewed map re-amplifying scale each frame), not triangulation
-in isolation.
+Trace analysis further showed essential is the de-facto primary pose method
+(579/750 room frames, E-fraction ~0.9 after frame 100) and E-method frames
+carry the runaway (median raw step 162k vs 3.7k for PnP frames): the E
+decomposition's unit-norm translation injects an uncalibrated world step at
+every E frame, and once |t| is large, rotation jitter times |t| randomly
+walks the centers. Two map-anchored scale calibrations were then rejected
+(see the trials log): `--tri_map_scale` at the triangulation level and
+`--e_step_map_scale` at the pose-composition level. Both improved room 8s
+(~0.31 vs 0.34) and regressed both sequences at 30s, because a relative
+anchor rides on the drifting map instead of stopping the drift. Conclusion:
+relative (map-anchored) scale calibration is ruled out at both levels; a fix
+for the scale feedback needs a signal that does not itself derive from the
+drifting map/pose state — e.g. enforcing inter-frame translation-magnitude
+continuity through the E handoffs, or making PnP the actual primary method so
+E never free-runs for hundreds of consecutive frames.
 
 Do not retry rejected surgical fixes without a materially new hypothesis: the
 full trial-by-trial log (100 entries with numbers, run folders, and
