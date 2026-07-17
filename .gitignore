@@ -37,3 +37,6 @@ simple_slam_c_brief
 orb_matches.pgm
 *.jpg
 *.pgm
+
+# Agent state (Antigravity CLI) - locked while running, never commit
+.antigravitycli/

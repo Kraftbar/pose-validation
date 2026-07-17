@@ -94,6 +94,14 @@ def main() -> None:
             print(f'twitchslam failed on frame {frame_id}: {exc}', file=sys.stderr)
             break
 
+
+
+
+
+
+
+        
+        
         current = slam.mapp.frames[-1]
         center = pose_to_center(current.pose)
         timeline.append({
