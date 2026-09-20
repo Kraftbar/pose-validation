@@ -10,14 +10,19 @@
 #include <time.h>
 
 #include "pure_c_math.h"
+#include "simple_slam_c_plus_geometry.h"
+
+static int g_geometry_core = 0;
 #include "simple_slam_c_plus_config.h"
 #include "simple_slam_c_plus_image.h"
 
 static void jacobi_9x9(double A[81], double W[9], double V[81]) {
-    jacobi_nxn(A, 9, W, V);
+    if (g_geometry_core) geometry_eigen(A, 9, W, V);
+    else jacobi_nxn(A, 9, W, V);
 }
 static void jacobi_12x12(double A[144], double W[12], double V[144]) {
-    jacobi_nxn(A, 12, W, V);
+    if (g_geometry_core) geometry_eigen(A, 12, W, V);
+    else jacobi_nxn(A, 12, W, V);
 }
 
 #ifndef M_PI
@@ -618,7 +623,8 @@ static double reprojection_error_xyz(const Pose *pose, const double X[3], Corner
 // (Hartley & Zisserman §11.7.3.)
 static void enforce_essential_constraints(double E[9]) {
     double W[3], U[9], V[9], S[9] = {0}, tmp[9], out[9];
-    svd_3x3(E, W, U, V);
+    if (g_geometry_core) geometry_svd3(E, W, U, V);
+    else svd_3x3(E, W, U, V);
 
     double sig = 0.5 * (W[0] + W[1]);
     S[0] = sig;
@@ -626,7 +632,11 @@ static void enforce_essential_constraints(double E[9]) {
     S[8] = 0;
 
     mat3_mul(U, S, tmp);
-    mat3_mul(tmp, V, out);
+    if (g_geometry_core) {
+        double VT[9];
+        mat3_transpose(V, VT);
+        mat3_mul(tmp, VT, out);
+    } else mat3_mul(tmp, V, out);
     memcpy(E, out, 9 * sizeof(double));
 }
 
@@ -643,7 +653,8 @@ static int decompose_and_choose_pose(const double E[9], const CornerVec *p_pts,
     double W[3], U[9], V[9], R1[9], R2[9], t[3];
     Pose cands[4];
     int bi = -1, bc = -1;
-    svd_3x3(E, W, U, V);
+    if (g_geometry_core) geometry_svd3(E, W, U, V);
+    else svd_3x3(E, W, U, V);
 
     t[0] = U[2];
     t[1] = U[5];
@@ -933,6 +944,7 @@ static void maybe_normalize_world_scale(const Config *cfg, Map *map, KFDB *kf_db
 int main(int argc, char **argv) {
     Config cfg = parse_args(argc, argv);
     g_ransac_seed = (unsigned int)cfg.ransac_seed;
+    g_geometry_core = cfg.geometry_core;
     brief_init_pattern();
     g_oriented_brief = cfg.oriented_brief;
     g_brief_patch_radius = cfg.brief_patch_radius;

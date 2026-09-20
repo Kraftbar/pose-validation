@@ -18,6 +18,7 @@ typedef struct {
     const char *map_lifecycle_dump;
     const char *e_inlier_dump;
     int ransac_seed;
+    int geometry_core;
     int kf_min_inliers;
     double kf_max_rot_deg;
     int max_points;
@@ -337,6 +338,8 @@ static Config parse_args(int argc, char **argv) {
             c.pose_lm_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--essential_iters") && i + 1 < argc)
             c.essential_iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--geometry_core"))
+            c.geometry_core = 1;
         else if (!strcmp(argv[i], "--joint_ba"))
             c.joint_ba = 1;
         else if (argv[i][0] != '-')

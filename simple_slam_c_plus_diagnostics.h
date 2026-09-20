@@ -25,8 +25,9 @@ static void write_metrics_json(FILE *f, const Config *cfg, const FrameStatVec *s
     }
     if (s->size > 1)
         av /= (s->size - 1);
+    fprintf(f, "{\n  \"geometry_core\": %d,\n", cfg->geometry_core);
     fprintf(f,
-            "{\n  \"frames\": %d, \"points\": %d, \"duration_sec\": %f, \"video_path\": \"%s\", "
+            "  \"frames\": %d, \"points\": %d, \"duration_sec\": %f, \"video_path\": \"%s\", "
             "\"proc_w\": %d, \"proc_h\": %d, \"keyframes\": %d, \"tri_points_total\": %d, "
             "\"speed_profile\": \"%s\", "
             "\"ransac_seed\": %d, "

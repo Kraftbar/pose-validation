@@ -42,6 +42,8 @@ static int count_pnp_linear_inliers(const Map *map, const CornerVec *corners, co
 static int count_pose_inliers(const Map *map, const CornerVec *corners, double fx, double fy,
                               double cx, double cy, const Pose *pose);
 
+#include "simple_slam_c_plus_geometry_pnp.h"
+
 static int dlt_projection_to_pose(const double P[12], Pose *out_pose) {
     double R[9] = {P[0], P[1], P[2], P[4], P[5], P[6], P[8], P[9], P[10]},
            t[3] = {P[3], P[7], P[11]};
@@ -72,6 +74,9 @@ static int dlt_projection_to_pose(const double P[12], Pose *out_pose) {
 static int estimate_pose_PnP(const Map *map, const CornerVec *corners, double fx, double fy,
                              double cx, double cy, int dlt_iters, int min_obs,
                              Pose *out_pose, int *out_inl) {
+    if (g_geometry_core)
+        return geometry_estimate_pnp(map, corners, fx, fy, cx, cy, dlt_iters,
+                                      min_obs, out_pose, out_inl);
     if (out_inl)
         *out_inl = 0;
     int n = 0;
@@ -268,20 +273,24 @@ static void refine_pose_lm(const Map *map, const CornerVec *corners, double fx, 
         double dx[6];
         if (!solve_6x6(H, b, dx))
             break;
-        t[0] += dx[0];
-        t[1] += dx[1];
-        t[2] += dx[2];
-        double dr[9] = {1, -dx[5], dx[4],
-                        dx[5], 1, -dx[3],
-                        -dx[4], dx[3], 1};
-        double Rn[9];
-        mat3_mul(dr, R, Rn);
-        double W[3], U[9], V[9], VT[9];
-        svd_3x3(Rn, W, U, V);
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++)
-                VT[i * 3 + j] = V[j * 3 + i];
-        mat3_mul(U, VT, R);
+        if (g_geometry_core) {
+            geometry_pose_step(R, t, dx);
+        } else {
+            t[0] += dx[0];
+            t[1] += dx[1];
+            t[2] += dx[2];
+            double dr[9] = {1, -dx[5], dx[4],
+                            dx[5], 1, -dx[3],
+                            -dx[4], dx[3], 1};
+            double Rn[9];
+            mat3_mul(dr, R, Rn);
+            double W[3], U[9], V[9], VT[9];
+            svd_3x3(Rn, W, U, V);
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    VT[i * 3 + j] = V[j * 3 + i];
+            mat3_mul(U, VT, R);
+        }
         if (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2] < 1e-8)
             break;
     }

@@ -218,3 +218,17 @@ reprojection RMSE > 100 px), which is consistent with the trajectory diverging
 before loop closure can fire. The next experiment should be per-point
 reprojection-error filtering before PnP, not another candidate-generator
 variant. (Recorded under `Active Pure-C Blocker` for future sessions.)
+
+## Geometry-core numerical regression tests
+
+`tools/test_plus_geometry.c` checks the opt-in `--geometry_core` implementation:
+SVD rank handling, eigensystems, pose Jacobians, two-view recovery, outlier PnP,
+and pose refinement with a distant world origin.
+
+```bash
+gcc -O2 -fopenmp tools/test_plus_geometry.c -lm -o /tmp/test_plus_geometry
+/tmp/test_plus_geometry
+```
+
+See [the geometry-core experiment report](oneshot_geometry.md) for the full GT
+validation, unchanged-default checks, and rejected rewrite results.

@@ -183,6 +183,14 @@ correspondence diff with its recorded findings — live in
 
 ## Active Pure-C Blocker
 
+The [2026-09-19 geometry-core experiment](docs/oneshot_geometry.md) is available
+behind `--geometry_core`, with numerical regression tests and complete 4x7
+validation. It remains opt-in because desk regresses. Two larger tracking
+rewrites were rejected after losing tracking. The default reproduces the fresh
+original-HEAD timelines exactly. That same-machine baseline does not reproduce
+the historical `pure_c_plus` table above; the report records both the discrepancy
+and the dedicated run folders without replacing the canonical results.
+
 `pure_c_plus` is the active architectural focus and current best pure-C variant
 by reported mean ATE. The promoted default now reports a causal smoothed output
 center (base `output_smooth_alpha=0.040`, outlier
