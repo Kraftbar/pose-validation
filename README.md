@@ -108,26 +108,48 @@ Mean ATE over the four GT datasets:
 
 ## Full-SLAM Comparison (original TUM RGB-D)
 
-Separate from the canonical 30-second GT sweep above: full original TUM
-sequences, scored with `tools/tum_eval.py` (Sim3 ATE over tracked frames /
-coverage). Repo implementations ran on a lossless re-encode with their
-built-in intrinsics. Details, caveats and ORB-SLAM2/DSO rows:
+Separate from the canonical 30-second GT sweep above: five full original TUM
+sequences (fr1_xyz, fr1_desk, fr1_floor, fr2_xyz, fr3_long_office), scored
+with `tools/tum_eval.py` (Sim3 ATE over tracked frames). Details and caveats:
 [docs/slam_candidates_comparison_20260925.md](docs/slam_candidates_comparison_20260925.md).
 
-| System | fr1_xyz | fr1_desk | fr1_floor | fr2_xyz | fr3_long_office | mean ATE (m) |
-|---|---|---|---|---|---|---|
-| stella_vslam (multi-thread, LC on) | 0.025 / 99% | 0.020 / 88% | 0.022 / 98% | 0.004 / 98% | 0.022 / 99% | 0.019 |
-| **stella C port** (`stella_port/`, 1-thread) | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% | 0.024 |
-| `cpp` (repo) | 0.183 / 100% | 0.681 / 100% | 0.533 / 100% | 0.364 / 100% | 1.336 / 100% | 0.619 |
-| `pure_c_plus` (repo) | 0.184 / 100% | 0.759 / 100% | 0.741 / 100% | 0.344 / 100% | 1.884 / 100% | 0.783 |
+### Summary
 
-The stella C port is a clean-room, library-free C99 port of stella_vslam
-(BSD-2; Eigen-derived parts MPL-2.0). It is bit-exact against a deterministic
-single-threaded stella reference (56 harness rows, 0 mismatches,
-`python3 tools/check_stella_port.py`; identical trajectories on all five
-sequences) and runs at 12.5–14.3 ms/frame single-threaded. It is not yet wired
-into `benchmark.py`; adding it requires a full `--all_gt` sweep. Status and
-method: `stella_port/HANDOVER.md`.
+| System | License | Mean ATE | Tracked frames | Speed (× real time) | Notes |
+|---|---|---:|---:|---:|---|
+| stella_vslam (upstream) | BSD-2 | **1.9 cm** | 96% | 1.8–2.5× | C++/OpenCV/Eigen/g2o, multi-thread, loop closing |
+| **stella C port (ours)** | BSD-2 / MPL-2.0 | 2.4 cm | 97% | **2.3–2.9×** | pure C99, no libraries, 1 thread, bit-exact to stella reference |
+| ORB-SLAM2 (upstream) | GPLv3 | 1.9 cm¹ | 67% | 0.2–2.5×² | never initializes on fr1_floor |
+| ORB-SLAM2 C port (ours, not in repo) | GPLv3-derived | 1.6 cm¹ | 67% | 0.2–0.4×² | matches upstream; kept private for licensing |
+| DSO (no photometric calibration) | GPLv3 | 13 cm | 16% | 0.8–3.3× | loses track on most frames |
+| `cpp` (repo) | own | 62 cm | 100% | 2–3× | |
+| `pure_c_plus` (repo) | own | 78 cm | 100% | 0.8–1.25× | best repo pure-C variant |
+| `python`, `c`, `pure_c`, `pure_c_brief`, `pure_c_orb` (repo) | own | 82–86 cm | 100% | — | |
+
+¹ Mean over the 4 sequences where it initializes. ² Single-threaded
+deterministic reference setup with synchronous mapping, not representative of
+normal ORB-SLAM2 speed. Speed = sequence duration / wall time on this machine
+(TUM is 30 Hz; >1× is faster than real time). The stella port reads
+pre-decoded frames (12.5–14.3 ms/frame).
+
+### Per sequence (ATE m / tracked frames)
+
+| System | fr1_xyz | fr1_desk | fr1_floor | fr2_xyz | fr3_long_office |
+|---|---|---|---|---|---|
+| stella_vslam (upstream) | 0.025 / 99% | 0.020 / 88% | 0.022 / 98% | 0.004 / 98% | 0.022 / 99% |
+| **stella C port (ours)** | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% |
+| ORB-SLAM2 (upstream) | 0.011 / 72% | 0.014 / 64% | never inits | 0.018 / 100% | 0.034 / 99% |
+| ORB-SLAM2 C port (ours) | 0.011 / 72% | 0.014 / 64% | never inits | 0.012 / 100% | 0.028 / 99% |
+| DSO | 0.063 / 18% | 0.211 / 24% | 0.258 / 17% | 0.020 / 3% | 0.089 / 19% |
+| `cpp` (repo) | 0.183 / 100% | 0.681 / 100% | 0.533 / 100% | 0.364 / 100% | 1.336 / 100% |
+| `pure_c_plus` (repo) | 0.184 / 100% | 0.759 / 100% | 0.741 / 100% | 0.344 / 100% | 1.884 / 100% |
+
+The stella C port matches the deterministic single-threaded stella reference
+byte-for-byte (identical trajectories on all five sequences; 56 harness rows,
+0 mismatches via `python3 tools/check_stella_port.py`). Its numbers differ from
+the upstream row only because upstream maps asynchronously in threads. It is
+not yet wired into `benchmark.py`; that needs a full `--all_gt` sweep. Status
+and method: `stella_port/HANDOVER.md`.
 
 ## Benchmark Discipline
 
