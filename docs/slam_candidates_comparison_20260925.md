@@ -15,9 +15,19 @@ their built-in (fr1-like / heuristic) intrinsics — no real calibration.
 | stella_vslam (LC off) | BSD-2 | 0.014 / 100% | 0.045 / 91% | 0.173 / 88% | 0.005 / 98% | 0.050 / 99% | 0.057 | 0.4–0.55 |
 | ORB-SLAM2 upstream (1-thread, no LC) | GPLv3 | 0.011 / 72% | 0.014 / 64% | never inits | 0.018 / 100% | 0.034 / 99% | 0.019 (4 seqs) | 0.4–4.1 |
 | ORB-SLAM2 C port (ours, isolated) | GPLv3-derived | 0.011 / 72% | 0.014 / 64% | never inits | 0.012 / 100% | 0.028 / 99% | 0.016 (4 seqs) | 2.8–6.2 |
+| stella_vslam C port (ours, 1-thread deterministic) | BSD-2 / MPL-2.0 | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% | 0.024 | 0.37–0.43 |
+| stella_vslam (1-thread deterministic reference) | BSD-2 | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% | 0.024 | 0.42–0.48 |
 | DSO (no photometric calib) | GPLv3 | 0.063 / 18% | 0.211 / 24% | 0.258 / 17% | 0.020 / 3% | 0.089 / 19% | 0.128 | 0.3–1.3 |
 | cpp (repo) | own | 0.183 / 100% | 0.681 / 100% | 0.533 / 100% | 0.364 / 100% | 1.336 / 100% | 0.619 | 0.3–0.5 |
 | pure_c_plus (repo) | own | 0.184 / 100% | 0.759 / 100% | 0.741 / 100% | 0.344 / 100% | 1.884 / 100% | 0.783 | 0.8–1.25 |
+
+Update 2026-10-01: the pure-C stella port (`stella_port/`) reproduces the
+deterministic single-threaded stella reference byte-for-byte on all five
+sequences (identical trajectories, so identical ATE); RTF is from
+`sv_run` on pre-decoded frames (12.5–14.3 ms/frame) vs the reference with
+PNG decode (13.9–15.9 ms/frame). The deterministic rows differ from the
+multi-threaded stella_vslam row because mapping runs synchronously.
+See `stella_port/HANDOVER.md`.
 
 Other repo impls (python, c, pure_c, pure_c_brief, pure_c_orb): mean 0.82–0.86 m, 100% coverage.
 *RTF = wall time / sequence duration (<1 = faster than real time). stella_vslam and DSO

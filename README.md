@@ -106,6 +106,29 @@ Mean ATE over the four GT datasets:
 | `pure_c` | 0.7258 | 0 | 0 |
 | `pure_c_orb` | 0.7262 | 0 | 0 |
 
+## Full-SLAM Comparison (original TUM RGB-D)
+
+Separate from the canonical 30-second GT sweep above: full original TUM
+sequences, scored with `tools/tum_eval.py` (Sim3 ATE over tracked frames /
+coverage). Repo implementations ran on a lossless re-encode with their
+built-in intrinsics. Details, caveats and ORB-SLAM2/DSO rows:
+[docs/slam_candidates_comparison_20260925.md](docs/slam_candidates_comparison_20260925.md).
+
+| System | fr1_xyz | fr1_desk | fr1_floor | fr2_xyz | fr3_long_office | mean ATE (m) |
+|---|---|---|---|---|---|---|
+| stella_vslam (multi-thread, LC on) | 0.025 / 99% | 0.020 / 88% | 0.022 / 98% | 0.004 / 98% | 0.022 / 99% | 0.019 |
+| **stella C port** (`stella_port/`, 1-thread) | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% | 0.024 |
+| `cpp` (repo) | 0.183 / 100% | 0.681 / 100% | 0.533 / 100% | 0.364 / 100% | 1.336 / 100% | 0.619 |
+| `pure_c_plus` (repo) | 0.184 / 100% | 0.759 / 100% | 0.741 / 100% | 0.344 / 100% | 1.884 / 100% | 0.783 |
+
+The stella C port is a clean-room, library-free C99 port of stella_vslam
+(BSD-2; Eigen-derived parts MPL-2.0). It is bit-exact against a deterministic
+single-threaded stella reference (56 harness rows, 0 mismatches,
+`python3 tools/check_stella_port.py`; identical trajectories on all five
+sequences) and runs at 12.5–14.3 ms/frame single-threaded. It is not yet wired
+into `benchmark.py`; adding it requires a full `--all_gt` sweep. Status and
+method: `stella_port/HANDOVER.md`.
+
 ## Benchmark Discipline
 
 **Hard rule:** any change to SLAM algorithm code or benchmark plumbing must be
