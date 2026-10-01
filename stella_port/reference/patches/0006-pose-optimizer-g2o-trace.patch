@@ -1,0 +1,185 @@
+--- a/src/stella_vslam/optimize/pose_optimizer_g2o.h
++++ b/src/stella_vslam/optimize/pose_optimizer_g2o.h
+@@ -5,6 +5,9 @@
+ 
+ #include "stella_vslam/type.h"
+ 
++#include <string>
++#include <vector>
++
+ namespace stella_vslam {
+ 
+ namespace data {
+@@ -23,6 +26,44 @@
+ 
+ namespace optimize {
+ 
++// [reference-port] one real pose_optimizer_g2o::optimize() call, captured
++// verbatim from whatever public-API caller invoked it (frame tracking,
++// relocalization, loop-detector Sim3 verification, ...) -- see
++// stella_port/HANDOVER.md module-4b note and
++// stella_port/reference_g2o/README.md for the capture/validation contract.
++// Deliberately does NOT reach into g2o internals (no per-iteration
++// chi2/lambda/accept-reject trace): g2o::OptimizationAlgorithmLevenberg
++// exposes no such hook through SparseOptimizer's public API without
++// patching g2o itself, which is out of scope for this leaf -- see the
++// note in pose_optimizer_g2o_trace_entry below.
++struct pose_optimizer_g2o_obs_trace {
++    unsigned int idx = 0; // undist_keypts_ index (== outlier_flags_ index)
++    double x = 0, y = 0;  // undistorted keypoint pixel coords
++    int octave = 0;
++    float inv_sigma_sq = 0;
++    double pos_w[3] = {0, 0, 0}; // landmark world position at call time
++};
++
++struct pose_optimizer_g2o_trace_entry {
++    unsigned int call_index = 0;
++    std::string call_site; // "frame", "keyframe", "raw" (which public overload)
++    double fx = 0, fy = 0, cx = 0, cy = 0;
++    double cam_pose_cw_initial[16] = {}; // row-major Mat44_t, as util::converter would write it
++    std::vector<pose_optimizer_g2o_obs_trace> obs;
++    unsigned int num_trials_robust = 0, num_trials = 0, num_each_iter = 0;
++    // outputs
++    double cam_pose_cw_final[16] = {};
++    std::vector<unsigned char> outlier_flags; // one entry per undist_keypts_ index (0/1), regardless of obs validity
++    unsigned int num_valid_obs = 0;
++};
++
++// [reference-port] global capture buffer; single-threaded reference driver
++// only, so no locking. Disabled (no-op, zero overhead beyond a branch) by
++// default so normal (non-dump) reference runs are unaffected.
++void pose_optimizer_g2o_trace_enable(bool enabled);
++void pose_optimizer_g2o_trace_clear();
++const std::vector<pose_optimizer_g2o_trace_entry>& pose_optimizer_g2o_trace_get();
++
+ class pose_optimizer_g2o : public pose_optimizer {
+ public:
+     /**
+--- a/src/stella_vslam/optimize/pose_optimizer_g2o.cc
++++ b/src/stella_vslam/optimize/pose_optimizer_g2o.cc
+@@ -5,6 +5,7 @@
+ #include "stella_vslam/optimize/terminate_action.h"
+ #include "stella_vslam/optimize/internal/se3/pose_opt_edge_wrapper.h"
+ #include "stella_vslam/util/converter.h"
++#include "stella_vslam/camera/perspective.h"
+ 
+ #include <vector>
+ #include <mutex>
+@@ -20,16 +21,34 @@
+ namespace stella_vslam {
+ namespace optimize {
+ 
++// [reference-port] see pose_optimizer_g2o.h. Single-threaded reference
++// driver only -- no synchronization.
++namespace {
++bool g_trace_enabled = false;
++unsigned int g_trace_call_index = 0;
++std::vector<pose_optimizer_g2o_trace_entry> g_trace;
++std::string g_next_call_site = "raw";
++} // namespace
++
++void pose_optimizer_g2o_trace_enable(bool enabled) { g_trace_enabled = enabled; }
++void pose_optimizer_g2o_trace_clear() {
++    g_trace.clear();
++    g_trace_call_index = 0;
++}
++const std::vector<pose_optimizer_g2o_trace_entry>& pose_optimizer_g2o_trace_get() { return g_trace; }
++
+ pose_optimizer_g2o::pose_optimizer_g2o(const unsigned int num_trials_robust, const unsigned int num_trials, const unsigned int num_each_iter)
+     : num_trials_robust_(num_trials_robust), num_trials_(num_trials), num_each_iter_(num_each_iter) {}
+ 
+ unsigned int pose_optimizer_g2o::optimize(const data::frame& frm, Mat44_t& optimized_pose, std::vector<bool>& outlier_flags) const {
++    g_next_call_site = "frame";
+     auto num_valid_obs = optimize(frm.get_pose_cw(), frm.frm_obs_, frm.orb_params_, frm.camera_,
+                                   frm.get_landmarks(), optimized_pose, outlier_flags);
+     return num_valid_obs;
+ }
+ 
+ unsigned int pose_optimizer_g2o::optimize(const data::keyframe* keyfrm, Mat44_t& optimized_pose, std::vector<bool>& outlier_flags) const {
++    g_next_call_site = "keyframe";
+     auto num_valid_obs = optimize(keyfrm->get_pose_cw(), keyfrm->frm_obs_, keyfrm->orb_params_, keyfrm->camera_,
+                                   keyfrm->get_landmarks(), optimized_pose, outlier_flags);
+     return num_valid_obs;
+@@ -41,6 +60,27 @@
+                                           const std::vector<std::shared_ptr<data::landmark>>& landmarks,
+                                           Mat44_t& optimized_pose,
+                                           std::vector<bool>& outlier_flags) const {
++    // [reference-port] trace capture setup (no-op unless enabled).
++    pose_optimizer_g2o_trace_entry trace;
++    const std::string this_call_site = g_next_call_site;
++    g_next_call_site = "raw";
++    if (g_trace_enabled) {
++        trace.call_index = g_trace_call_index++;
++        trace.call_site = this_call_site;
++        for (int r = 0; r < 4; ++r) {
++            for (int c = 0; c < 4; ++c) {
++                trace.cam_pose_cw_initial[r * 4 + c] = cam_pose_cw(r, c);
++            }
++        }
++        if (camera->model_type_ == camera::model_type_t::Perspective) {
++            const auto pc = static_cast<const camera::perspective*>(camera);
++            trace.fx = pc->fx_;
++            trace.fy = pc->fy_;
++            trace.cx = pc->cx_;
++            trace.cy = pc->cy_;
++        }
++    }
++
+     // 1. Construct an optimizer
+ 
+     auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>>();
+@@ -105,9 +145,30 @@
+                                                         inv_sigma_sq, sqrt_chi_sq);
+         pose_opt_edge_wraps.push_back(pose_opt_edge_wrap);
+         optimizer.addEdge(pose_opt_edge_wrap.edge_);
++
++        if (g_trace_enabled) {
++            pose_optimizer_g2o_obs_trace ot;
++            ot.idx = idx;
++            ot.x = undist_keypt.pt.x;
++            ot.y = undist_keypt.pt.y;
++            ot.octave = undist_keypt.octave;
++            ot.inv_sigma_sq = inv_sigma_sq;
++            const Vec3_t pos_w = lm->get_pos_in_world();
++            ot.pos_w[0] = pos_w(0);
++            ot.pos_w[1] = pos_w(1);
++            ot.pos_w[2] = pos_w(2);
++            trace.obs.push_back(ot);
++        }
+     }
+ 
+     if (num_init_obs < 5) {
++        if (g_trace_enabled) {
++            trace.num_trials_robust = num_trials_robust_;
++            trace.num_trials = num_trials_;
++            trace.num_each_iter = num_each_iter_;
++            trace.num_valid_obs = 0;
++            g_trace.push_back(trace);
++        }
+         return 0;
+     }
+ 
+@@ -171,6 +232,23 @@
+ 
+     optimized_pose = util::converter::to_eigen_mat(frm_vtx->estimate());
+ 
++    if (g_trace_enabled) {
++        trace.num_trials_robust = num_trials_robust_;
++        trace.num_trials = num_trials_;
++        trace.num_each_iter = num_each_iter_;
++        for (int r = 0; r < 4; ++r) {
++            for (int c = 0; c < 4; ++c) {
++                trace.cam_pose_cw_final[r * 4 + c] = optimized_pose(r, c);
++            }
++        }
++        trace.outlier_flags.resize(outlier_flags.size());
++        for (size_t i = 0; i < outlier_flags.size(); ++i) {
++            trace.outlier_flags[i] = outlier_flags[i] ? 1 : 0;
++        }
++        trace.num_valid_obs = num_init_obs - num_bad_obs;
++        g_trace.push_back(trace);
++    }
++
+     return num_init_obs - num_bad_obs;
+ }
+ 

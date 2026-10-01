@@ -1,0 +1,99 @@
+--- a/src/stella_vslam/util/erasure_log.h
++++ b/src/stella_vslam/util/erasure_log.h
+@@ -59,6 +59,37 @@
+ extern std::vector<erased_landmark_record> g_erased_landmarks;
+ extern std::vector<erased_keyframe_record> g_erased_keyframes;
+ 
++// [reference-port] (patch 0009) keyframe_inserter::create_new_keyframe()
++// records, right after keyfrm->update_landmarks(), the new keyframe's own
++// derived pose fields and the post-update state of every (non-erased)
++// landmark it observes (add_observation + update_mean_normal_and_obs_scale_
++// variance + compute_descriptor). One record per created keyframe; the
++// driver reads and clears g_kf_inserts after each feed.
++struct kf_insert_landmark_record {
++    unsigned int kp_idx = 0;
++    unsigned int id = 0;
++    Vec3_t pos_w = Vec3_t::Zero();
++    std::vector<uint8_t> descriptor;
++    Vec3_t mean_normal = Vec3_t::Zero();
++    float min_valid_dist = 0.f;
++    float max_valid_dist = 0.f;
++    unsigned int num_observations = 0;
++    unsigned int num_observed = 0;
++    unsigned int num_observable = 0;
++    int ref_keyfrm_id = -1;
++};
++
++struct kf_insert_record {
++    unsigned int keyfrm_id = 0;
++    double timestamp = 0.0;
++    Mat44_t pose_cw = Mat44_t::Identity();
++    Mat44_t pose_wc = Mat44_t::Identity();
++    Vec3_t trans_wc = Vec3_t::Zero();
++    std::vector<kf_insert_landmark_record> landmarks;
++};
++
++extern std::vector<kf_insert_record> g_kf_inserts;
++
+ } // namespace util
+ } // namespace stella_vslam
+ 
+--- a/src/stella_vslam/util/erasure_log.cc
++++ b/src/stella_vslam/util/erasure_log.cc
+@@ -5,6 +5,7 @@
+ 
+ std::vector<erased_landmark_record> g_erased_landmarks;
+ std::vector<erased_keyframe_record> g_erased_keyframes;
++std::vector<kf_insert_record> g_kf_inserts; // [reference-port] patch 0009
+ 
+ } // namespace util
+ } // namespace stella_vslam
+--- a/src/stella_vslam/module/keyframe_inserter.cc
++++ b/src/stella_vslam/module/keyframe_inserter.cc
+@@ -5,6 +5,7 @@
+ #include "stella_vslam/marker_model/base.h"
+ #include "stella_vslam/module/marker_initializer.h"
+ #include "stella_vslam/module/keyframe_inserter.h"
++#include "stella_vslam/util/erasure_log.h" // [reference-port] patch 0009
+ 
+ #include <spdlog/spdlog.h>
+ 
+@@ -156,6 +157,38 @@
+     auto keyfrm = data::keyframe::make_keyframe(map_db->next_keyframe_id_++, curr_frm);
+     keyfrm->update_landmarks();
+ 
++    { // [reference-port] patch 0009: record the post-update_landmarks() state
++        util::kf_insert_record rec;
++        rec.keyfrm_id = keyfrm->id_;
++        rec.timestamp = keyfrm->timestamp_;
++        rec.pose_cw = keyfrm->get_pose_cw();
++        rec.pose_wc = keyfrm->get_pose_wc();
++        rec.trans_wc = keyfrm->get_trans_wc();
++        const auto kf_lms = keyfrm->get_landmarks();
++        for (unsigned int idx = 0; idx < kf_lms.size(); ++idx) {
++            const auto& lm = kf_lms.at(idx);
++            if (!lm || lm->will_be_erased()) {
++                continue;
++            }
++            util::kf_insert_landmark_record lr;
++            lr.kp_idx = idx;
++            lr.id = lm->id_;
++            lr.pos_w = lm->get_pos_in_world();
++            const cv::Mat desc = lm->get_descriptor();
++            lr.descriptor.assign(desc.ptr<uint8_t>(), desc.ptr<uint8_t>() + desc.cols);
++            lr.mean_normal = lm->get_obs_mean_normal();
++            lr.min_valid_dist = lm->get_min_valid_distance();
++            lr.max_valid_dist = lm->get_max_valid_distance();
++            lr.num_observations = lm->num_observations();
++            lr.num_observed = lm->get_num_observed();
++            lr.num_observable = lm->get_num_observable();
++            const auto ref = lm->get_ref_keyframe();
++            lr.ref_keyfrm_id = ref ? static_cast<int>(ref->id_) : -1;
++            rec.landmarks.push_back(std::move(lr));
++        }
++        util::g_kf_inserts.push_back(std::move(rec));
++    }
++
+     for (const auto& id_mkr2d : keyfrm->markers_2d_) {
+         auto marker = map_db->get_marker(id_mkr2d.first);
+         if (!marker) {

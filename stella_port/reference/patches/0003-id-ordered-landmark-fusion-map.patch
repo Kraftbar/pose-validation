@@ -1,0 +1,87 @@
+--- a/src/stella_vslam/match/fuse.h	2026-09-24 09:35:01.337435145 +0200
++++ b/src/stella_vslam/match/fuse.h	2026-09-24 10:54:46.163626394 +0200
+@@ -30,7 +30,14 @@
+                                     const Vec3_t& trans_cw,
+                                     const T& landmarks_to_check,
+                                     const float margin,
+-                                    std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>& duplicated_lms_in_keyfrm,
++                                    // [reference-port] was std::unordered_map<shared_ptr<landmark>, ...>
++                                    // (pointer-hash order, bypasses -DDETERMINISTIC=ON's
++                                    // nondeterministic:: alias); switched to the same alias
++                                    // type.h's other shared_ptr<keyframe|landmark> maps already
++                                    // use, so this one is id-ordered under DETERMINISTIC too.
++                                    // new_connections is keyed by unsigned int (a landmark id,
++                                    // not a pointer) and was already deterministic; left as-is.
++                                    nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>& duplicated_lms_in_keyfrm,
+                                     std::unordered_map<unsigned int, std::shared_ptr<data::landmark>>& new_connections,
+                                     bool do_reprojection_matching = false) const;
+ 
+--- a/src/stella_vslam/match/fuse.cc	2026-09-24 09:35:01.337435145 +0200
++++ b/src/stella_vslam/match/fuse.cc	2026-09-24 10:55:05.819375994 +0200
+@@ -14,7 +14,7 @@
+                                       const Vec3_t& trans_cw,
+                                       const T& landmarks_to_check,
+                                       const float margin,
+-                                      std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>& duplicated_lms_in_keyfrm,
++                                      nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>& duplicated_lms_in_keyfrm,
+                                       std::unordered_map<unsigned int, std::shared_ptr<data::landmark>>& new_connections,
+                                       bool do_reprojection_matching) const {
+     const Vec3_t trans_wc = -rot_cw.transpose() * trans_cw;
+@@ -158,7 +158,7 @@
+                                                const Vec3_t&,
+                                                const std::vector<std::shared_ptr<data::landmark>>&,
+                                                const float,
+-                                               std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
++                                               nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
+                                                std::unordered_map<unsigned int, std::shared_ptr<data::landmark>>&,
+                                                bool) const;
+ template unsigned int fuse::detect_duplication(const std::shared_ptr<data::keyframe>&,
+@@ -166,7 +166,7 @@
+                                                const Vec3_t&,
+                                                const id_ordered_set<std::shared_ptr<data::landmark>>&,
+                                                const float,
+-                                               std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
++                                               nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
+                                                std::unordered_map<unsigned int, std::shared_ptr<data::landmark>>&,
+                                                bool) const;
+ template unsigned int fuse::detect_duplication(const std::shared_ptr<data::keyframe>&,
+@@ -174,7 +174,7 @@
+                                                const Vec3_t&,
+                                                const std::unordered_set<std::shared_ptr<data::landmark>>&,
+                                                const float,
+-                                               std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
++                                               nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>>&,
+                                                std::unordered_map<unsigned int, std::shared_ptr<data::landmark>>&,
+                                                bool) const;
+ } // namespace match
+--- a/src/stella_vslam/mapping_module.cc	2026-09-24 10:55:53.947763698 +0200
++++ b/src/stella_vslam/mapping_module.cc	2026-09-24 10:55:15.650250831 +0200
+@@ -461,7 +461,7 @@
+         // then, add matches and solve duplication
+         auto cur_landmarks = cur_keyfrm_->get_landmarks();
+         for (const auto& fuse_tgt_keyfrm : fuse_tgt_keyfrms) {
+-            std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
++            nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
+             std::unordered_map<unsigned int, std::shared_ptr<data::landmark>> new_connections;
+             const Mat33_t rot_cw = fuse_tgt_keyfrm->get_rot_cw();
+             const Vec3_t trans_cw = fuse_tgt_keyfrm->get_trans_cw();
+@@ -529,7 +529,7 @@
+             }
+         }
+ 
+-        std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
++        nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
+         std::unordered_map<unsigned int, std::shared_ptr<data::landmark>> new_connections;
+         const Mat33_t rot_cw = cur_keyfrm_->get_rot_cw();
+         const Vec3_t trans_cw = cur_keyfrm_->get_trans_cw();
+--- a/src/stella_vslam/global_optimization_module.cc	2026-09-24 10:55:53.944763736 +0200
++++ b/src/stella_vslam/global_optimization_module.cc	2026-09-24 10:55:15.651250818 +0200
+@@ -487,7 +487,7 @@
+ 
+         // reproject the landmarks observed in the current keyframe to the neighbor,
+         // then search duplication of the landmarks
+-        std::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
++        nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> duplicated_lms_in_keyfrm;
+         std::unordered_map<unsigned int, std::shared_ptr<data::landmark>> new_connections;
+         // Convert Sim3 into SE3
+         const Mat33_t s_rot_cw = Sim3_nw_after_correction.block<3, 3>(0, 0);

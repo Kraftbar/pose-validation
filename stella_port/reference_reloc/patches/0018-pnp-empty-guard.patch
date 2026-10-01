@@ -1,0 +1,15 @@
+Define all-invalid EPnP output. Intentionally changes undefined degenerate behavior; real-input public results are checked separately.
+
+--- a/src/stella_vslam/solve/pnp_solver.cc
++++ b/src/stella_vslam/solve/pnp_solver.cc
+@@ -161,6 +161,10 @@
+ double pnp_solver::compute_pose(const eigen_alloc_vector<Vec3_t>& bearing_vectors,
+                                 const eigen_alloc_vector<Vec3_t>& pos_ws,
+                                 Mat33_t& rot_cw, Vec3_t& trans_cw, const unsigned int num_iter) {
++    // [reference-port] All-invalid candidates must not expose uninitialized
++    // output to the RANSAC inlier test.
++    rot_cw.setConstant(std::numeric_limits<double>::quiet_NaN());
++    trans_cw.setConstant(std::numeric_limits<double>::quiet_NaN());
+     // EPnP: An AccurateO(n)Solution to the PnP Problem
+     // (Lepetit et al. in IJCV 2009)
+ 

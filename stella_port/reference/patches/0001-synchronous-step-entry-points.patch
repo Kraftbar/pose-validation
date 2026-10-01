@@ -1,0 +1,241 @@
+--- a/src/stella_vslam/mapping_module.h	2026-09-24 09:35:01.336435159 +0200
++++ b/src/stella_vslam/mapping_module.h	2026-09-24 10:46:47.830807984 +0200
+@@ -50,6 +50,28 @@
+     //! Run main loop of the mapping module
+     void run();
+ 
++    //! [reference-port] Synchronous single-step equivalent of one pass through
++    //! the run() loop body once a keyframe is queued: process exactly one
++    //! queued keyframe (mapping_with_new_keyframe) and, if a global
++    //! optimization module is attached, hand the keyframe to it the same way
++    //! run() does. Returns false without side effects if no keyframe is
++    //! queued. Intended for a single-threaded deterministic driver that
++    //! never starts the mapping thread; does not touch pause/reset/terminate
++    //! handling, which that driver does not use.
++    bool run_step();
++
++    //! [reference-port] Set once, before any keyframe is queued, by a
++    //! single-threaded deterministic driver that never starts the mapping
++    //! thread. When set, async_add_keyframe() drains the newly queued
++    //! keyframe with run_step() before returning, instead of leaving it
++    //! queued for a mapping thread that will never run. This matters
++    //! because some callers (tracking_module::initialize() for the initial
++    //! map's keyframes unconditionally, module::keyframe_inserter when
++    //! wait_for_local_bundle_adjustment is set) block on the returned
++    //! future's get(): without a mapping thread that future would otherwise
++    //! never be fulfilled.
++    void set_synchronous(bool synchronous) { synchronous_ = synchronous; }
++
+     //! Queue a keyframe to process the mapping
+     std::shared_future<void> async_add_keyframe(const std::shared_ptr<data::keyframe>& keyfrm);
+ 
+@@ -100,6 +122,9 @@
+     void abort_local_BA();
+ 
+ private:
++    //! [reference-port] see set_synchronous()
++    bool synchronous_ = false;
++
+     //-----------------------------------------
+     // main process
+ 
+--- a/src/stella_vslam/global_optimization_module.h	2026-09-24 09:35:01.334435185 +0200
++++ b/src/stella_vslam/global_optimization_module.h	2026-09-24 10:30:50.270706998 +0200
+@@ -110,7 +110,26 @@
+ 
+     bool request_loop_closure(unsigned int keyfrm1_id, unsigned int keyfrm2_id);
+ 
++    //-----------------------------------------
++    // [reference-port] synchronous driver support
++
++    //! Run loop BA (module::loop_bundle_adjuster::optimize) inline on the
++    //! calling thread instead of on a detached std::thread. Set once, before
++    //! any keyframe is queued, by a single-threaded deterministic driver
++    //! that never starts the global-optimization thread.
++    void set_synchronous(bool synchronous) { synchronous_ = synchronous; }
++
++    //! Synchronous single-step equivalent of one pass through the run() loop
++    //! body once a keyframe is queued: dequeue one keyframe, run loop
++    //! detection/validation, and correct the loop (with the loop BA run
++    //! inline when set_synchronous(true) was called). Returns false without
++    //! side effects if no keyframe is queued.
++    bool run_step();
++
+ private:
++    //! [reference-port] see set_synchronous()
++    bool synchronous_ = false;
++
+     //-----------------------------------------
+     // main process
+ 
+--- a/src/stella_vslam/global_optimization_module.cc	2026-09-24 09:35:01.334435185 +0200
++++ b/src/stella_vslam/global_optimization_module.cc	2026-09-24 10:31:03.252487146 +0200
+@@ -209,6 +209,32 @@
+     return !keyfrms_queue_.empty();
+ }
+ 
++bool global_optimization_module::run_step() {
++    if (!keyframe_is_queued()) {
++        return false;
++    }
++    {
++        std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
++        cur_keyfrm_ = keyfrms_queue_.front();
++        keyfrms_queue_.pop_front();
++    }
++    {
++        std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
++        cur_keyfrm_->set_not_to_be_erased();
++        loop_detector_->set_current_keyframe(cur_keyfrm_);
++        if (!loop_detector_->detect_loop_candidates()) {
++            cur_keyfrm_->set_to_be_erased();
++            return true;
++        }
++        if (!loop_detector_->validate_candidates()) {
++            cur_keyfrm_->set_to_be_erased();
++            return true;
++        }
++    }
++    correct_loop();
++    return true;
++}
++
+ void global_optimization_module::correct_loop() {
+     auto final_candidate_keyfrm = loop_detector_->get_selected_candidate_keyframe();
+ 
+@@ -298,8 +324,17 @@
+         thread_for_loop_BA_->join();
+         thread_for_loop_BA_.reset(nullptr);
+     }
+-    SPDLOG_TRACE("global_optimization_module: launch loop BA");
+-    thread_for_loop_BA_ = std::unique_ptr<std::thread>(new std::thread(&module::loop_bundle_adjuster::optimize, loop_bundle_adjuster_.get(), cur_keyfrm_));
++    if (synchronous_) {
++        // [reference-port] run loop BA inline: no background thread, so its
++        // result is visible to the caller before correct_loop() returns and
++        // there is no thread-timing dependence on when it finishes.
++        SPDLOG_TRACE("global_optimization_module: run loop BA synchronously");
++        loop_bundle_adjuster_->optimize(cur_keyfrm_);
++    }
++    else {
++        SPDLOG_TRACE("global_optimization_module: launch loop BA");
++        thread_for_loop_BA_ = std::unique_ptr<std::thread>(new std::thread(&module::loop_bundle_adjuster::optimize, loop_bundle_adjuster_.get(), cur_keyfrm_));
++    }
+ 
+     // 6. post-processing
+ 
+--- a/src/stella_vslam/system.h	2026-09-24 09:35:01.345435038 +0200
++++ b/src/stella_vslam/system.h	2026-09-24 10:31:24.340133095 +0200
+@@ -71,6 +71,26 @@
+     void shutdown();
+ 
+     //-----------------------------------------
++    // [reference-port] single-threaded deterministic driver support
++
++    //! Prepare the system for single-threaded operation: does the
++    //! bookkeeping startup() would do, WITHOUT starting the mapping_module
++    //! or global_optimization_module threads (that never run in this
++    //! process), and marks the global optimization module (if present) to
++    //! run loop BA inline. Call once, before feeding any frame; call
++    //! synchronize_background_modules() after each feed_*_frame() instead of
++    //! relying on the (absent) background threads.
++    void startup_single_threaded(const bool need_initialize = true);
++
++    //! Drain the mapping module's keyframe queue and, transitively, the
++    //! global optimization module's queue, synchronously on the calling
++    //! thread, in the same per-keyframe order the mapping/global-optimization
++    //! threads would process them (mapping_module::run_step() /
++    //! global_optimization_module::run_step()). Call after every
++    //! feed_*_frame() in a single-threaded driver.
++    void synchronize_background_modules();
++
++    //-----------------------------------------
+     // data I/O
+ 
+     //! Save the frame trajectory in the specified format
+--- a/src/stella_vslam/system.cc	2026-09-24 09:35:01.344435051 +0200
++++ b/src/stella_vslam/system.cc	2026-09-24 10:47:00.984634906 +0200
+@@ -219,6 +219,39 @@
+     }
+ }
+ 
++void system::startup_single_threaded(const bool need_initialize) {
++    spdlog::info("startup SLAM system (single-threaded reference driver)");
++    system_is_running_ = true;
++
++    if (!need_initialize) {
++        tracker_->tracking_state_ = tracker_state_t::Lost;
++    }
++
++    // No mapping_thread_/global_optimization_thread_ is started: the
++    // mapping_module and global_optimization_module are driven synchronously
++    // from synchronize_background_modules() instead. mapping_module::
++    // is_terminated_ defaults to true (never flipped by run(), which never
++    // executes here), so async_pause()/async_terminate() calls made from
++    // inside correct_loop()/shutdown() resolve immediately instead of
++    // blocking on a thread that will never call pause()/terminate().
++    mapper_->set_synchronous(true);
++    if (global_optimizer_) {
++        global_optimizer_->set_synchronous(true);
++    }
++}
++
++void system::synchronize_background_modules() {
++    while (mapper_->run_step()) {
++        // one keyframe fully processed by the mapping module (and, if not a
++        // spanning-tree root, handed to the global optimization module)
++    }
++    if (global_optimizer_) {
++        while (global_optimizer_->run_step()) {
++            // one keyframe fully processed by loop detection/correction
++        }
++    }
++}
++
+ void system::shutdown() {
+     // terminate the other threads
+     if (global_optimizer_) {
+--- a/src/stella_vslam/mapping_module.cc	2026-09-24 09:35:01.336435159 +0200
++++ b/src/stella_vslam/mapping_module.cc	2026-09-24 10:48:28.418490013 +0200
+@@ -118,12 +118,37 @@
+     spdlog::info("terminate mapping module");
+ }
+ 
++bool mapping_module::run_step() {
++    if (!keyframe_is_queued()) {
++        return false;
++    }
++    // create and extend the map with the new keyframe
++    mapping_with_new_keyframe();
++    // send the new keyframe to the global optimization module
++    if (global_optimizer_ && !cur_keyfrm_->graph_node_->is_spanning_root()) {
++        global_optimizer_->queue_keyframe(cur_keyfrm_);
++    }
++    return true;
++}
++
+ std::shared_future<void> mapping_module::async_add_keyframe(const std::shared_ptr<data::keyframe>& keyfrm) {
+-    std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
+-    keyfrms_queue_.push_back(keyfrm);
+-    abort_local_BA_ = true;
+-    promise_add_keyfrm_queue_.emplace_back();
+-    return promise_add_keyfrm_queue_.back().get_future().share();
++    std::shared_future<void> future;
++    {
++        std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
++        keyfrms_queue_.push_back(keyfrm);
++        abort_local_BA_ = true;
++        promise_add_keyfrm_queue_.emplace_back();
++        future = promise_add_keyfrm_queue_.back().get_future().share();
++    }
++    // [reference-port] see set_synchronous(): with no mapping thread ever
++    // running, draining right here is what makes callers that immediately
++    // future.get() on the returned future (tracking_module::initialize(),
++    // module::keyframe_inserter with wait_for_local_bundle_adjustment) not
++    // deadlock.
++    if (synchronous_) {
++        run_step();
++    }
++    return future;
+ }
+ 
+ unsigned int mapping_module::get_num_queued_keyframes() const {

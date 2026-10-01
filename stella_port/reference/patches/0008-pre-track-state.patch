@@ -1,0 +1,85 @@
+--- a/src/stella_vslam/tracking_module.h
++++ b/src/stella_vslam/tracking_module.h
+@@ -96,6 +96,33 @@
+     const std::vector<std::shared_ptr<data::landmark>>& get_local_landmarks() const { return local_landmarks_; }
+     const module::keyframe_inserter::decision_trace& get_last_kf_decision() const { return keyfrm_inserter_.get_last_decision(); }
+ 
++    //! [reference-port] (patch 0008) tracking state at the START of
++    //! feed_frame(), i.e. before this frame's update_last_frame(), for the
++    //! stella_port tracking-side harnesses. Read-only snapshot; changes no
++    //! computation. tracking_state: 0 Initializing, 1 Tracking, 2 Lost.
++    struct pre_track_state {
++        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
++        int tracking_state = 0;
++        bool twist_is_valid = false;
++        Mat44_t twist = Mat44_t::Identity();
++        Mat44_t last_cam_pose_from_ref_keyfrm = Mat44_t::Identity();
++        unsigned int last_reloc_frm_id = 0;
++        double last_reloc_frm_timestamp = 0.0;
++        bool last_frm_pose_valid = false;
++        Mat44_t last_frm_pose_cw = Mat44_t::Identity();
++        long long last_frm_id = -1;
++        long long last_frm_ref_keyfrm_id = -1;
++        unsigned int last_frm_num_landmarks = 0;
++        //! FNV-1a 64 over (idx, landmark id) of the last frame's non-null landmarks
++        uint64_t last_frm_landmark_hash = 0;
++        long long last_inserted_keyfrm_id = -1;
++        double last_inserted_keyfrm_timestamp = 0.0;
++        Vec3_t last_inserted_keyfrm_trans_wc = Vec3_t::Zero();
++        unsigned int num_keyframes = 0;
++        unsigned int fixed_keyframe_id_threshold = 0;
++    };
++    pre_track_state get_pre_track_state() const;
++
+     //! Set the mapping module
+     void set_mapping_module(mapping_module* mapper);
+ 
+--- a/src/stella_vslam/tracking_module.cc
++++ b/src/stella_vslam/tracking_module.cc
+@@ -45,6 +45,46 @@
+     spdlog::debug("DESTRUCT: tracking_module");
+ }
+ 
++// [reference-port] (patch 0008) see tracking_module.h pre_track_state
++tracking_module::pre_track_state tracking_module::get_pre_track_state() const {
++    pre_track_state s;
++    s.tracking_state = static_cast<int>(tracking_state_);
++    s.twist_is_valid = twist_is_valid_;
++    s.twist = twist_;
++    s.last_cam_pose_from_ref_keyfrm = last_cam_pose_from_ref_keyfrm_;
++    s.last_reloc_frm_id = last_reloc_frm_id_;
++    s.last_reloc_frm_timestamp = last_reloc_frm_timestamp_;
++    s.last_frm_pose_valid = last_frm_.pose_is_valid();
++    if (s.last_frm_pose_valid) {
++        s.last_frm_pose_cw = last_frm_.get_pose_cw();
++    }
++    s.last_frm_id = last_frm_.frm_obs_.undist_keypts_.empty() ? -1 : static_cast<long long>(last_frm_.id_);
++    s.last_frm_ref_keyfrm_id = last_frm_.ref_keyfrm_ ? static_cast<long long>(last_frm_.ref_keyfrm_->id_) : -1;
++    uint64_t h = 1469598103934665603ULL;
++    for (unsigned int idx = 0; idx < last_frm_.frm_obs_.undist_keypts_.size(); ++idx) {
++        const auto& lm = last_frm_.get_landmark(idx);
++        if (!lm) {
++            continue;
++        }
++        ++s.last_frm_num_landmarks;
++        const uint64_t vals[2] = {idx, lm->id_};
++        for (int k = 0; k < 2; ++k) {
++            h ^= vals[k];
++            h *= 1099511628211ULL;
++        }
++    }
++    s.last_frm_landmark_hash = h;
++    const auto lik = map_db_->get_last_inserted_keyframe();
++    if (lik) {
++        s.last_inserted_keyfrm_id = lik->id_;
++        s.last_inserted_keyfrm_timestamp = lik->timestamp_;
++        s.last_inserted_keyfrm_trans_wc = lik->get_trans_wc();
++    }
++    s.num_keyframes = map_db_->get_num_keyframes();
++    s.fixed_keyframe_id_threshold = map_db_->get_fixed_keyframe_id_threshold();
++    return s;
++}
++
+ void tracking_module::set_mapping_module(mapping_module* mapper) {
+     mapper_ = mapper;
+     keyfrm_inserter_.set_mapping_module(mapper);

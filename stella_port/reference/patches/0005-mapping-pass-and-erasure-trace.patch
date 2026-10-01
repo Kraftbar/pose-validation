@@ -1,0 +1,737 @@
+--- a/src/stella_vslam/mapping_module.h
++++ b/src/stella_vslam/mapping_module.h
+@@ -2,6 +2,7 @@
+ #define STELLA_VSLAM_MAPPING_MODULE_H
+ 
+ #include "stella_vslam/config.h"
++#include "stella_vslam/type.h"
+ #include "stella_vslam/camera/base.h"
+ #include "stella_vslam/module/local_map_cleaner.h"
+ #include "stella_vslam/optimize/local_bundle_adjuster.h"
+@@ -11,6 +12,8 @@
+ #include <atomic>
+ #include <memory>
+ #include <future>
++#include <vector>
++#include <utility>
+ 
+ #include <yaml-cpp/yaml.h>
+ 
+@@ -72,6 +75,55 @@
+     //! never be fulfilled.
+     void set_synchronous(bool synchronous) { synchronous_ = synchronous; }
+ 
++    //-----------------------------------------
++    // [reference-port] mapping-pass trace, for stella_port/reference dumps.
++    // Populated during mapping_with_new_keyframe() (run_step()'s only real
++    // work); read by the driver after synchronize_background_modules()
++    // returns.
++
++    struct triangulation_neighbor_trace {
++        unsigned int neighbor_keyfrm_id = 0;
++        //! (idx in the current keyframe, idx in the neighbor), as passed to
++        //! triangulate_with_two_keyframes()
++        std::vector<std::pair<unsigned int, unsigned int>> matches;
++        //! landmarks actually created from this neighbor's matches
++        std::vector<unsigned int> accepted_landmark_ids;
++        std::vector<Vec3_t> accepted_landmark_positions; // parallel to accepted_landmark_ids
++    };
++
++    struct mapping_pass_trace {
++        bool ran = false;
++        unsigned int keyfrm_id = 0;
++        //! module::local_map_cleaner::get_last_culled_landmark_ids(), copied
++        //! here (reason: local_map_cleaner::culled_landmark_reason())
++        std::vector<unsigned int> culled_landmark_ids;
++        //! create_new_landmarks()'s covisibility loop, in that order
++        std::vector<triangulation_neighbor_trace> triangulation;
++        //! (landmark id replaced away, landmark id it was replaced by), from
++        //! update_new_keyframe()'s fuse_landmark_duplication() call
++        std::vector<std::pair<unsigned int, unsigned int>> replaced_landmark_ids;
++        //! module::local_map_cleaner::get_last_culled_keyframe_ids(), copied
++        //! here (reason: local_map_cleaner::culled_keyframe_reason())
++        std::vector<unsigned int> culled_keyframe_ids;
++        //! whether local_bundle_adjuster_->optimize() was actually called
++        //! this pass; if false, get_last_local_ba_trace() is stale (from an
++        //! earlier pass that did call it, or default-empty if none ever did)
++        //! and should be ignored by a reader
++        bool local_ba_invoked = false;
++    };
++    const mapping_pass_trace& get_last_pass_trace() const { return last_pass_trace_; }
++    //! [reference-port] called once per frame, before the run_step() drain
++    //! loop, by system::synchronize_background_modules() -- NOT from inside
++    //! run_step() itself, since that would also fire (and wipe the trace) on
++    //! the drain loop's own final, queue-now-empty call right after a pass
++    //! that did run something.
++    void reset_last_pass_trace() { last_pass_trace_ = mapping_pass_trace{}; }
++    //! optimize::local_ba_trace from the local_bundle_adjuster_ used this
++    //! pass (empty/ran=false if local BA was skipped this pass -- see
++    //! mapping_with_new_keyframe()'s `2 < map_db_->get_num_keyframes()` /
++    //! is_skipping_localBA() gates)
++    const optimize::local_ba_trace& get_last_local_ba_trace() const { return local_bundle_adjuster_->get_last_trace(); }
++
+     //! Queue a keyframe to process the mapping
+     std::shared_future<void> async_add_keyframe(const std::shared_ptr<data::keyframe>& keyfrm);
+ 
+@@ -124,6 +176,8 @@
+ private:
+     //! [reference-port] see set_synchronous()
+     bool synchronous_ = false;
++    //! [reference-port] see get_last_pass_trace()
++    mapping_pass_trace last_pass_trace_;
+ 
+     //-----------------------------------------
+     // main process
+--- a/src/stella_vslam/mapping_module.cc
++++ b/src/stella_vslam/mapping_module.cc
+@@ -182,6 +182,11 @@
+ 
+     SPDLOG_TRACE("mapping_module: current keyframe is {}", cur_keyfrm_->id_);
+ 
++    // [reference-port] see mapping_pass_trace
++    last_pass_trace_ = mapping_pass_trace{};
++    last_pass_trace_.ran = true;
++    last_pass_trace_.keyfrm_id = cur_keyfrm_->id_;
++
+     // store the new keyframe to the database
+     fprintf(stderr, "[TRACE] store_new_keyframe begin\n"); fflush(stderr);
+     store_new_keyframe();
+@@ -189,6 +194,7 @@
+ 
+     // remove invalid landmarks
+     local_map_cleaner_->remove_invalid_landmarks(cur_keyfrm_->id_);
++    last_pass_trace_.culled_landmark_ids = local_map_cleaner_->get_last_culled_landmark_ids(); // [reference-port]
+ 
+     // triangulate new landmarks between the current frame and each of the covisibilities
+     std::atomic<bool> abort_create_new_landmarks{false};
+@@ -236,6 +242,7 @@
+         }
+         else {
+             fprintf(stderr, "[TRACE] local BA begin\n"); fflush(stderr);
++            last_pass_trace_.local_ba_invoked = true; // [reference-port]
+             local_bundle_adjuster_->optimize(map_db_, cur_keyfrm_, &abort_local_BA_);
+             fprintf(stderr, "[TRACE] local BA end\n"); fflush(stderr);
+         }
+@@ -272,6 +279,7 @@
+ 
+     fprintf(stderr, "[TRACE] remove_redundant_keyframes begin\n"); fflush(stderr);
+     local_map_cleaner_->remove_redundant_keyframes(cur_keyfrm_);
++    last_pass_trace_.culled_keyframe_ids = local_map_cleaner_->get_last_culled_keyframe_ids(); // [reference-port]
+     fprintf(stderr, "[TRACE] remove_redundant_keyframes end\n"); fflush(stderr);
+ 
+     {
+@@ -371,6 +379,15 @@
+             robust_matcher.match_for_triangulation(cur_keyfrm_, ngh_keyfrm, E_ngh_to_cur, matches, residual_rad_thr_);
+         }
+ 
++        // [reference-port] see mapping_pass_trace::triangulation; this
++        // entry is filled in by the triangulate_with_two_keyframes() call
++        // right below (accepted_landmark_ids/_positions), which -- with
++        // USE_OPENMP off, see README -- runs its matches loop sequentially,
++        // so `.back()` is always this neighbor's entry while that call runs
++        last_pass_trace_.triangulation.push_back(triangulation_neighbor_trace{});
++        last_pass_trace_.triangulation.back().neighbor_keyfrm_id = ngh_keyfrm->id_;
++        last_pass_trace_.triangulation.back().matches = matches;
++
+         // triangulation
+         triangulate_with_two_keyframes(cur_keyfrm_, ngh_keyfrm, matches);
+     }
+@@ -412,6 +429,14 @@
+ #endif
+         {
+             local_map_cleaner_->add_fresh_landmark(lm);
++            // [reference-port] see the push_back() in create_new_landmarks();
++            // .back() is this neighbor's entry (USE_OPENMP is off, see
++            // README, so this loop -- like the neighbor loop above -- runs
++            // sequentially and single-threaded)
++            if (!last_pass_trace_.triangulation.empty()) {
++                last_pass_trace_.triangulation.back().accepted_landmark_ids.push_back(lm->id_);
++                last_pass_trace_.triangulation.back().accepted_landmark_positions.push_back(pos_w);
++            }
+         }
+     }
+ }
+@@ -425,6 +450,14 @@
+     // resolve the duplication of landmarks between the current keyframe and the targets
+     nondeterministic::unordered_map<std::shared_ptr<data::landmark>, std::shared_ptr<data::landmark>> replaced_lms;
+     fuse_landmark_duplication(fuse_tgt_keyfrms, replaced_lms);
++    // [reference-port] (id replaced away -> id it was replaced by); read
++    // before replace_landmarks_in_last_frm(), which doesn't touch these ids
++    // or the map itself, just last_frm_'s landmark pointers
++    for (const auto& old_new : replaced_lms) {
++        if (old_new.first && old_new.second) {
++            last_pass_trace_.replaced_landmark_ids.emplace_back(old_new.first->id_, old_new.second->id_);
++        }
++    }
+     tracker_->replace_landmarks_in_last_frm(replaced_lms);
+ 
+     // update the geometries
+--- a/src/stella_vslam/module/local_map_cleaner.h
++++ b/src/stella_vslam/module/local_map_cleaner.h
+@@ -54,7 +54,21 @@
+      */
+     void count_redundant_observations(const std::shared_ptr<data::keyframe>& keyfrm, unsigned int& num_valid_obs, unsigned int& num_redundant_obs) const;
+ 
++    //! [reference-port] ids culled by the most recent remove_invalid_landmarks()/
++    //! remove_redundant_keyframes() call, for stella_port/reference dumps.
++    //! Each function has exactly one reason it culls something (see the
++    //! comments at the call sites in the .cc), so a single fixed reason
++    //! string per vector is enough, not a per-id reason.
++    const std::vector<unsigned int>& get_last_culled_landmark_ids() const { return last_culled_landmark_ids_; }
++    static constexpr const char* culled_landmark_reason() { return "observed_ratio_below_threshold"; }
++    const std::vector<unsigned int>& get_last_culled_keyframe_ids() const { return last_culled_keyframe_ids_; }
++    static constexpr const char* culled_keyframe_reason() { return "redundant_observation_ratio"; }
++
+ private:
++    //! [reference-port] see getters above
++    mutable std::vector<unsigned int> last_culled_landmark_ids_;
++    mutable std::vector<unsigned int> last_culled_keyframe_ids_;
++
+     //! map database
+     data::map_database* map_db_ = nullptr;
+     //! BoW database
+--- a/src/stella_vslam/module/local_map_cleaner.cc
++++ b/src/stella_vslam/module/local_map_cleaner.cc
+@@ -25,6 +25,7 @@
+                             NotClear };
+ 
+     unsigned int num_removed = 0;
++    last_culled_landmark_ids_.clear(); // [reference-port]
+     auto iter = fresh_landmarks_.begin();
+     while (iter != fresh_landmarks_.end()) {
+         const auto& lm = *iter;
+@@ -53,6 +54,7 @@
+         }
+         else if (lm_state == lm_state_t::Invalid) {
+             ++num_removed;
++            last_culled_landmark_ids_.push_back(lm->id_); // [reference-port]
+             lm->prepare_for_erasing(map_db_);
+             iter = fresh_landmarks_.erase(iter);
+         }
+@@ -76,6 +78,7 @@
+     // if the redundancy ratio of observations is larger than this threshold,
+     // the corresponding keyframe will be erased
+     unsigned int num_removed = 0;
++    last_culled_keyframe_ids_.clear(); // [reference-port]
+     // check redundancy for each of the covisibilities
+     const auto cur_covisibilities = cur_keyfrm->graph_node_->get_top_n_covisibilities(top_n_covisibilities_to_search_);
+     for (const auto& covisibility : cur_covisibilities) {
+@@ -98,6 +101,7 @@
+         // if the redundant observation ratio of `covisibility` is larger than the threshold, it will be removed
+         if (redundant_obs_ratio_thr_ <= static_cast<float>(num_redundant_obs) / num_valid_obs) {
+             ++num_removed;
++            last_culled_keyframe_ids_.push_back(covisibility->id_); // [reference-port]
+             const auto cur_landmarks = covisibility->get_landmarks();
+             covisibility->prepare_for_erasing(map_db_, bow_db_);
+             for (const auto& lm : cur_landmarks) {
+--- a/src/stella_vslam/optimize/local_bundle_adjuster.h
++++ b/src/stella_vslam/optimize/local_bundle_adjuster.h
+@@ -2,6 +2,7 @@
+ #define STELLA_VSLAM_OPTIMIZE_LOCAL_BUNDLE_ADJUSTER_H
+ 
+ #include <memory>
++#include <vector>
+ 
+ namespace stella_vslam {
+ 
+@@ -12,8 +13,26 @@
+ 
+ namespace optimize {
+ 
++//! [reference-port] populated by local_bundle_adjuster_g2o::optimize() (the
++//! only implementation that overrides get_last_trace(); other backends
++//! such as a gtsam variant, if compiled in, keep the base no-op default and
++//! report ran=false). For stella_port/reference dumps.
++struct local_ba_trace {
++    bool ran = false;
++    unsigned int curr_keyfrm_id = 0;
++    std::vector<unsigned int> local_keyfrm_ids;
++    std::vector<unsigned int> fixed_keyfrm_ids;
++    int num_iters_first = 0;
++    int num_iters_second = 0;
++    double chi2_before = 0.0;
++    double chi2_after = 0.0;
++    unsigned int num_outlier_observations_removed = 0;
++};
++
+ class local_bundle_adjuster {
+ public:
++    virtual ~local_bundle_adjuster() = default;
++
+     /**
+      * Perform optimization
+      * @param map_db
+@@ -21,6 +40,12 @@
+      * @param force_stop_flag
+      */
+     virtual void optimize(data::map_database* map_db, const std::shared_ptr<data::keyframe>& curr_keyfrm, bool* const force_stop_flag) const = 0;
++
++    //! [reference-port] see local_ba_trace
++    virtual const local_ba_trace& get_last_trace() const {
++        static local_ba_trace empty;
++        return empty;
++    }
+ };
+ 
+ } // namespace optimize
+--- a/src/stella_vslam/optimize/local_bundle_adjuster_g2o.h
++++ b/src/stella_vslam/optimize/local_bundle_adjuster_g2o.h
+@@ -39,6 +39,9 @@
+      */
+     void optimize(data::map_database* map_db, const std::shared_ptr<data::keyframe>& curr_keyfrm, bool* const force_stop_flag) const override;
+ 
++    //! [reference-port] see local_ba_trace
++    const local_ba_trace& get_last_trace() const override { return last_trace_; }
++
+ private:
+     //! number of iterations of first optimization
+     const unsigned int num_first_iter_;
+@@ -46,6 +49,9 @@
+     const unsigned int num_second_iter_;
+     //!
+     const unsigned int use_additional_keyframes_for_monocular_ = false;
++
++    //! [reference-port] see get_last_trace(); optimize() is const
++    mutable local_ba_trace last_trace_;
+ };
+ 
+ } // namespace optimize
+--- a/src/stella_vslam/optimize/local_bundle_adjuster_g2o.cc
++++ b/src/stella_vslam/optimize/local_bundle_adjuster_g2o.cc
+@@ -12,6 +12,7 @@
+ #include "stella_vslam/util/converter.h"
+ 
+ #include <unordered_map>
++#include <algorithm>
+ 
+ #include <Eigen/StdVector>
+ #include <g2o/core/solver.h>
+@@ -146,6 +147,21 @@
+         }
+     }
+ 
++    // [reference-port] see local_ba_trace; local_keyfrms/fixed_keyfrms are
++    // now final (use_additional_keyframes_for_monocular_ has already moved
++    // any keyframes between the two maps above)
++    last_trace_ = local_ba_trace{};
++    last_trace_.ran = true;
++    last_trace_.curr_keyfrm_id = curr_keyfrm->id_;
++    for (const auto& id_keyfrm : local_keyfrms) {
++        last_trace_.local_keyfrm_ids.push_back(id_keyfrm.first);
++    }
++    for (const auto& id_keyfrm : fixed_keyfrms) {
++        last_trace_.fixed_keyfrm_ids.push_back(id_keyfrm.first);
++    }
++    std::sort(last_trace_.local_keyfrm_ids.begin(), last_trace_.local_keyfrm_ids.end());
++    std::sort(last_trace_.fixed_keyfrm_ids.begin(), last_trace_.fixed_keyfrm_ids.end());
++
+     // 2. Construct an optimizer
+ 
+     std::unique_ptr<g2o::BlockSolverBase> block_solver;
+@@ -310,7 +326,13 @@
+     }
+ 
+     optimizer.initializeOptimization();
+-    optimizer.optimize(num_first_iter_);
++    // [reference-port] chi2() needs computeActiveErrors() to have run at
++    // least once; both are read-only diagnostics, no effect on the
++    // optimize() call that follows
++    optimizer.computeActiveErrors();
++    last_trace_.chi2_before = optimizer.activeChi2();
++    last_trace_.num_iters_first = optimizer.optimize(num_first_iter_);
++    last_trace_.chi2_after = optimizer.activeChi2(); // overwritten below if the second pass runs
+ 
+     // 6. Discard outliers, then perform the second optimization
+ 
+@@ -344,7 +366,9 @@
+         }
+ 
+         optimizer.initializeOptimization();
+-        optimizer.optimize(num_second_iter_);
++        last_trace_.num_iters_second = optimizer.optimize(num_second_iter_); // [reference-port]
++        optimizer.computeActiveErrors();
++        last_trace_.chi2_after = optimizer.activeChi2(); // [reference-port]
+     }
+ 
+     delete terminateAction;
+@@ -373,6 +397,7 @@
+             }
+         }
+     }
++    last_trace_.num_outlier_observations_removed = (unsigned int)outlier_observations.size(); // [reference-port]
+ 
+     // 8. Update the information
+ 
+--- a/src/stella_vslam/module/loop_detector.h
++++ b/src/stella_vslam/module/loop_detector.h
+@@ -8,6 +8,8 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <algorithm>
++#include <vector>
+ 
+ #include <yaml-cpp/yaml.h>
+ 
+@@ -89,6 +91,12 @@
+      */
+     void set_loop_correct_keyframe_id(const unsigned int loop_correct_keyfrm_id);
+ 
++    //! [reference-port] ids of loop_candidates_to_validate_ (the candidates
++    //! detect_loop_candidates() found and validate_candidates() then chose
++    //! among), sorted by id for a deterministic dump order -- the member
++    //! itself is an unordered_set<shared_ptr<keyframe>>, pointer-hash order.
++    std::vector<unsigned int> get_candidate_ids_to_validate() const;
++
+ private:
+     /**
+      * called by detect_loop_candidates
+--- a/src/stella_vslam/module/loop_detector.cc
++++ b/src/stella_vslam/module/loop_detector.cc
+@@ -619,5 +619,17 @@
+     prev_loop_correct_keyfrm_id_ = loop_correct_keyfrm_id;
+ }
+ 
++std::vector<unsigned int> loop_detector::get_candidate_ids_to_validate() const { // [reference-port]
++    std::vector<unsigned int> ids;
++    ids.reserve(loop_candidates_to_validate_.size());
++    for (const auto& kf : loop_candidates_to_validate_) {
++        if (kf) {
++            ids.push_back(kf->id_);
++        }
++    }
++    std::sort(ids.begin(), ids.end());
++    return ids;
++}
++
+ } // namespace module
+ } // namespace stella_vslam
+--- a/src/stella_vslam/global_optimization_module.h
++++ b/src/stella_vslam/global_optimization_module.h
+@@ -126,9 +126,41 @@
+     //! side effects if no keyframe is queued.
+     bool run_step();
+ 
++    //! [reference-port] one run_step() call's activity, for stella_port/
++    //! reference dumps.
++    struct step_trace {
++        bool ran = false;
++        unsigned int keyfrm_id = 0;
++        //! module::loop_detector::get_candidate_ids_to_validate(), i.e. the
++        //! candidates detect_loop_candidates() found, before
++        //! validate_candidates() narrows them to (at most) one
++        std::vector<unsigned int> candidate_ids_considered;
++        bool loop_accepted = false;
++        int accepted_candidate_id = -1; // -1 if !loop_accepted
++        //! Sim3s_nw_after_correction.size() in correct_loop() -- covisibility
++        //! keyframes whose pose was Sim3-corrected
++        unsigned int num_keyframes_sim3_corrected = 0;
++        //! found_lm_to_ref_keyfrm_id.size() in correct_loop() -- landmarks
++        //! whose position was corrected by the covisibility Sim3 correction
++        //! (a superset of, and cheaper to capture than, exactly which ids
++        //! fuse_landmark_duplication-equivalent replacement touched)
++        unsigned int num_landmarks_position_corrected = 0;
++        //! whether loop_bundle_adjuster_->optimize() was invoked this step
++        //! (only happens if loop_accepted); see
++        //! module::loop_bundle_adjuster -- no per-call cost/iteration trace
++        //! there, unlike local_bundle_adjuster_g2o (see README "Not done")
++        bool loop_ba_invoked = false;
++    };
++    const step_trace& get_last_step_trace() const { return last_step_trace_; }
++    //! [reference-port] see mapping_module::reset_last_pass_trace() -- same
++    //! reasoning, called once per frame before the run_step() drain loop.
++    void reset_last_step_trace() { last_step_trace_ = step_trace{}; }
++
+ private:
+     //! [reference-port] see set_synchronous()
+     bool synchronous_ = false;
++    //! [reference-port] see get_last_step_trace()
++    step_trace last_step_trace_;
+ 
+     //-----------------------------------------
+     // main process
+--- a/src/stella_vslam/global_optimization_module.cc
++++ b/src/stella_vslam/global_optimization_module.cc
+@@ -218,6 +218,9 @@
+         cur_keyfrm_ = keyfrms_queue_.front();
+         keyfrms_queue_.pop_front();
+     }
++    last_step_trace_ = step_trace{}; // [reference-port]
++    last_step_trace_.ran = true;
++    last_step_trace_.keyfrm_id = cur_keyfrm_->id_;
+     {
+         std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
+         cur_keyfrm_->set_not_to_be_erased();
+@@ -226,17 +229,20 @@
+             cur_keyfrm_->set_to_be_erased();
+             return true;
+         }
++        last_step_trace_.candidate_ids_considered = loop_detector_->get_candidate_ids_to_validate(); // [reference-port]
+         if (!loop_detector_->validate_candidates()) {
+             cur_keyfrm_->set_to_be_erased();
+             return true;
+         }
+     }
++    last_step_trace_.loop_accepted = true; // [reference-port]
+     correct_loop();
+     return true;
+ }
+ 
+ void global_optimization_module::correct_loop() {
+     auto final_candidate_keyfrm = loop_detector_->get_selected_candidate_keyframe();
++    last_step_trace_.accepted_candidate_id = (int)final_candidate_keyfrm->id_; // [reference-port]
+ 
+     spdlog::info("detect loop: keyframe {} - keyframe {}", final_candidate_keyfrm->id_, cur_keyfrm_->id_);
+ 
+@@ -292,6 +298,9 @@
+         // correct covisibility keyframe camera poses
+         correct_covisibility_keyframes(Sim3s_nw_after_correction);
+     }
++    // [reference-port]
++    last_step_trace_.num_keyframes_sim3_corrected = (unsigned int)Sim3s_nw_after_correction.size();
++    last_step_trace_.num_landmarks_position_corrected = (unsigned int)found_lm_to_ref_keyfrm_id.size();
+ 
+     // 2. resolve duplications of landmarks caused by loop fusion
+ 
+@@ -329,6 +338,7 @@
+         // result is visible to the caller before correct_loop() returns and
+         // there is no thread-timing dependence on when it finishes.
+         SPDLOG_TRACE("global_optimization_module: run loop BA synchronously");
++        last_step_trace_.loop_ba_invoked = true; // [reference-port]
+         loop_bundle_adjuster_->optimize(cur_keyfrm_);
+     }
+     else {
+--- a/src/stella_vslam/system.h
++++ b/src/stella_vslam/system.h
+@@ -89,6 +89,13 @@
+     //! tracking_module has no private section, so these are plain public
+     //! members once reached through this getter.
+     tracking_module* get_tracker() const { return tracker_; }
++    //! [reference-port] read-only access to the mapping module, for
++    //! mapping_module::get_last_pass_trace()/get_last_local_ba_trace().
++    mapping_module* get_mapper() const { return mapper_; }
++    //! [reference-port] read-only access to the global optimization module,
++    //! for global_optimization_module::get_last_step_trace() (nullptr if
++    //! the system has none, e.g. no vocabulary was loaded).
++    global_optimization_module* get_global_optimizer() const { return global_optimizer_; }
+ 
+     //! Drain the mapping module's keyframe queue and, transitively, the
+     //! global optimization module's queue, synchronously on the calling
+--- a/src/stella_vslam/system.cc
++++ b/src/stella_vslam/system.cc
+@@ -241,6 +241,21 @@
+ }
+ 
+ void system::synchronize_background_modules() {
++    // [reference-port] NOTE: in synchronous mode (see
++    // startup_single_threaded()), a keyframe insertion drains itself inline
++    // -- mapping_module::async_add_keyframe() calls run_step() immediately,
++    // and that happens *inside* feed_monocular_frame()/feed_frame(), before
++    // this function is ever called. So by the time this runs, mapper_'s
++    // queue (and, transitively, global_optimizer_'s) is normally already
++    // empty and get_last_pass_trace()/get_last_step_trace() already hold
++    // that frame's result. The while loops below are a safety net for any
++    // path that does *not* go through the synchronous async_add_keyframe()
++    // drain. A driver reading get_last_pass_trace()/get_last_step_trace()
++    // must reset them (mapping_module::reset_last_pass_trace()/
++    // global_optimization_module::reset_last_step_trace()) itself, before
++    // feed_monocular_frame()/feed_frame() -- not here, since resetting here
++    // would run after the inline drain above and wipe its result before the
++    // driver ever reads it.
+     while (mapper_->run_step()) {
+         // one keyframe fully processed by the mapping module (and, if not a
+         // spanning-tree root, handed to the global optimization module)
+--- a/src/stella_vslam/util/CMakeLists.txt
++++ b/src/stella_vslam/util/CMakeLists.txt
+@@ -3,6 +3,7 @@
+                PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/angle.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/converter.h
++               ${CMAKE_CURRENT_SOURCE_DIR}/erasure_log.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/fancy_index.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/image_converter.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/random_array.h
+@@ -13,6 +14,7 @@
+                ${CMAKE_CURRENT_SOURCE_DIR}/yaml.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/angle.cc
+                ${CMAKE_CURRENT_SOURCE_DIR}/converter.cc
++               ${CMAKE_CURRENT_SOURCE_DIR}/erasure_log.cc
+                ${CMAKE_CURRENT_SOURCE_DIR}/image_converter.cc
+                ${CMAKE_CURRENT_SOURCE_DIR}/random_array.cc
+                ${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.cc
+--- a/src/stella_vslam/data/keyframe.cc
++++ b/src/stella_vslam/data/keyframe.cc
+@@ -11,6 +11,7 @@
+ #include "stella_vslam/data/bow_vocabulary.h"
+ #include "stella_vslam/feature/orb_params.h"
+ #include "stella_vslam/util/converter.h"
++#include "stella_vslam/util/erasure_log.h"
+ 
+ #include <nlohmann/json.hpp>
+ #include <spdlog/spdlog.h>
+@@ -624,6 +625,28 @@
+     // 1. raise the flag which indicates it has been erased
+ 
+     SPDLOG_TRACE("keyframe::prepare_for_erasing {}", id_);
++
++    // [reference-port] snapshot before graph_node_'s connections are torn
++    // down below; see util/erasure_log.h
++    {
++        util::erased_keyframe_record rec;
++        rec.id = id_;
++        rec.pose_cw = get_pose_cw();
++        for (const auto& kf : graph_node_->get_covisibilities()) {
++            if (kf) {
++                rec.covisibilities.emplace_back(kf->id_, graph_node_->get_num_shared_landmarks(kf));
++            }
++        }
++        auto parent = graph_node_->get_spanning_parent();
++        rec.spanning_parent_id = parent ? (int)parent->id_ : -1;
++        for (const auto& c : graph_node_->get_spanning_children()) {
++            if (c) {
++                rec.spanning_children_ids.push_back(c->id_);
++            }
++        }
++        util::g_erased_keyframes.push_back(std::move(rec));
++    }
++
+     will_be_erased_ = true;
+ 
+     // 2. remove associations between keypoints and landmarks
+--- a/src/stella_vslam/data/landmark.cc
++++ b/src/stella_vslam/data/landmark.cc
+@@ -3,6 +3,7 @@
+ #include "stella_vslam/data/landmark.h"
+ #include "stella_vslam/data/map_database.h"
+ #include "stella_vslam/match/base.h"
++#include "stella_vslam/util/erasure_log.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -358,6 +359,33 @@
+     {
+         std::lock_guard<std::mutex> lock1(mtx_observations_);
+         observations = observations_;
++
++        // [reference-port] snapshot before observations_/state are torn
++        // down; see util/erasure_log.h. replaced_by_id is left at -1 here
++        // and filled in by replace() (the only caller that knows it) right
++        // after this call returns.
++        util::erased_landmark_record rec;
++        rec.id = id_;
++        rec.pos_w = pos_w_;
++        if (has_representative_descriptor_ && !descriptor_.empty()) {
++            const auto* p = descriptor_.data;
++            rec.descriptor.assign(p, p + descriptor_.total() * descriptor_.elemSize());
++        }
++        rec.mean_normal = mean_normal_;
++        rec.min_valid_dist = min_valid_dist_;
++        rec.max_valid_dist = max_valid_dist_;
++        for (const auto& obs : observations) {
++            auto kf = obs.first.lock();
++            if (kf) {
++                rec.observations.emplace_back(kf->id_, obs.second);
++            }
++        }
++        rec.num_observed = num_observed_;
++        rec.num_observable = num_observable_;
++        auto ref_kf = ref_keyfrm_.lock();
++        rec.ref_keyfrm_id = ref_kf ? (int)ref_kf->id_ : -1;
++        util::g_erased_landmarks.push_back(std::move(rec));
++
+         observations_.clear();
+         will_be_erased_ = true;
+     }
+@@ -393,6 +421,11 @@
+     }
+ 
+     prepare_for_erasing(map_db);
++    // [reference-port] see prepare_for_erasing(); this is the only caller
++    // that knows the replacement id
++    if (!util::g_erased_landmarks.empty() && util::g_erased_landmarks.back().id == id_) {
++        util::g_erased_landmarks.back().replaced_by_id = (int)lm->id_;
++    }
+ 
+     // 2. Merge lm with this
+     unsigned int num_observable, num_observed;
+--- /dev/null
++++ b/src/stella_vslam/util/erasure_log.h
+@@ -0,0 +1,65 @@
++#ifndef STELLA_VSLAM_UTIL_ERASURE_LOG_H
++#define STELLA_VSLAM_UTIL_ERASURE_LOG_H
++
++// [reference-port] Hooks at data::keyframe::prepare_for_erasing() and
++// data::landmark::prepare_for_erasing()/replace() append a snapshot of the
++// object's live state here, right before that state is torn down. A driver
++// can read+clear these every frame to get erased.tsv (see
++// stella_port/reference/README.md "Dumps") -- otherwise an erased
++// keyframe/landmark simply vanishes from map_publisher::get_keyframes()/
++// get_landmarks() with no record of what it looked like, which is not
++// enough for a port to rebuild dangling references the way stella_vslam's
++// own runtime does (erased objects stay referenced by shared_ptr from
++// wherever last held one, e.g. curr_frm_/last_frm_, and can still be
++// queried until the last reference drops).
++//
++// Global, not per-object: erasure can be triggered from many call sites
++// (module::local_map_cleaner, optimize::local_bundle_adjuster_g2o's
++// outlier removal via landmark::erase_observation, mapping_module's
++// erase_temporal_keyframes_, landmark::replace(), ...) and goal is one
++// combined log of "everything erased", not one log per caller.
++
++#include "stella_vslam/type.h"
++
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++namespace stella_vslam {
++namespace util {
++
++struct erased_landmark_record {
++    unsigned int id = 0;
++    Vec3_t pos_w = Vec3_t::Zero();
++    //! representative descriptor bytes (empty if it never had one)
++    std::vector<uint8_t> descriptor;
++    Vec3_t mean_normal = Vec3_t::Zero();
++    float min_valid_dist = 0.f;
++    float max_valid_dist = 0.f;
++    //! (keyframe id, keypoint idx), snapshot of observations_ before it was cleared
++    std::vector<std::pair<unsigned int, unsigned int>> observations;
++    unsigned int num_observed = 0;
++    unsigned int num_observable = 0;
++    int ref_keyfrm_id = -1; // -1 if ref_keyfrm_ was already expired
++    //! id of the landmark this one was merged into, or -1 if this was a
++    //! plain cull (not a replace())
++    int replaced_by_id = -1;
++};
++
++struct erased_keyframe_record {
++    unsigned int id = 0;
++    Mat44_t pose_cw = Mat44_t::Identity();
++    //! (covisibility keyframe id, weight), graph_node_->get_covisibilities()
++    //! order, snapshot before erase_all_connections()
++    std::vector<std::pair<unsigned int, unsigned int>> covisibilities;
++    int spanning_parent_id = -1;
++    std::vector<unsigned int> spanning_children_ids;
++};
++
++extern std::vector<erased_landmark_record> g_erased_landmarks;
++extern std::vector<erased_keyframe_record> g_erased_keyframes;
++
++} // namespace util
++} // namespace stella_vslam
++
++#endif // STELLA_VSLAM_UTIL_ERASURE_LOG_H
+--- /dev/null
++++ b/src/stella_vslam/util/erasure_log.cc
+@@ -0,0 +1,10 @@
++#include "stella_vslam/util/erasure_log.h"
++
++namespace stella_vslam {
++namespace util {
++
++std::vector<erased_landmark_record> g_erased_landmarks;
++std::vector<erased_keyframe_record> g_erased_keyframes;
++
++} // namespace util
++} // namespace stella_vslam

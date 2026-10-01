@@ -1,0 +1,66 @@
+--- a/src/stella_vslam/tracking_module.cc
++++ b/src/stella_vslam/tracking_module.cc
+@@ -13,6 +13,7 @@
+ #include "stella_vslam/util/yaml.h"
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <unordered_map>
+ 
+ #include <spdlog/spdlog.h>
+@@ -386,18 +387,53 @@
+     return true;
+ }
+ 
++namespace {
++// [reference-port] patch 0010: OPT-IN fault injection, DEFAULT OFF. Only when
++// the environment variable STELLA_PORT_FORCE_PATH is set ("bow:N" or
++// "robust:N"), every N-th frame (frame id % N == 0) skips the motion-model
++// tracker ("bow:N") or the motion-model and BoW trackers ("robust:N"), so the
++// otherwise unreachable frame_tracker paths run on real data. Used only to
++// produce alternative dumps (runs/stella_port/reference_dumps_force_*) for
++// exercising the port; the canonical reference dumps never set it.
++struct force_path_cfg {
++    int mode = 0;
++    unsigned int period = 0;
++};
++force_path_cfg parse_force_path() {
++    force_path_cfg cfg;
++    const char* env = std::getenv("STELLA_PORT_FORCE_PATH");
++    if (!env) {
++        return cfg;
++    }
++    const std::string s(env);
++    const auto colon = s.find(':');
++    if (colon == std::string::npos) {
++        return cfg;
++    }
++    const std::string kind = s.substr(0, colon);
++    cfg.period = static_cast<unsigned int>(std::atoi(s.c_str() + colon + 1));
++    cfg.mode = (kind == "bow") ? 1 : (kind == "robust") ? 2 : 0;
++    return cfg;
++}
++} // namespace
++
+ bool tracking_module::track_current_frame() {
+     bool succeeded = false;
+ 
++    static const force_path_cfg force = parse_force_path(); // [reference-port] patch 0010
++    const bool force_now = force.mode > 0 && force.period > 0 && (curr_frm_.id_ % force.period) == 0;
++    const bool skip_motion = force_now;
++    const bool skip_bow = force_now && force.mode >= 2;
++
+     // Tracking mode
+-    if (twist_is_valid_) {
++    if (twist_is_valid_ && !skip_motion) {
+         // if the motion model is valid
+         succeeded = frame_tracker_.motion_based_track(curr_frm_, last_frm_, twist_);
+         if (succeeded) {
+             last_track_path_ = track_path_t::motion_model; // [reference-port]
+         }
+     }
+-    if (!succeeded) {
++    if (!succeeded && !skip_bow) {
+         // Compute the BoW representations to perform the BoW match
+         if (bow_vocab_ && !curr_frm_.bow_is_available()) {
+             curr_frm_.compute_bow(bow_vocab_);

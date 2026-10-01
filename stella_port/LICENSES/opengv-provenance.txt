@@ -1,0 +1,13 @@
+Retrieved 2026-10-01. Attribution required by stella_vslam e445b545 README, License section.
+
+opengv-License.txt: SHA256 73318cebde5331e51cc0519cffc70e9465de7a41cdbe76cd635c96f399ae4be7
+opengv-Epnp.cpp: SHA256 b9d16c17a032390e09370a88217a48ae0480095749b5fd29b2d6d01a142c11a1
+
+https://github.com/laurentkneip/opengv/blob/master/License.txt
+https://github.com/laurentkneip/opengv/blob/master/src/absolute_pose/modules/Epnp.cpp
+
+OpenGV Epnp.cpp also credits the original EPnP authors at EPFL:
+Vincent Lepetit, Francesc Moreno-Noguer and Pascal Fua. Its header states
+that Laurent Kneip adapted their code to Eigen. The downloaded header
+uses the BSD-3-Clause notice reproduced here. This records upstream
+attribution; it is not an independent clearance of earlier EPnP history.

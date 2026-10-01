@@ -1,0 +1,682 @@
+--- a/src/stella_vslam/optimize/terminate_action.cc
++++ b/src/stella_vslam/optimize/terminate_action.cc
+@@ -27,6 +27,7 @@
+ // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include <stella_vslam/optimize/terminate_action.h>
++#include <stella_vslam/optimize/ba_trace.h> // [reference-port]
+ 
+ #include <g2o/core/sparse_optimizer.h>
+ 
+@@ -72,6 +73,12 @@
+             stopped_by_terminate_action_ = true;
+         }
+     }
++    { // [reference-port] optional per-iteration recorder (default off), see ba_trace.h
++        auto& ba_tr = ba_trace_global();
++        if (ba_tr.iter_hook) {
++            ba_tr.iter_hook(optimizer, params->iteration);
++        }
++    }
+     return this;
+ }
+ 
+--- a/src/stella_vslam/optimize/local_bundle_adjuster_g2o.cc
++++ b/src/stella_vslam/optimize/local_bundle_adjuster_g2o.cc
+@@ -5,6 +5,7 @@
+ #include "stella_vslam/marker_model/base.h"
+ #include "stella_vslam/optimize/local_bundle_adjuster_g2o.h"
+ #include "stella_vslam/optimize/terminate_action.h"
++#include "stella_vslam/optimize/ba_trace.h" // [reference-port]
+ #include "stella_vslam/optimize/internal/landmark_vertex_container.h"
+ #include "stella_vslam/optimize/internal/marker_vertex_container.h"
+ #include "stella_vslam/optimize/internal/se3/shot_vertex_container.h"
+@@ -44,6 +45,40 @@
+ 
+     local_keyfrms[curr_keyfrm->id_] = curr_keyfrm;
+     const auto curr_covisibilities = curr_keyfrm->graph_node_->get_covisibilities();
++
++    // [reference-port] ba_trace: map view, captured before anything is touched
++    ba_trace_call* tr = nullptr;
++    if (ba_trace_global().enabled) {
++        auto& calls = ba_trace_global().calls;
++        calls.emplace_back();
++        tr = &calls.back();
++        tr->kind = 0;
++        tr->call_index = ba_trace_global().next_call_index++;
++        tr->curr_keyfrm_id = curr_keyfrm->id_;
++        tr->fixed_keyframe_id_threshold = map_db->get_fixed_keyframe_id_threshold();
++        tr->num_first_iter = num_first_iter_;
++        tr->num_second_iter = num_second_iter_;
++        tr->gain_threshold = 1e-3;
++        tr->use_huber = 1;
++        tr->flag_given = force_stop_flag ? 1 : 0;
++        tr->flag_in = (force_stop_flag && *force_stop_flag) ? 1 : 0;
++        tr->use_additional_keyframes = use_additional_keyframes_for_monocular_ ? 1 : 0;
++        ba_trace_capture_camera(*tr, curr_keyfrm);
++        ba_trace_capture_kf(*tr, curr_keyfrm, true);
++        for (const auto& lm : curr_keyfrm->get_landmarks()) {
++            ba_trace_capture_lm(*tr, lm);
++        }
++        for (const auto& cv : curr_covisibilities) {
++            if (!cv) {
++                continue;
++            }
++            tr->order_keyfrm_ids.push_back(cv->id_);
++            ba_trace_capture_kf(*tr, cv, true);
++            for (const auto& lm : cv->get_landmarks()) {
++                ba_trace_capture_lm(*tr, lm);
++            }
++        }
++    }
+     for (const auto& local_keyfrm : curr_covisibilities) {
+         if (!local_keyfrm) {
+             continue;
+@@ -325,6 +360,13 @@
+         return;
+     }
+ 
++    if (tr) { // [reference-port]
++        tr->has_markers = local_mkrs.empty() ? 0 : 1;
++        tr->ran_optimize = 1;
++        ba_trace_capture_graph(*tr, optimizer, reproj_edge_wraps, keyfrm_vtx_container, lm_vtx_container);
++        ba_trace_install_hook(*tr, algorithm);
++        ba_trace_stage_begin(*tr, num_first_iter_, reproj_edge_wraps);
++    }
+     optimizer.initializeOptimization();
+     // [reference-port] chi2() needs computeActiveErrors() to have run at
+     // least once; both are read-only diagnostics, no effect on the
+@@ -332,6 +374,9 @@
+     optimizer.computeActiveErrors();
+     last_trace_.chi2_before = optimizer.activeChi2();
+     last_trace_.num_iters_first = optimizer.optimize(num_first_iter_);
++    if (tr) { // [reference-port]
++        ba_trace_stage_end(*tr, optimizer, last_trace_.num_iters_first, terminateAction->stopped_by_terminate_action_);
++    }
+     last_trace_.chi2_after = optimizer.activeChi2(); // overwritten below if the second pass runs
+ 
+     // 6. Discard outliers, then perform the second optimization
+@@ -365,8 +410,14 @@
+             edge->setRobustKernel(nullptr);
+         }
+ 
++        if (tr) { // [reference-port]
++            ba_trace_stage_begin(*tr, num_second_iter_, reproj_edge_wraps);
++        }
+         optimizer.initializeOptimization();
+         last_trace_.num_iters_second = optimizer.optimize(num_second_iter_); // [reference-port]
++        if (tr) { // [reference-port]
++            ba_trace_stage_end(*tr, optimizer, last_trace_.num_iters_second, terminateAction->stopped_by_terminate_action_);
++        }
+         optimizer.computeActiveErrors();
+         last_trace_.chi2_after = optimizer.activeChi2(); // [reference-port]
+     }
+@@ -398,6 +449,13 @@
+         }
+     }
+     last_trace_.num_outlier_observations_removed = (unsigned int)outlier_observations.size(); // [reference-port]
++    if (tr) { // [reference-port]
++        ba_trace_remove_hook();
++        ba_trace_capture_final(*tr, optimizer, reproj_edge_wraps);
++        for (const auto& oo : outlier_observations) {
++            tr->outliers.emplace_back(oo.first->id_, oo.second->id_);
++        }
++    }
+ 
+     // 8. Update the information
+ 
+@@ -420,6 +478,16 @@
+ 
+             auto keyfrm_vtx = keyfrm_vtx_container.get_vertex(local_keyfrm);
+             local_keyfrm->set_pose_cw(util::converter::to_eigen_mat(keyfrm_vtx->estimate()));
++            if (tr) { // [reference-port]
++                const Mat44_t applied = util::converter::to_eigen_mat(keyfrm_vtx->estimate());
++                std::vector<double> row_major(16);
++                for (int r = 0; r < 4; ++r) {
++                    for (int cc = 0; cc < 4; ++cc) {
++                        row_major[r * 4 + cc] = applied(r, cc);
++                    }
++                }
++                tr->applied_poses.emplace_back(local_keyfrm->id_, row_major);
++            }
+         }
+ 
+         for (const auto& id_local_lm_pair : local_lms) {
+--- a/src/stella_vslam/optimize/global_bundle_adjuster.cc
++++ b/src/stella_vslam/optimize/global_bundle_adjuster.cc
+@@ -5,6 +5,7 @@
+ #include "stella_vslam/marker_model/base.h"
+ #include "stella_vslam/optimize/global_bundle_adjuster.h"
+ #include "stella_vslam/optimize/terminate_action.h"
++#include "stella_vslam/optimize/ba_trace.h" // [reference-port]
+ #include "stella_vslam/optimize/internal/landmark_vertex_container.h"
+ #include "stella_vslam/optimize/internal/marker_vertex_container.h"
+ #include "stella_vslam/optimize/internal/se3/shot_vertex_container.h"
+@@ -36,7 +37,9 @@
+                    bool use_huber_kernel,
+                    bool fix_markers,
+                    bool verbose,
+-                   bool* const force_stop_flag) {
++                   bool* const force_stop_flag,
++                   ba_trace_call* tr = nullptr,                 // [reference-port]
++                   const terminate_action* tr_term = nullptr) { // [reference-port]
+     // 2. Construct an optimizer
+ 
+     std::unique_ptr<g2o::BlockSolverBase> block_solver;
+@@ -182,9 +185,26 @@
+ 
+     // 5. Perform optimization
+ 
++    if (tr) { // [reference-port]
++        tr->has_markers = markers.empty() ? 0 : 1;
++        tr->ran_optimize = 1;
++        ba_trace_capture_graph(*tr, optimizer, reproj_edge_wraps, keyfrm_vtx_container, lm_vtx_container);
++        ba_trace_install_hook(*tr, algorithm);
++        ba_trace_stage_begin(*tr, num_iter, reproj_edge_wraps);
++    }
+     optimizer.initializeOptimization();
+     optimizer.setVerbose(verbose);
+-    optimizer.optimize(num_iter);
++    const int tr_ret = optimizer.optimize(num_iter);
++    if (tr) { // [reference-port]
++        ba_trace_stage_end(*tr, optimizer, tr_ret, tr_term ? tr_term->stopped_by_terminate_action_ : false);
++        ba_trace_remove_hook();
++        ba_trace_capture_final(*tr, optimizer, reproj_edge_wraps);
++        for (unsigned int i = 0; i < lms.size(); ++i) {
++            if (is_optimized_lm.at(i) && lms.at(i)) {
++                tr->optimized_lm_ids.push_back(lms.at(i)->id_);
++            }
++        }
++    }
+ 
+     if (force_stop_flag && *force_stop_flag) {
+         return;
+@@ -207,6 +227,33 @@
+                                                          bool* const force_stop_flag) const {
+     std::vector<bool> is_optimized_lm(lms.size(), true);
+ 
++    // [reference-port] ba_trace (default off)
++    ba_trace_call* tr = nullptr;
++    if (ba_trace_global().enabled) {
++        auto& calls = ba_trace_global().calls;
++        calls.emplace_back();
++        tr = &calls.back();
++        tr->kind = 1;
++        tr->call_index = ba_trace_global().next_call_index++;
++        tr->num_first_iter = num_iter_;
++        tr->gain_threshold = gain_threshold;
++        tr->use_huber = use_huber_kernel_ ? 1 : 0;
++        tr->fix_markers = fix_markers ? 1 : 0;
++        tr->flag_given = force_stop_flag ? 1 : 0;
++        tr->flag_in = (force_stop_flag && *force_stop_flag) ? 1 : 0;
++        if (!keyfrms.empty()) {
++            ba_trace_capture_camera(*tr, keyfrms.front());
++        }
++        for (const auto& kf : keyfrms) {
++            tr->order_keyfrm_ids.push_back(kf ? kf->id_ : 0xFFFFFFFFu);
++            ba_trace_capture_kf(*tr, kf, true);
++        }
++        for (const auto& lm : lms) {
++            tr->order_lm_ids.push_back(lm ? lm->id_ : 0xFFFFFFFFu);
++            ba_trace_capture_lm(*tr, lm);
++        }
++    }
++
+     auto vtx_id_offset = std::make_shared<unsigned int>(0);
+     // Container of the shot vertices
+     internal::se3::shot_vertex_container keyfrm_vtx_container(vtx_id_offset, keyfrms.size());
+@@ -222,7 +269,7 @@
+     optimizer.addPostIterationAction(terminateAction);
+ 
+     optimize_impl(optimizer, keyfrms, lms, markers, is_optimized_lm, keyfrm_vtx_container, lm_vtx_container, marker_vtx_container,
+-                  mkr_has_vtx, num_iter_, use_huber_kernel_, fix_markers, verbose_, force_stop_flag);
++                  mkr_has_vtx, num_iter_, use_huber_kernel_, fix_markers, verbose_, force_stop_flag, tr, terminateAction);
+ 
+     if (force_stop_flag && *force_stop_flag) {
+         return;
+@@ -238,6 +285,15 @@
+         const auto cam_pose_cw = util::converter::to_eigen_mat(keyfrm_vtx->estimate());
+ 
+         keyfrm->set_pose_cw(cam_pose_cw);
++        if (tr) { // [reference-port]
++            std::vector<double> row_major(16);
++            for (int r = 0; r < 4; ++r) {
++                for (int cc = 0; cc < 4; ++cc) {
++                    row_major[r * 4 + cc] = cam_pose_cw(r, cc);
++                }
++            }
++            tr->applied_poses.emplace_back(keyfrm->id_, row_major);
++        }
+     }
+ 
+     for (unsigned int i = 0; i < lms.size(); ++i) {
+@@ -321,6 +377,33 @@
+ 
+     std::vector<bool> is_optimized_lm(lms.size(), true);
+ 
++    // [reference-port] ba_trace (default off)
++    ba_trace_call* tr = nullptr;
++    if (ba_trace_global().enabled) {
++        auto& calls = ba_trace_global().calls;
++        calls.emplace_back();
++        tr = &calls.back();
++        tr->kind = 2;
++        tr->call_index = ba_trace_global().next_call_index++;
++        tr->num_first_iter = num_iter_;
++        tr->gain_threshold = 1e-3;
++        tr->use_huber = use_huber_kernel_ ? 1 : 0;
++        tr->fix_markers = 0;
++        tr->flag_given = force_stop_flag ? 1 : 0;
++        tr->flag_in = (force_stop_flag && *force_stop_flag) ? 1 : 0;
++        if (!keyfrms.empty()) {
++            ba_trace_capture_camera(*tr, keyfrms.front());
++        }
++        for (const auto& kf : keyfrms) {
++            tr->order_keyfrm_ids.push_back(kf ? kf->id_ : 0xFFFFFFFFu);
++            ba_trace_capture_kf(*tr, kf, true);
++        }
++        for (const auto& lm : lms) {
++            tr->order_lm_ids.push_back(lm ? lm->id_ : 0xFFFFFFFFu);
++            ba_trace_capture_lm(*tr, lm);
++        }
++    }
++
+     auto vtx_id_offset = std::make_shared<unsigned int>(0);
+     // Container of the shot vertices
+     internal::se3::shot_vertex_container keyfrm_vtx_container(vtx_id_offset, keyfrms.size());
+@@ -336,9 +419,12 @@
+     optimizer.addPostIterationAction(terminateAction);
+ 
+     optimize_impl(optimizer, keyfrms, lms, markers, is_optimized_lm, keyfrm_vtx_container, lm_vtx_container, marker_vtx_container,
+-                  mkr_has_vtx, num_iter_, use_huber_kernel_, false, verbose_, force_stop_flag);
++                  mkr_has_vtx, num_iter_, use_huber_kernel_, false, verbose_, force_stop_flag, tr, terminateAction);
+ 
+     if (force_stop_flag && *force_stop_flag && !terminateAction->stopped_by_terminate_action_) {
++        if (tr) { // [reference-port]
++            tr->returned_ok = 0;
++        }
+         return false;
+     }
+ 
+@@ -354,6 +440,15 @@
+         const auto cam_pose_cw = util::converter::to_eigen_mat(keyfrm_vtx->estimate());
+ 
+         keyfrm_to_pose_cw_after_global_BA[keyfrm->id_] = cam_pose_cw;
++        if (tr) { // [reference-port]
++            std::vector<double> row_major(16);
++            for (int r = 0; r < 4; ++r) {
++                for (int cc = 0; cc < 4; ++cc) {
++                    row_major[r * 4 + cc] = cam_pose_cw(r, cc);
++                }
++            }
++            tr->applied_poses.emplace_back(keyfrm->id_, row_major);
++        }
+         optimized_keyfrm_ids.insert(keyfrm->id_);
+     }
+ 
+--- /dev/null
++++ b/src/stella_vslam/optimize/ba_trace.h
+@@ -0,0 +1,363 @@
++#ifndef STELLA_VSLAM_OPTIMIZE_BA_TRACE_H
++#define STELLA_VSLAM_OPTIMIZE_BA_TRACE_H
++
++// [reference-port] opt-in (default OFF) capture of real bundle-adjustment
++// calls -- local_bundle_adjuster_g2o::optimize() and
++// global_bundle_adjuster::{optimize_for_initialization,optimize}() -- for
++// stella_port/ module 4b part 2. Purely additive/read-only: every field is
++// read from state the algorithm itself already built; no algorithm value is
++// changed. See stella_port/HANDOVER.md and
++// stella_port/reference_tools/dump_stella_g2o_ba.cc (the serializer).
++
++#include "stella_vslam/data/keyframe.h"
++#include "stella_vslam/data/landmark.h"
++#include "stella_vslam/camera/perspective.h"
++#include "stella_vslam/feature/orb_params.h"
++#include "stella_vslam/optimize/internal/landmark_vertex_container.h"
++#include "stella_vslam/optimize/internal/se3/shot_vertex_container.h"
++#include "stella_vslam/optimize/internal/se3/reproj_edge_wrapper.h"
++#include "stella_vslam/util/converter.h"
++
++#include <g2o/core/sparse_optimizer.h>
++#include <g2o/core/robust_kernel_impl.h>
++#include <g2o/core/optimization_algorithm_levenberg.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <set>
++#include <vector>
++
++namespace g2o {
++class SparseOptimizer;
++} // namespace g2o
++
++namespace stella_vslam {
++namespace optimize {
++
++struct ba_trace_iter {
++    double chi2 = 0;   // activeRobustChi2() after this iteration's computeActiveErrors()
++    double lambda = 0; // OptimizationAlgorithmLevenberg::currentLambda() after the iteration
++    int lev_iter = 0;  // levenbergIteration() (trials in this iteration's do-while)
++    unsigned int flag = 0; // optimizer forceStopFlag value after terminate_action ran
++};
++
++struct ba_trace_stage {
++    unsigned int requested_iters = 0;
++    int returned_iters = 0;
++    unsigned int flag_after = 0;
++    bool stopped_by_terminate = false;
++    std::vector<unsigned char> edge_level_at_start; // per edge (insertion order)
++    std::vector<ba_trace_iter> iters;
++};
++
++struct ba_trace_vertex {
++    unsigned int vtx_id = 0;
++    int is_landmark = 0;
++    int fixed = 0;
++    unsigned int owner_id = 0; // keyframe id / landmark id
++    double est_init[7] = {};   // shot: qx,qy,qz,qw,tx,ty,tz ; landmark: x,y,z,0,0,0,0
++    double est_final[7] = {};
++};
++
++struct ba_trace_edge {
++    unsigned int lm_vtx_id = 0, kf_vtx_id = 0;
++    unsigned int kf_id = 0, lm_id = 0, idx = 0;
++    double obs[2] = {};
++    double inv_sigma_sq = 0; // information = Identity * inv_sigma_sq (float widened)
++    double huber_delta = 0;  // 0 if no robust kernel
++    int has_kernel = 0;
++    // final state
++    double chi2_final = 0;
++    double err_final[2] = {};
++    int depth_positive_final = 0;
++    int level_final = 0;
++};
++
++struct ba_trace_mv_kf {
++    unsigned int id = 0;
++    int erased = 0, spanning_root = 0;
++    double pose_cw[16] = {}; // row-major
++    bool has_lm_slots = false;
++    std::vector<unsigned int> lm_slots; // 0xFFFFFFFF = null
++    struct kp { unsigned int idx; float x, y; int octave; };
++    std::map<unsigned int, kp> kps; // sparse: only referenced indices
++};
++
++struct ba_trace_mv_lm {
++    unsigned int id = 0;
++    int erased = 0;
++    double pos[3] = {};
++    std::vector<std::pair<unsigned int, unsigned int>> obs; // (kf id, idx) in get_observations() order
++};
++
++struct ba_trace_call {
++    int kind = 0; // 0 local, 1 global initialization, 2 global (loop) BA
++    unsigned int call_index = 0;
++    unsigned int curr_keyfrm_id = 0;
++    unsigned int fixed_keyframe_id_threshold = 0;
++    unsigned int num_first_iter = 0, num_second_iter = 0;
++    double gain_threshold = 0;
++    int use_huber = 0, fix_markers = 0;
++    int flag_given = 0;
++    unsigned int flag_in = 0;
++    int use_additional_keyframes = 0;
++    int has_markers = 0;
++    double fx = 0, fy = 0, cx = 0, cy = 0;
++    std::vector<float> inv_level_sigma_sq;
++    // map view
++    std::vector<unsigned int> order_keyfrm_ids; // local: covisibilities of curr (get_covisibilities order); global: keyfrms argument order
++    std::vector<unsigned int> order_lm_ids;     // global initialization: lms argument order (else empty)
++    std::map<unsigned int, ba_trace_mv_kf> mv_kfs;
++    std::map<unsigned int, ba_trace_mv_lm> mv_lms;
++    // built graph (insertion order)
++    std::vector<ba_trace_vertex> vertices;
++    std::vector<ba_trace_edge> edges;
++    std::vector<ba_trace_stage> stages;
++    std::vector<std::pair<unsigned int, unsigned int>> outliers; // (kf id, lm id)
++    std::vector<std::pair<unsigned int, std::vector<double>>> applied_poses; // (kf id, Mat44 row-major) that set_pose_cw() received
++    int ran_optimize = 0;
++    int returned_ok = 1; // global optimize() return value
++    std::vector<unsigned int> optimized_lm_ids; // global: landmarks whose vertex was kept
++};
++
++struct ba_trace_state {
++    bool enabled = false;
++    unsigned int next_call_index = 0;
++    std::vector<ba_trace_call> calls;
++    ba_trace_call* current = nullptr;
++    // per-iteration hook, called from terminate_action after it has run
++    std::function<void(const g2o::SparseOptimizer*, int)> iter_hook;
++};
++
++inline ba_trace_state& ba_trace_global() {
++    static ba_trace_state s;
++    return s;
++}
++inline void ba_trace_enable(bool e) { ba_trace_global().enabled = e; }
++inline void ba_trace_clear() {
++    auto& s = ba_trace_global();
++    s.calls.clear();
++    s.next_call_index = 0;
++    s.current = nullptr;
++}
++inline const std::vector<ba_trace_call>& ba_trace_get() { return ba_trace_global().calls; }
++
++// ---- capture helpers (called only when enabled) ----
++
++inline void ba_trace_capture_kf(ba_trace_call& c, const std::shared_ptr<data::keyframe>& kf, bool with_lm_slots) {
++    if (!kf) {
++        return;
++    }
++    auto& r = c.mv_kfs[kf->id_];
++    r.id = kf->id_;
++    r.erased = kf->will_be_erased() ? 1 : 0;
++    r.spanning_root = kf->graph_node_->is_spanning_root() ? 1 : 0;
++    const Mat44_t pose = kf->get_pose_cw();
++    for (int i = 0; i < 4; ++i) {
++        for (int j = 0; j < 4; ++j) {
++            r.pose_cw[i * 4 + j] = pose(i, j);
++        }
++    }
++    if (with_lm_slots && !r.has_lm_slots) {
++        r.has_lm_slots = true;
++        for (const auto& lm : kf->get_landmarks()) {
++            r.lm_slots.push_back(lm ? (unsigned int)lm->id_ : 0xFFFFFFFFu);
++        }
++    }
++}
++
++inline void ba_trace_capture_lm(ba_trace_call& c, const std::shared_ptr<data::landmark>& lm) {
++    if (!lm || c.mv_lms.count(lm->id_)) {
++        return;
++    }
++    auto& r = c.mv_lms[lm->id_];
++    r.id = lm->id_;
++    r.erased = lm->will_be_erased() ? 1 : 0;
++    const Vec3_t p = lm->get_pos_in_world();
++    r.pos[0] = p(0);
++    r.pos[1] = p(1);
++    r.pos[2] = p(2);
++    for (const auto& obs : lm->get_observations()) {
++        const auto kf = obs.first.lock();
++        if (!kf) {
++            continue;
++        }
++        r.obs.emplace_back(kf->id_, obs.second);
++        ba_trace_capture_kf(c, kf, false);
++        auto& k = c.mv_kfs[kf->id_];
++        if (!k.kps.count(obs.second)) {
++            const auto& kp = kf->frm_obs_.undist_keypts_.at(obs.second);
++            k.kps[obs.second] = ba_trace_mv_kf::kp{obs.second, kp.pt.x, kp.pt.y, kp.octave};
++        }
++    }
++}
++
++inline void ba_trace_capture_camera(ba_trace_call& c, const std::shared_ptr<data::keyframe>& kf) {
++    if (!kf) {
++        return;
++    }
++    if (kf->camera_->model_type_ == camera::model_type_t::Perspective) {
++        const auto pc = static_cast<const camera::perspective*>(kf->camera_);
++        c.fx = pc->fx_;
++        c.fy = pc->fy_;
++        c.cx = pc->cx_;
++        c.cy = pc->cy_;
++    }
++    c.inv_level_sigma_sq = kf->orb_params_->inv_level_sigma_sq_;
++}
++
++// optimizer.vertices() is an unordered_map<int, Vertex*>; sort by id (== creation order)
++inline std::vector<g2o::OptimizableGraph::Vertex*> ba_trace_sorted_vertices(g2o::SparseOptimizer& optimizer) {
++    std::vector<g2o::OptimizableGraph::Vertex*> vs;
++    for (const auto& id_v : optimizer.vertices()) {
++        vs.push_back(static_cast<g2o::OptimizableGraph::Vertex*>(id_v.second));
++    }
++    std::sort(vs.begin(), vs.end(), [](const g2o::OptimizableGraph::Vertex* a, const g2o::OptimizableGraph::Vertex* b) {
++        return a->id() < b->id();
++    });
++    return vs;
++}
++
++// Vertices (id order == creation order) and monocular reprojection edges
++// (wrapper vector order == insertion order), captured right before the
++// first optimize().
++inline void ba_trace_capture_graph(ba_trace_call& c, g2o::SparseOptimizer& optimizer,
++                                   const std::vector<internal::se3::reproj_edge_wrapper<data::keyframe>>& wraps,
++                                   const internal::se3::shot_vertex_container& kfc,
++                                   const internal::landmark_vertex_container& lmc) {
++    for (auto* v : ba_trace_sorted_vertices(optimizer)) {
++        ba_trace_vertex tv;
++        tv.vtx_id = v->id();
++        tv.fixed = v->fixed() ? 1 : 0;
++        if (auto* sv = dynamic_cast<internal::se3::shot_vertex*>(v)) {
++            tv.is_landmark = 0;
++            tv.owner_id = kfc.get_id(tv.vtx_id);
++            const g2o::SE3Quat& e = sv->estimate();
++            tv.est_init[0] = e.rotation().x();
++            tv.est_init[1] = e.rotation().y();
++            tv.est_init[2] = e.rotation().z();
++            tv.est_init[3] = e.rotation().w();
++            tv.est_init[4] = e.translation()(0);
++            tv.est_init[5] = e.translation()(1);
++            tv.est_init[6] = e.translation()(2);
++        }
++        else if (auto* lv = dynamic_cast<internal::landmark_vertex*>(v)) {
++            tv.is_landmark = 1;
++            tv.owner_id = lmc.get_id(tv.vtx_id);
++            tv.est_init[0] = lv->estimate()(0);
++            tv.est_init[1] = lv->estimate()(1);
++            tv.est_init[2] = lv->estimate()(2);
++        }
++        else {
++            c.has_markers = 1;
++        }
++        c.vertices.push_back(tv);
++    }
++    for (const auto& w : wraps) {
++        if (!w.is_monocular_) {
++            c.has_markers = 1; // unsupported shape, harness skips the call
++            continue;
++        }
++        auto* e = static_cast<internal::se3::mono_perspective_reproj_edge*>(w.edge_);
++        ba_trace_edge te;
++        te.lm_vtx_id = e->vertex(0)->id();
++        te.kf_vtx_id = e->vertex(1)->id();
++        te.kf_id = w.shot_->id_;
++        te.lm_id = w.lm_ ? w.lm_->id_ : 0xFFFFFFFFu;
++        te.idx = w.idx_;
++        te.obs[0] = e->measurement()(0);
++        te.obs[1] = e->measurement()(1);
++        te.inv_sigma_sq = e->information()(0, 0);
++        if (auto* hk = dynamic_cast<g2o::RobustKernelHuber*>(e->robustKernel())) {
++            te.has_kernel = 1;
++            te.huber_delta = hk->delta();
++        }
++        c.edges.push_back(te);
++    }
++}
++
++// Final estimates / edge state; call after the last optimize().
++inline void ba_trace_capture_final(ba_trace_call& c, g2o::SparseOptimizer& optimizer,
++                                   const std::vector<internal::se3::reproj_edge_wrapper<data::keyframe>>& wraps) {
++    size_t vi = 0;
++    for (auto* v : ba_trace_sorted_vertices(optimizer)) {
++        auto& tv = c.vertices.at(vi++);
++        if (auto* sv = dynamic_cast<internal::se3::shot_vertex*>(v)) {
++            const g2o::SE3Quat& e = sv->estimate();
++            tv.est_final[0] = e.rotation().x();
++            tv.est_final[1] = e.rotation().y();
++            tv.est_final[2] = e.rotation().z();
++            tv.est_final[3] = e.rotation().w();
++            tv.est_final[4] = e.translation()(0);
++            tv.est_final[5] = e.translation()(1);
++            tv.est_final[6] = e.translation()(2);
++        }
++        else if (auto* lv = dynamic_cast<internal::landmark_vertex*>(v)) {
++            tv.est_final[0] = lv->estimate()(0);
++            tv.est_final[1] = lv->estimate()(1);
++            tv.est_final[2] = lv->estimate()(2);
++        }
++    }
++    size_t ei = 0;
++    for (const auto& w : wraps) {
++        if (!w.is_monocular_) {
++            continue;
++        }
++        auto* e = static_cast<internal::se3::mono_perspective_reproj_edge*>(w.edge_);
++        auto& te = c.edges.at(ei++);
++        te.chi2_final = e->chi2();
++        te.err_final[0] = e->error()(0);
++        te.err_final[1] = e->error()(1);
++        te.depth_positive_final = w.depth_is_positive() ? 1 : 0;
++        te.level_final = e->level();
++    }
++}
++
++inline void ba_trace_stage_begin(ba_trace_call& c, unsigned int requested,
++                                 const std::vector<internal::se3::reproj_edge_wrapper<data::keyframe>>& wraps) {
++    c.stages.emplace_back();
++    auto& st = c.stages.back();
++    st.requested_iters = requested;
++    for (const auto& w : wraps) {
++        st.edge_level_at_start.push_back((unsigned char)w.edge_->level());
++    }
++}
++
++inline void ba_trace_stage_end(ba_trace_call& c, g2o::SparseOptimizer& optimizer, int returned, bool stopped_by_terminate) {
++    auto& st = c.stages.back();
++    st.returned_iters = returned;
++    st.flag_after = optimizer.forceStopFlag() ? (*optimizer.forceStopFlag() ? 1u : 0u) : 0u;
++    st.stopped_by_terminate = stopped_by_terminate;
++}
++
++// Installs the per-iteration recorder (invoked from terminate_action after
++// its own bookkeeping). `c.stages.back()` receives the samples.
++inline void ba_trace_install_hook(ba_trace_call& c, g2o::OptimizationAlgorithmLevenberg* algo) {
++    auto& s = ba_trace_global();
++    s.current = &c;
++    s.iter_hook = [&c, algo](const g2o::SparseOptimizer* opt, int iteration) {
++        if (iteration < 0 || c.stages.empty()) {
++            return;
++        }
++        ba_trace_iter it;
++        it.chi2 = opt->activeRobustChi2();
++        it.lambda = algo->currentLambda();
++        it.lev_iter = algo->levenbergIteration();
++        it.flag = opt->forceStopFlag() ? (*opt->forceStopFlag() ? 1u : 0u) : 0u;
++        c.stages.back().iters.push_back(it);
++    };
++}
++
++inline void ba_trace_remove_hook() {
++    auto& s = ba_trace_global();
++    s.current = nullptr;
++    s.iter_hook = nullptr;
++}
++
++} // namespace optimize
++} // namespace stella_vslam
++
++#endif // STELLA_VSLAM_OPTIMIZE_BA_TRACE_H

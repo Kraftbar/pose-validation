@@ -1,0 +1,53 @@
+{
+  "name": "own_orb_v1",
+  "artifact_sha256": "4bd76eabd355a54225cf0b2b057afd565aba48d42e70dcf7477b4dfab9b624a5",
+  "artifact_bytes": 38128064,
+  "license": "CC-BY-4.0",
+  "training_sources": [
+    {
+      "sequence": "rgbd_dataset_freiburg2_large_no_loop",
+      "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_large_no_loop.tgz",
+      "archive_sha256": "82f03f395318f9ac07b788a1b080c6b6813a5e9d7954d4220cb73fbb0f41a9f4",
+      "rgb_list_sha256": "108556d391191dffeb8c198dc1cecd70305d300d10a22454690744a9f3497bbd",
+      "license": "CC-BY-4.0",
+      "license_source": "https://cvg.cit.tum.de/data/datasets/rgbd-dataset#license"
+    },
+    {
+      "sequence": "rgbd_dataset_freiburg3_teddy",
+      "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_teddy.tgz",
+      "archive_sha256": "7e25358ab955b9dcaf6cb6fd2d62668345aee97dfd2f173cb3729f5b4bfd4a5f",
+      "rgb_list_sha256": "fa51b526dfefb084149f1b705327b3e5a351c14b67d9da5a546491d879542eed",
+      "license": "CC-BY-4.0",
+      "license_source": "https://cvg.cit.tum.de/data/datasets/rgbd-dataset#license"
+    }
+  ],
+  "training_image_manifest_sha256": "9f3e487d14d5457c2abc4b28e1cfec334ac5ac390017b8f9ca79c1791bf313e2",
+  "descriptor_sha256": "85975ba92f84f55fab082173a401cc9ed33324284122f65f61703a1cdb31050e",
+  "extractor_binary_sha256": "2a5d9dce12adf4f6a484262682a1d658f58cee4ce97f59d80e59ac4dbabc6964",
+  "trainer_binary_sha256": "f2532717649e44ae7c2883a9f78f098ea8e5723eb9efe12dc36ced670fb044bc",
+  "trainer_source_sha256": "f411b8eae46a2bc531e2d42e5e6b483210a86eed9f439165eff9ae9f3da277fa",
+  "parameters": {
+    "documents": 962,
+    "descriptors": 754938,
+    "nodes": 571378,
+    "words": 486271,
+    "blocks": 85107,
+    "zero_df_words": 0,
+    "k": 10,
+    "depth": 6,
+    "iterations": 15,
+    "seed": 20260930,
+    "idf": "log((documents+1)/(df+1))+1"
+  },
+  "two_process_extraction_identical": true,
+  "two_process_training_identical": true,
+  "compatibility": "962 documents, native/C FBoW: 0/2865573\n",
+  "eval_exclusion": [
+    "fr1_xyz",
+    "fr1_desk",
+    "fr1_floor",
+    "fr2_xyz",
+    "fr3_long_office"
+  ],
+  "selection": "single predeclared candidate; no selection using comparison ATE"
+}

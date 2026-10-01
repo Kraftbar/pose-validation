@@ -1,0 +1,229 @@
+Isolated relocalizer observer, namespace rename and deterministic seed forwarding for the optional robust matcher.
+
+--- a/src/stella_vslam/module/relocalizer.h
++++ b/src/stella_vslam/module/relocalizer.h
+@@ -1,11 +1,11 @@
+-#ifndef STELLA_VSLAM_MODULE_RELOCALIZER_H
+-#define STELLA_VSLAM_MODULE_RELOCALIZER_H
++#ifndef SV_OBSERVED_RELOCALIZER_H
++#define SV_OBSERVED_RELOCALIZER_H
+ 
+ #include "stella_vslam/match/bow_tree.h"
+ #include "stella_vslam/match/projection.h"
+ #include "stella_vslam/match/robust.h"
+ #include "stella_vslam/optimize/pose_optimizer.h"
+-#include "stella_vslam/solve/pnp_solver.h"
++#include "pnp_solver.h"
+ 
+ #include <memory>
+ 
+@@ -16,7 +16,7 @@
+ class bow_database;
+ } // namespace data
+ 
+-namespace module {
++namespace reloc_reference {
+ 
+ class relocalizer {
+ public:
+@@ -66,7 +66,7 @@
+     std::vector<unsigned int> extract_valid_indices(const std::vector<std::shared_ptr<data::landmark>>& landmarks) const;
+ 
+     //! Setup PnP solver with the specified 2D-3D matches
+-    std::unique_ptr<solve::pnp_solver> setup_pnp_solver(const std::vector<unsigned int>& valid_indices,
++    std::unique_ptr<reloc_reference::pnp_solver> setup_pnp_solver(const std::vector<unsigned int>& valid_indices,
+                                                         const eigen_alloc_vector<Vec3_t>& bearings,
+                                                         const std::vector<cv::KeyPoint>& keypts,
+                                                         const std::vector<std::shared_ptr<data::landmark>>& matched_landmarks,
+@@ -104,4 +104,4 @@
+ } // namespace module
+ } // namespace stella_vslam
+ 
+-#endif // STELLA_VSLAM_MODULE_RELOCALIZER_H
++#endif // SV_OBSERVED_RELOCALIZER_H
+--- a/src/stella_vslam/module/relocalizer.cc
++++ b/src/stella_vslam/module/relocalizer.cc
+@@ -3,14 +3,15 @@
+ #include "stella_vslam/data/landmark.h"
+ #include "stella_vslam/data/bow_database.h"
+ #include "stella_vslam/module/local_map_updater.h"
+-#include "stella_vslam/module/relocalizer.h"
++#include "relocalizer.h"
++#include "reloc_trace.hpp"
+ #include "stella_vslam/optimize/pose_optimizer_g2o.h"
+ #include "stella_vslam/util/fancy_index.h"
+ 
+ #include <spdlog/spdlog.h>
+ 
+ namespace stella_vslam {
+-namespace module {
++namespace reloc_reference {
+ 
+ relocalizer::relocalizer(const std::shared_ptr<optimize::pose_optimizer>& pose_optimizer,
+                          const double bow_match_lowe_ratio, const double proj_match_lowe_ratio,
+@@ -56,6 +57,7 @@
+ bool relocalizer::relocalize(data::bow_database* bow_db, data::frame& curr_frm) {
+     // Acquire relocalization candidates
+     const auto reloc_candidates = bow_db->acquire_keyframes(curr_frm.bow_vec_, 0.0f, num_common_words_thr_ratio_);
++    reloc_trace::ids("candidates", reloc_candidates);
+     if (reloc_candidates.empty()) {
+         return false;
+     }
+@@ -73,12 +75,15 @@
+     // Compute matching points for each candidate by using BoW tree matcher
+     for (unsigned int i = 0; i < num_candidates; ++i) {
+         const auto& candidate_keyfrm = reloc_candidates.at(i);
++        reloc_trace::scalar("candidate", candidate_keyfrm->id_);
+         if (candidate_keyfrm->will_be_erased()) {
+             spdlog::debug("keyframe will be erased. candidate keyframe id is {}", candidate_keyfrm->id_);
+             continue;
+         }
+ 
+         bool ok = reloc_by_candidate(curr_frm, candidate_keyfrm, use_robust_matcher);
++        reloc_trace::scalar("candidate_ok", ok);
++        reloc_trace::frame("candidate", curr_frm);
+         if (ok) {
+             spdlog::info("relocalization succeeded (frame={}, keyframe={})", curr_frm.id_, candidate_keyfrm->id_);
+             // TODO: should set the reference keyframe of the current frame
+@@ -87,6 +92,7 @@
+     }
+ 
+     curr_frm.invalidate_pose();
++    reloc_trace::frame("failed", curr_frm);
+     return false;
+ }
+ 
+@@ -96,6 +102,8 @@
+     std::vector<unsigned int> inlier_indices;
+     std::vector<std::shared_ptr<data::landmark>> matched_landmarks;
+     bool ok = relocalize_by_pnp_solver(curr_frm, candidate_keyfrm, use_robust_matcher, inlier_indices, matched_landmarks);
++    reloc_trace::scalar("pnp_ok", ok);
++    reloc_trace::frame("pnp", curr_frm);
+     if (!ok) {
+         return false;
+     }
+@@ -109,6 +117,8 @@
+ 
+     std::vector<bool> outlier_flags;
+     ok = optimize_pose(curr_frm, candidate_keyfrm, outlier_flags);
++    reloc_trace::scalar("optimize_ok", ok);
++    reloc_trace::frame("optimize", curr_frm);
+     if (!ok) {
+         return false;
+     }
+@@ -123,11 +133,15 @@
+     }
+ 
+     ok = refine_pose(curr_frm, candidate_keyfrm, already_found_landmarks);
++    reloc_trace::scalar("refine_ok", ok);
++    reloc_trace::frame("refine", curr_frm);
+     if (!ok) {
+         return false;
+     }
+ 
+     ok = refine_pose_by_local_map(curr_frm, candidate_keyfrm);
++    reloc_trace::scalar("local_ok", ok);
++    reloc_trace::frame("local", curr_frm);
+     return ok;
+ }
+ 
+@@ -136,8 +150,10 @@
+                                            bool use_robust_matcher,
+                                            std::vector<unsigned int>& inlier_indices,
+                                            std::vector<std::shared_ptr<data::landmark>>& matched_landmarks) const {
+-    const auto num_matches = use_robust_matcher ? robust_matcher_.match_frame_and_keyframe(curr_frm, candidate_keyfrm, matched_landmarks)
++    const auto num_matches = use_robust_matcher ? robust_matcher_.match_frame_and_keyframe(curr_frm, candidate_keyfrm, matched_landmarks, use_fixed_seed_)
+                                                 : bow_matcher_.match_frame_and_keyframe(candidate_keyfrm, curr_frm, matched_landmarks);
++    reloc_trace::scalar("initial_matches", num_matches);
++    reloc_trace::ids("initial_landmarks", matched_landmarks);
+     // Discard the candidate if the number of 2D-3D matches is less than the threshold
+     if (num_matches < min_num_bow_matches_) {
+         spdlog::debug("Number of 2D-3D matches ({}) < threshold ({}). candidate keyframe id is {}", num_matches, min_num_bow_matches_, candidate_keyfrm->id_);
+@@ -160,7 +176,7 @@
+ 
+         for (const auto& ngh_keyfrm : ngh_keyfrms) {
+             std::vector<std::shared_ptr<data::landmark>> additional_matched_landmarks;
+-            const auto num_additional_matches = use_robust_matcher ? robust_matcher_.match_frame_and_keyframe(curr_frm, ngh_keyfrm, additional_matched_landmarks)
++            const auto num_additional_matches = use_robust_matcher ? robust_matcher_.match_frame_and_keyframe(curr_frm, ngh_keyfrm, additional_matched_landmarks, use_fixed_seed_)
+                                                                    : bow_matcher_.match_frame_and_keyframe(ngh_keyfrm, curr_frm, additional_matched_landmarks);
+             assert(matched_landmarks.size() == additional_matched_landmarks.size());
+             int num_associated = 0;
+@@ -188,6 +204,7 @@
+     }
+ 
+     // Setup an PnP solver with the current 2D-3D matches
++    reloc_trace::ids("expanded_landmarks", matched_landmarks);
+     const auto valid_indices = extract_valid_indices(matched_landmarks);
+     auto pnp_solver = setup_pnp_solver(valid_indices, curr_frm.frm_obs_.bearings_, curr_frm.frm_obs_.undist_keypts_,
+                                        matched_landmarks, curr_frm.orb_params_->scale_factors_);
+@@ -242,6 +259,8 @@
+ 
+     // Projection match based on the pre-optimized camera pose
+     auto num_found = proj_matcher_.match_frame_and_keyframe(curr_frm, candidate_keyfrm, already_found_landmarks, 10, 100);
++    reloc_trace::scalar("projection10", num_found);
++    reloc_trace::frame("projection10", curr_frm);
+     // Discard the candidate if the number of the inliers is less than the threshold
+     if (num_valid_obs + num_found < min_num_valid_obs_) {
+         spdlog::debug("Number of inliers ({}) < threshold ({}). candidate keyframe id is {}", num_valid_obs + num_found, min_num_valid_obs_, candidate_keyfrm->id_);
+@@ -265,6 +284,8 @@
+     }
+     // Apply projection match again, then set the 2D-3D matches
+     auto num_additional = proj_matcher_.match_frame_and_keyframe(curr_frm, candidate_keyfrm, already_found_landmarks1, 3, 64);
++    reloc_trace::scalar("projection3", num_additional);
++    reloc_trace::frame("projection3", curr_frm);
+ 
+     // Discard if the number of the observations is less than the threshold
+     if (num_valid_obs1 + num_additional < min_num_valid_obs_) {
+@@ -306,6 +327,8 @@
+     auto local_keyfrms = local_map_updater.get_local_keyframes();
+     auto local_landmarks = local_map_updater.get_local_landmarks();
+     auto nearest_covisibility = local_map_updater.get_nearest_covisibility();
++    reloc_trace::ids("local_keys", local_keyfrms);
++    reloc_trace::ids("local_landmarks", local_landmarks);
+     SPDLOG_TRACE("refine_pose_by_local_map: keyfrms={}, lms={} nearest_covisibility id={}", local_keyfrms.size(), local_landmarks.size(), nearest_covisibility->id_);
+ 
+     std::vector<int> margins{5, 15, 5};
+@@ -352,19 +375,24 @@
+         }
+ 
+         if (!found_proj_candidate) {
++            reloc_trace::scalar("local_visible", found_proj_candidate);
+             return false;
+         }
+ 
+         // acquire more 2D-3D matches by projecting the local landmarks to the current frame
++        reloc_trace::scalar("local_visible", found_proj_candidate);
+         match::projection projection_matcher(0.8);
+         const float margin = margins[i];
+         auto num_additional_matches = projection_matcher.match_frame_and_landmarks(curr_frm, local_landmarks, lm_to_reproj, lm_to_x_right, lm_to_scale, margin);
++        reloc_trace::scalar("local_additional", num_additional_matches);
++        reloc_trace::frame("local_projection", curr_frm);
+ 
+         // optimize the pose
+         Mat44_t optimized_pose;
+         std::vector<bool> outlier_flags;
+         auto num_valid_obs = pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+         curr_frm.set_pose_cw(optimized_pose);
++        reloc_trace::scalar("local_valid", num_valid_obs);
+ 
+         // Reject outliers
+         for (unsigned int idx = 0; idx < curr_frm.frm_obs_.undist_keypts_.size(); ++idx) {
+@@ -404,7 +432,7 @@
+     return valid_indices;
+ }
+ 
+-std::unique_ptr<solve::pnp_solver> relocalizer::setup_pnp_solver(const std::vector<unsigned int>& valid_indices,
++std::unique_ptr<reloc_reference::pnp_solver> relocalizer::setup_pnp_solver(const std::vector<unsigned int>& valid_indices,
+                                                                  const eigen_alloc_vector<Vec3_t>& bearings,
+                                                                  const std::vector<cv::KeyPoint>& keypts,
+                                                                  const std::vector<std::shared_ptr<data::landmark>>& matched_landmarks,
+@@ -422,7 +450,8 @@
+         valid_points.at(i) = valid_assoc_lms.at(i)->get_pos_in_world();
+     }
+     // Setup PnP solver
+-    return std::unique_ptr<solve::pnp_solver>(new solve::pnp_solver(valid_bearings, octaves, valid_points, scale_factors, 10, use_fixed_seed_));
++    if (reloc_trace::pnp_input) reloc_trace::pnp_input(valid_bearings, octaves, valid_points, scale_factors);
++    return std::unique_ptr<reloc_reference::pnp_solver>(new reloc_reference::pnp_solver(valid_bearings, octaves, valid_points, scale_factors, 10, use_fixed_seed_));
+ }
+ 
+ } // namespace module

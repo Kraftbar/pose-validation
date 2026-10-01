@@ -1,0 +1,1067 @@
+Patch 0013 -- loop closing (module 7): id-ordered containers, loop trace, opt-in Eigen solver
+
+Three independent parts; parts 1 and 3 do not change any computed value in a
+default run, part 2 is dump-only and off unless the driver enables it.
+
+1. Determinism (order only). The loop-correction path used POINTER-ordered
+   containers whose iteration order decides which landmark/keyframe is handled
+   first (ASLR-dependent, so two runs of the same binary could differ once a
+   loop is accepted):
+     * module::keyframe_Sim3_pairs_t  std::map<shared_ptr<keyframe>, Sim3,
+       std::less<...>> -> id_less. Iterated by correct_covisibility_landmarks()
+       (a landmark seen by several neighbors is corrected with the FIRST
+       neighbor in iteration order: found_lm_to_ref_keyfrm_id) and by
+       replace_duplicated_landmarks() (neighbor order of the fuse pass).
+     * graph_node::get_loop_edges()  std::set<shared_ptr<keyframe>> ->
+       id_ordered_set (iterated by graph_optimizer -> edge insertion order).
+     * global_optimization_module::extract_new_connections() and
+       graph_optimizer::optimize()'s loop_connections: outer map and inner
+       sets pointer-ordered -> id-ordered (edge insertion order = g2o edge
+       ids = Hessian accumulation order).
+   nullptr keys (expired weak_ptr locks in get_connected_keyframes()) sort last
+   (id_less semantics), as the DETERMINISTIC aliases already do elsewhere.
+   Membership-only containers (keyfrms_to_reject, keyframe_set::keyfrm_set_,
+   the already_checked map) are untouched: their order is unobservable.
+
+2. Loop trace (dump only). New util/loop_trace.h (+ globals in
+   util/erasure_log.cc): when the driver sets util::g_loop_trace to a FILE*,
+   loop_detector, transform_optimizer, graph_optimizer and
+   global_optimization_module::{run_step,correct_loop} print one tab separated
+   line per event (%a doubles). util::g_loop_hook(phase) is called from
+   run_step() with phase 0 before the step, 1 after the pose graph
+   optimization, 2 after an accepted loop incl. the loop BA. Extra read-only
+   getter data::bow_database::get_all_keyframe_ids().
+
+3. Opt-in solver switch (default OFF). With env STELLA_PORT_EIGEN_SOLVER set,
+   graph_optimizer and global_bundle_adjuster use g2o's LinearSolverEigen
+   (SimplicialLLT + AMD, the solver the C port reimplements) instead of the
+   LGPL CSparse solver. Without the variable behaviour is unchanged.
+
+4. Opt-in threshold overrides (default = upstream constants): env
+   STELLA_PORT_LOOP_THR_OPT1 / _A / _B replace the three hard-coded validation
+   thresholds of loop_detector::select_loop_candidate_via_Sim3() (10 / 25 / 40),
+   so rejection at each later stage can be provoked on real data. The values in
+   effect are printed in the CAND trace line; the YAML-configured detector
+   parameters are printed in the DET line.
+
+diff -ruN a/src/stella_vslam/data/bow_database.cc b/src/stella_vslam/data/bow_database.cc
+--- a/src/stella_vslam/data/bow_database.cc
++++ b/src/stella_vslam/data/bow_database.cc
+@@ -49,6 +49,17 @@
+     }
+ }
+ 
++std::vector<unsigned int> bow_database::get_all_keyframe_ids() const { // [reference-port] patch 0013
++    std::lock_guard<std::mutex> lock(mtx_);
++    std::set<unsigned int> ids;
++    for (const auto& node_and_keyfrms : keyfrms_in_node_) {
++        for (const auto& keyfrm : node_and_keyfrms.second) {
++            ids.insert(keyfrm->id_);
++        }
++    }
++    return std::vector<unsigned int>(ids.begin(), ids.end());
++}
++
+ void bow_database::clear() {
+     std::lock_guard<std::mutex> lock(mtx_);
+     spdlog::info("clear BoW database");
+diff -ruN a/src/stella_vslam/data/bow_database.h b/src/stella_vslam/data/bow_database.h
+--- a/src/stella_vslam/data/bow_database.h
++++ b/src/stella_vslam/data/bow_database.h
+@@ -54,6 +54,9 @@
+                                                              const float num_common_words_thr_ratio = 0.8f,
+                                                              const std::set<std::shared_ptr<keyframe>>& keyfrms_to_reject = {});
+ 
++    //! [reference-port] patch 0013: sorted unique ids of the keyframes indexed in the database
++    std::vector<unsigned int> get_all_keyframe_ids() const;
++
+ protected:
+     /**
+      * Initialize temporary variables
+diff -ruN a/src/stella_vslam/data/graph_node.cc b/src/stella_vslam/data/graph_node.cc
+--- a/src/stella_vslam/data/graph_node.cc
++++ b/src/stella_vslam/data/graph_node.cc
+@@ -393,9 +393,9 @@
+     owner_keyfrm_.lock()->set_not_to_be_erased();
+ }
+ 
+-std::set<std::shared_ptr<keyframe>> graph_node::get_loop_edges() const {
++id_ordered_set<std::shared_ptr<keyframe>> graph_node::get_loop_edges() const {
+     std::lock_guard<std::mutex> lock(mtx_);
+-    std::set<std::shared_ptr<keyframe>> locked_loop_edges;
++    id_ordered_set<std::shared_ptr<keyframe>> locked_loop_edges;
+     for (const auto& keyfrm : loop_edges_) {
+         locked_loop_edges.insert(keyfrm.lock());
+     }
+diff -ruN a/src/stella_vslam/data/graph_node.h b/src/stella_vslam/data/graph_node.h
+--- a/src/stella_vslam/data/graph_node.h
++++ b/src/stella_vslam/data/graph_node.h
+@@ -139,7 +139,8 @@
+     /**
+      * Get the loop edges
+      */
+-    std::set<std::shared_ptr<keyframe>> get_loop_edges() const;
++    // [reference-port] patch 0013: was std::set<shared_ptr<keyframe>> (pointer order)
++    id_ordered_set<std::shared_ptr<keyframe>> get_loop_edges() const;
+ 
+     /**
+      * Whether this node has any loop edges or not
+diff -ruN a/src/stella_vslam/global_optimization_module.cc b/src/stella_vslam/global_optimization_module.cc
+--- a/src/stella_vslam/global_optimization_module.cc
++++ b/src/stella_vslam/global_optimization_module.cc
+@@ -7,6 +7,7 @@
+ #include "stella_vslam/match/fuse.h"
+ #include "stella_vslam/util/converter.h"
+ #include "stella_vslam/util/yaml.h"
++#include "stella_vslam/util/loop_trace.h" // [reference-port] patch 0013
+ 
+ #include <spdlog/spdlog.h>
+ 
+@@ -221,6 +222,16 @@
+     last_step_trace_ = step_trace{}; // [reference-port]
+     last_step_trace_.ran = true;
+     last_step_trace_.keyfrm_id = cur_keyfrm_->id_;
++    ++util::g_loop_step_index; // [reference-port] patch 0013
++    if (util::lt_on()) {
++        util::lt_start("S");
++        util::lt_u(cur_keyfrm_->id_);
++        util::lt_i(util::g_loop_frame_idx);
++        util::lt_end();
++    }
++    if (util::g_loop_hook) {
++        util::g_loop_hook(0);
++    }
+     {
+         std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
+         cur_keyfrm_->set_not_to_be_erased();
+@@ -237,6 +248,9 @@
+     }
+     last_step_trace_.loop_accepted = true; // [reference-port]
+     correct_loop();
++    if (util::g_loop_hook) { // [reference-port] patch 0013
++        util::g_loop_hook(2);
++    }
+     return true;
+ }
+ 
+@@ -245,6 +259,13 @@
+     last_step_trace_.accepted_candidate_id = (int)final_candidate_keyfrm->id_; // [reference-port]
+ 
+     spdlog::info("detect loop: keyframe {} - keyframe {}", final_candidate_keyfrm->id_, cur_keyfrm_->id_);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        util::lt_start("L0");
++        util::lt_u(final_candidate_keyfrm->id_);
++        util::lt_u(cur_keyfrm_->id_);
++        util::lt_u(cur_keyfrm_->graph_node_->get_spanning_root() == final_candidate_keyfrm->graph_node_->get_spanning_root() ? 1 : 0);
++        util::lt_end();
++    }
+ 
+     if (cur_keyfrm_->graph_node_->get_spanning_root() != final_candidate_keyfrm->graph_node_->get_spanning_root()) {
+         spdlog::warn("The feature to merge two spanning trees has not yet been implemented.");
+@@ -274,6 +295,13 @@
+     // acquire the covisibilities of the current keyframe
+     std::vector<std::shared_ptr<data::keyframe>> curr_neighbors = cur_keyfrm_->graph_node_->get_covisibilities_over_min_num_shared_lms(thr_neighbor_keyframes_);
+     curr_neighbors.push_back(cur_keyfrm_);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> ids;
++        for (const auto& k : curr_neighbors) ids.push_back(util::lt_kid(k));
++        util::lt_start("LN");
++        util::lt_ids(ids);
++        util::lt_end();
++    }
+ 
+     // Sim3 camera poses BEFORE loop correction
+     module::keyframe_Sim3_pairs_t Sim3s_nw_before_correction;
+@@ -293,10 +321,43 @@
+         // compute Sim3s AFTER loop correction
+         Sim3s_nw_after_correction = get_Sim3s_after_loop_correction(cam_pose_wc_before_correction, g2o_Sim3_cw_after_correction, curr_neighbors);
+ 
++        if (util::lt_on()) { // [reference-port] patch 0013
++            for (const auto& t : Sim3s_nw_before_correction) {
++                util::lt_start("LB");
++                util::lt_u(t.first->id_);
++                util::lt_sim3(t.second);
++                util::lt_end();
++            }
++            for (const auto& t : Sim3s_nw_after_correction) {
++                util::lt_start("LA");
++                util::lt_u(t.first->id_);
++                util::lt_sim3(t.second);
++                util::lt_end();
++            }
++        }
+         // correct covibisibility landmark positions
+         correct_covisibility_landmarks(Sim3s_nw_before_correction, Sim3s_nw_after_correction, found_lm_to_ref_keyfrm_id);
+         // correct covisibility keyframe camera poses
+         correct_covisibility_keyframes(Sim3s_nw_after_correction);
++        if (util::lt_on()) { // [reference-port] patch 0013
++            std::map<unsigned int, unsigned int> sorted(found_lm_to_ref_keyfrm_id.begin(), found_lm_to_ref_keyfrm_id.end());
++            for (const auto& kv : sorted) {
++                const auto lm = map_db_->get_landmark(kv.first);
++                util::lt_start("LF");
++                util::lt_u(kv.first);
++                util::lt_u(kv.second);
++                if (lm) {
++                    util::lt_vec3(lm->get_pos_in_world());
++                }
++                util::lt_end();
++            }
++            for (const auto& t : Sim3s_nw_after_correction) {
++                util::lt_start("LK");
++                util::lt_u(t.first->id_);
++                util::lt_mat44(t.first->get_pose_cw());
++                util::lt_end();
++            }
++        }
+     }
+     // [reference-port]
+     last_step_trace_.num_keyframes_sim3_corrected = (unsigned int)Sim3s_nw_after_correction.size();
+@@ -312,11 +373,24 @@
+ 
+     SPDLOG_TRACE("global_optimization_module: extract the new connections created after loop fusion");
+     const auto new_connections = extract_new_connections(curr_neighbors);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        for (const auto& kv : new_connections) {
++            std::vector<int> ids;
++            for (const auto& k : kv.second) ids.push_back(util::lt_kid(k));
++            util::lt_start("LNC");
++            util::lt_u(kv.first->id_);
++            util::lt_ids(ids);
++            util::lt_end();
++        }
++    }
+ 
+     // 4. pose graph optimization
+ 
+     SPDLOG_TRACE("global_optimization_module: pose graph optimization");
+     graph_optimizer_->optimize(final_candidate_keyfrm, cur_keyfrm_, Sim3s_nw_before_correction, Sim3s_nw_after_correction, new_connections, found_lm_to_ref_keyfrm_id);
++    if (util::g_loop_hook) { // [reference-port] patch 0013
++        util::g_loop_hook(1);
++    }
+ 
+     // add a loop edge
+     final_candidate_keyfrm->graph_node_->add_loop_edge(cur_keyfrm_);
+@@ -505,6 +579,25 @@
+         const Mat33_t rot_cw = s_rot_cw / s_cw;
+         const Vec3_t trans_cw = Sim3_nw_after_correction.block<3, 1>(0, 3) / s_cw;
+         fuse_matcher.detect_duplication(neighbor, rot_cw, trans_cw, curr_match_lms_observed_in_cand_covis, 4.0, duplicated_lms_in_keyfrm, new_connections);
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("LFU");
++            util::lt_u(neighbor->id_);
++            std::fputc('\t', util::g_loop_trace);
++            bool first = true;
++            for (const auto& kv : duplicated_lms_in_keyfrm) {
++                std::fprintf(util::g_loop_trace, "%s%u:%u", first ? "" : ",", kv.first->id_, kv.second->id_);
++                first = false;
++            }
++            std::map<unsigned int, unsigned int> sorted_nc;
++            for (const auto& kv : new_connections) sorted_nc[kv.first] = kv.second->id_;
++            std::fputc('\t', util::g_loop_trace);
++            first = true;
++            for (const auto& kv : sorted_nc) {
++                std::fprintf(util::g_loop_trace, "%s%u:%u", first ? "" : ",", kv.first, kv.second);
++                first = false;
++            }
++            util::lt_end();
++        }
+ 
+         std::lock_guard<std::mutex> lock(data::map_database::mtx_database_);
+ 
+@@ -532,12 +625,22 @@
+             }
+         }
+     }
++    if (util::lt_on()) { // [reference-port] patch 0013
++        util::lt_start("LREP");
++        std::fputc('\t', util::g_loop_trace);
++        bool first = true;
++        for (const auto& kv : replaced_lms) {
++            std::fprintf(util::g_loop_trace, "%s%u:%u", first ? "" : ",", kv.first->id_, kv.second->id_);
++            first = false;
++        }
++        util::lt_end();
++    }
+     tracker_->replace_landmarks_in_last_frm(replaced_lms);
+ }
+ 
+ auto global_optimization_module::extract_new_connections(const std::vector<std::shared_ptr<data::keyframe>>& covisibilities) const
+-    -> std::map<std::shared_ptr<data::keyframe>, std::set<std::shared_ptr<data::keyframe>>> {
+-    std::map<std::shared_ptr<data::keyframe>, std::set<std::shared_ptr<data::keyframe>>> new_connections;
++    -> std::map<std::shared_ptr<data::keyframe>, id_ordered_set<std::shared_ptr<data::keyframe>>, id_less<std::shared_ptr<data::keyframe>>> {
++    std::map<std::shared_ptr<data::keyframe>, id_ordered_set<std::shared_ptr<data::keyframe>>, id_less<std::shared_ptr<data::keyframe>>> new_connections;
+ 
+     for (auto covisibility : covisibilities) {
+         // acquire neighbors BEFORE loop fusion (because update_connections() is not called yet)
+@@ -546,7 +649,11 @@
+         // call update_connections()
+         covisibility->graph_node_->update_connections(map_db_->get_min_num_shared_lms());
+         // acquire neighbors AFTER loop fusion
+-        new_connections[covisibility] = covisibility->graph_node_->get_connected_keyframes();
++        {
++            // [reference-port] patch 0013: id-ordered copy (get_connected_keyframes() is a pointer-ordered std::set)
++            const auto connected = covisibility->graph_node_->get_connected_keyframes();
++            new_connections[covisibility] = id_ordered_set<std::shared_ptr<data::keyframe>>(connected.begin(), connected.end());
++        }
+ 
+         // remove covisibilities
+         for (const auto& keyfrm_to_erase : covisibilities) {
+diff -ruN a/src/stella_vslam/global_optimization_module.h b/src/stella_vslam/global_optimization_module.h
+--- a/src/stella_vslam/global_optimization_module.h
++++ b/src/stella_vslam/global_optimization_module.h
+@@ -188,7 +188,8 @@
+                                       const module::keyframe_Sim3_pairs_t& Sim3s_nw_after_correction) const;
+ 
+     //! Extract the new connections which will be created AFTER loop correction
+-    std::map<std::shared_ptr<data::keyframe>, std::set<std::shared_ptr<data::keyframe>>> extract_new_connections(const std::vector<std::shared_ptr<data::keyframe>>& covisibilities) const;
++    // [reference-port] patch 0013: keys and mapped sets id-ordered (were pointer-ordered)
++    std::map<std::shared_ptr<data::keyframe>, id_ordered_set<std::shared_ptr<data::keyframe>>, id_less<std::shared_ptr<data::keyframe>>> extract_new_connections(const std::vector<std::shared_ptr<data::keyframe>>& covisibilities) const;
+ 
+     //-----------------------------------------
+     // management for reset process
+diff -ruN a/src/stella_vslam/module/loop_detector.cc b/src/stella_vslam/module/loop_detector.cc
+--- a/src/stella_vslam/module/loop_detector.cc
++++ b/src/stella_vslam/module/loop_detector.cc
+@@ -10,12 +10,42 @@
+ #include "stella_vslam/solve/pnp_solver.h"
+ #include "stella_vslam/util/converter.h"
+ #include "stella_vslam/util/fancy_index.h"
++#include "stella_vslam/util/loop_trace.h" // [reference-port] patch 0013
+ 
+ #include <spdlog/spdlog.h>
+ 
++#include <cstdlib>
++
+ namespace stella_vslam {
+ namespace module {
+ 
++namespace {
++// [reference-port] patch 0013: OPT-IN override (env, default = upstream constant) of the three hard-coded
++// validation thresholds of select_loop_candidate_via_Sim3(), so that rejection at every stage can be
++// provoked on real data (no sequence available here reaches the later stages and is then rejected).
++unsigned int env_threshold(const char* name, unsigned int default_value) {
++    const char* v = std::getenv(name);
++    return v ? static_cast<unsigned int>(std::atoi(v)) : default_value;
++}
++// [reference-port] patch 0013 helpers (only called when tracing is on)
++void lt_outliers(const std::vector<bool>& flags) {
++    std::vector<int> idx;
++    for (size_t i = 0; i < flags.size(); ++i) {
++        if (flags[i]) idx.push_back(static_cast<int>(i));
++    }
++    util::lt_ids(idx);
++}
++// pointer-ordered std::set contents are printed by id, the null pointer (expired keyframe, -1) last
++void lt_sort_null_last(std::vector<int>& v) {
++    std::sort(v.begin(), v.end(), [](int a, int b) { return static_cast<unsigned int>(a) < static_cast<unsigned int>(b); });
++}
++void lt_cx(int code) {
++    util::lt_start("CX");
++    util::lt_i(code);
++    util::lt_end();
++}
++} // namespace
++
+ loop_detector::loop_detector(data::bow_database* bow_db, data::bow_vocabulary* bow_vocab, const YAML::Node& yaml_node, const bool fix_scale_in_Sim3_estimation)
+     : bow_db_(bow_db), bow_vocab_(bow_vocab), transform_optimizer_(fix_scale_in_Sim3_estimation), pose_optimizer_(optimize::pose_optimizer_factory::create(yaml_node)),
+       loop_detector_is_enabled_(yaml_node["enabled"].as<bool>(true)),
+@@ -50,6 +80,12 @@
+ }
+ 
+ bool loop_detector::detect_loop_candidates() {
++    if (util::lt_on()) { // [reference-port] patch 0013
++        const auto db_ids = bow_db_->get_all_keyframe_ids();
++        util::lt_start("DBIDS");
++        util::lt_ids(std::vector<int>(db_ids.begin(), db_ids.end()));
++        util::lt_end();
++    }
+     auto succeeded = detect_loop_candidates_impl();
+     // register to the BoW database
+     bow_db_->add_keyframe(cur_keyfrm_);
+@@ -72,6 +108,24 @@
+ bool loop_detector::detect_loop_candidates_impl() {
+     // if the loop detector is disabled or the loop has been corrected recently,
+     // cannot perfrom the loop correction
++    if (util::lt_on()) { // [reference-port] patch 0013
++        util::lt_start("DET");
++        util::lt_u(cur_keyfrm_->id_);
++        util::lt_u(prev_loop_correct_keyfrm_id_);
++        util::lt_u(loop_detector_is_enabled_ ? 1 : 0);
++        // parameters of this run: num_final_matches_thr, min_continuity, reject_by_graph_distance, min_distance_on_graph,
++        // num_matches_thr, num_matches_thr_brute_force, num_optimized_inliers_thr, top_n_covisibilities_to_search, ratio
++        util::lt_u(num_final_matches_thr_);
++        util::lt_u(min_continuity_);
++        util::lt_u(reject_by_graph_distance_ ? 1 : 0);
++        util::lt_u(min_distance_on_graph_);
++        util::lt_u(num_matches_thr_);
++        util::lt_u(num_matches_thr_brute_force_);
++        util::lt_u(num_optimized_inliers_thr_);
++        util::lt_u(top_n_covisibilities_to_search_);
++        util::lt_d(static_cast<double>(num_common_words_thr_ratio_));
++        util::lt_end();
++    }
+     if (!loop_detector_is_enabled_ || cur_keyfrm_->id_ < prev_loop_correct_keyfrm_id_ + 10) {
+         return false;
+     }
+@@ -81,6 +135,11 @@
+     // 1-1. before inquiring, compute the minimum score of BoW similarity between the current and each of the covisibilities
+ 
+     const float min_score = compute_min_score_in_covisibilities(cur_keyfrm_);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        util::lt_start("MINS");
++        util::lt_d(static_cast<double>(min_score));
++        util::lt_end();
++    }
+ 
+     // 1-2. inquiring to the BoW database about the similar keyframe whose score is lower than min_score
+ 
+@@ -127,6 +186,18 @@
+     }
+ 
+     const auto init_loop_candidates = bow_db_->acquire_keyframes(cur_keyfrm_->bow_vec_, min_score, num_common_words_thr_ratio_, keyfrms_to_reject);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> rej, init;
++        for (const auto& k : keyfrms_to_reject) rej.push_back(util::lt_kid(k));
++        lt_sort_null_last(rej); // pointer-ordered std::set -> sorted for a stable dump
++        for (const auto& k : init_loop_candidates) init.push_back(util::lt_kid(k));
++        util::lt_start("REJ");
++        util::lt_ids(rej);
++        util::lt_end();
++        util::lt_start("INIT");
++        util::lt_ids(init);
++        util::lt_end();
++    }
+ 
+     // 1-3. if no candidates are found, cannot perform the loop correction
+ 
+@@ -142,6 +213,18 @@
+     //    (note that "match of two keyframe sets" means the intersection of the two sets is NOT empty)
+ 
+     const auto curr_cont_detected_keyfrm_sets = find_continuously_detected_keyframe_sets(cont_detected_keyfrm_sets_, init_loop_candidates);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        for (const auto& s : curr_cont_detected_keyfrm_sets) {
++            std::vector<int> members;
++            for (const auto& k : s.keyfrm_set_) members.push_back(util::lt_kid(k));
++            lt_sort_null_last(members);
++            util::lt_start("CONT");
++            util::lt_i(util::lt_kid(s.lead_keyfrm_));
++            util::lt_u(s.continuity_);
++            util::lt_ids(members);
++            util::lt_end();
++        }
++    }
+ 
+     // 3. if the number of the detection is equal of greater than the threshold (`min_continuity_`),
+     //    adopt it as one of the loop candidates
+@@ -157,6 +240,14 @@
+         }
+     }
+ 
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> v;
++        for (const auto& k : loop_candidates_to_validate_) v.push_back(util::lt_kid(k));
++        util::lt_start("TOVAL3");
++        util::lt_ids(v);
++        util::lt_end();
++    }
++
+     // 4. Update the members for the next call of this function
+ 
+     cont_detected_keyfrm_sets_ = curr_cont_detected_keyfrm_sets;
+@@ -175,6 +266,14 @@
+         }
+     }
+ 
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> v;
++        for (const auto& k : loop_candidates_to_validate_) v.push_back(util::lt_kid(k));
++        util::lt_start("TOVAL5");
++        util::lt_ids(v);
++        util::lt_end();
++    }
++
+     // return any candidate is found or not
+     return !loop_candidates_to_validate_.empty();
+ }
+@@ -213,6 +312,10 @@
+     Sim3_world_to_curr_ = util::converter::to_eigen_mat(g2o_Sim3_world_to_curr_);
+ 
+     if (!candidate_is_found) {
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("VNONE");
++            util::lt_end();
++        }
+         return false;
+     }
+ 
+@@ -263,6 +366,17 @@
+             ++num_final_matches;
+         }
+     }
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> covis_lms;
++        for (const auto& lm : curr_match_lms_observed_in_cand_covis_) covis_lms.push_back(static_cast<int>(lm->id_));
++        util::lt_start("VCOVIS");
++        util::lt_ids(covis_lms);
++        util::lt_end();
++        util::lt_start("VFINAL");
++        util::lt_u(num_final_matches);
++        util::lt_assoc(curr_match_lms_observed_in_cand_);
++        util::lt_end();
++    }
+ 
+     spdlog::debug("acquired {} matches after projection-match", num_final_matches);
+ 
+@@ -368,6 +482,15 @@
+     match::projection projection_matcher(0.75, false);
+ 
+     for (const auto& candidate : loop_candidates) {
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("CAND");
++            util::lt_u(candidate->id_);
++            util::lt_u(candidate->will_be_erased() ? 1 : 0);
++            util::lt_u(env_threshold("STELLA_PORT_LOOP_THR_OPT1", 10));
++            util::lt_u(env_threshold("STELLA_PORT_LOOP_THR_A", 25));
++            util::lt_u(env_threshold("STELLA_PORT_LOOP_THR_B", 40));
++            util::lt_end();
++        }
+         if (candidate->will_be_erased()) {
+             continue;
+         }
+@@ -376,8 +499,15 @@
+         curr_match_lms_observed_in_cand.clear();
+         const auto num_matches = bow_matcher.match_keyframes(cur_keyfrm_, candidate, curr_match_lms_observed_in_cand);
+ 
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("BOW");
++            util::lt_u(num_matches);
++            util::lt_assoc(curr_match_lms_observed_in_cand);
++            util::lt_end();
++        }
+         // check the threshold
+         if (num_matches < num_matches_thr_) {
++            if (util::lt_on()) lt_cx(1);
+             continue;
+         }
+ 
+@@ -425,8 +555,24 @@
+                                                                                    10, use_fixed_seed_));
+ 
+         pnp_solver->find_via_ransac(30, false);
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("PNP");
++            util::lt_u(pnp_solver->solution_is_valid() ? 1 : 0);
++            util::lt_u(valid_indices.size());
++            if (pnp_solver->solution_is_valid()) {
++                util::lt_mat44(pnp_solver->get_best_cam_pose());
++                const auto flags = pnp_solver->get_inlier_flags();
++                std::vector<int> in;
++                for (size_t i = 0; i < flags.size(); ++i) {
++                    if (flags[i]) in.push_back(static_cast<int>(i));
++                }
++                util::lt_ids(in);
++            }
++            util::lt_end();
++        }
+         if (!pnp_solver->solution_is_valid()) {
+             spdlog::debug("solution is not valid.");
++            if (util::lt_on()) lt_cx(3);
+             continue;
+         }
+ 
+@@ -447,9 +593,19 @@
+                                                        curr_match_lms_observed_in_cand, optimized_pose, outlier_flags);
+ 
+         // Discard the candidate if the number of the inliers is less than the threshold
+-        const int min_num_matches_after_pose_optimize = 10;
++        const int min_num_matches_after_pose_optimize = static_cast<int>(env_threshold("STELLA_PORT_LOOP_THR_OPT1", 10)); // [reference-port] patch 0013 (opt-in env override)
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("OPT1");
++            util::lt_u(num_valid_obs);
++            if (num_valid_obs != 0) { // the pose is left uninitialized when the optimizer has fewer than 5 observations
++                util::lt_mat44(optimized_pose);
++            }
++            lt_outliers(outlier_flags);
++            util::lt_end();
++        }
+         if (num_valid_obs < min_num_matches_after_pose_optimize) {
+             spdlog::debug("1. Number of inliers ({}) < threshold ({})", num_valid_obs, min_num_matches_after_pose_optimize);
++            if (util::lt_on()) lt_cx(4);
+             continue;
+         }
+ 
+@@ -475,10 +631,18 @@
+                                                                      cur_keyfrm_->orb_params_, curr_match_lms_observed_in_cand,
+                                                                      candidate, already_found_landmarks, 10, 100);
+         // Discard the candidate if the number of the inliers is less than the threshold
+-        const unsigned int min_num_valid_obs1 = 25;
++        const unsigned int min_num_valid_obs1 = env_threshold("STELLA_PORT_LOOP_THR_A", 25); // [reference-port] patch 0013 (opt-in env override)
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("PRJ1");
++            util::lt_u(num_found);
++            util::lt_u(already_found_landmarks.size());
++            util::lt_assoc(curr_match_lms_observed_in_cand);
++            util::lt_end();
++        }
+         if (already_found_landmarks.size() + num_found < min_num_valid_obs1) {
+             spdlog::debug("2. Number of matches ({}) < threshold ({})",
+                           already_found_landmarks.size() + num_found, min_num_valid_obs1);
++            if (util::lt_on()) lt_cx(5);
+             continue;
+         }
+ 
+@@ -488,8 +652,18 @@
+                                                         cur_keyfrm_->frm_obs_, cur_keyfrm_->orb_params_, cur_keyfrm_->camera_,
+                                                         curr_match_lms_observed_in_cand, optimized_pose1, outlier_flags1);
+ 
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("OPT2");
++            util::lt_u(num_valid_obs1);
++            if (num_valid_obs1 != 0) { // the pose is left uninitialized when the optimizer has fewer than 5 observations
++                util::lt_mat44(optimized_pose1);
++            }
++            lt_outliers(outlier_flags1);
++            util::lt_end();
++        }
+         if (num_valid_obs1 < min_num_valid_obs1) {
+             spdlog::debug("2. Number of inliers ({}) < threshold ({})", num_valid_obs1, min_num_valid_obs1);
++            if (util::lt_on()) lt_cx(6);
+             continue;
+         }
+ 
+@@ -506,10 +680,17 @@
+                                                                           cur_keyfrm_->orb_params_, curr_match_lms_observed_in_cand,
+                                                                           candidate, already_found_landmarks, 3, 64);
+ 
+-        const unsigned int min_num_valid_obs2 = 40;
++        const unsigned int min_num_valid_obs2 = env_threshold("STELLA_PORT_LOOP_THR_B", 40); // [reference-port] patch 0013 (opt-in env override)
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("PRJ2");
++            util::lt_u(num_additional);
++            util::lt_assoc(curr_match_lms_observed_in_cand);
++            util::lt_end();
++        }
+         // Discard if the number of the observations is less than the threshold
+         if (num_valid_obs1 + num_additional < min_num_valid_obs2) {
+             spdlog::debug("3. Number of matches ({}) < threshold ({})", num_valid_obs1 + num_additional, min_num_valid_obs2);
++            if (util::lt_on()) lt_cx(7);
+             return false;
+         }
+ 
+@@ -521,8 +702,18 @@
+                                                         curr_match_lms_observed_in_cand, optimized_pose2, outlier_flags2);
+ 
+         // Discard if falling below the threshold
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("OPT3");
++            util::lt_u(num_valid_obs2);
++            if (num_valid_obs2 != 0) { // the pose is left uninitialized when the optimizer has fewer than 5 observations
++                util::lt_mat44(optimized_pose2);
++            }
++            lt_outliers(outlier_flags2);
++            util::lt_end();
++        }
+         if (num_valid_obs2 < min_num_valid_obs2) {
+             spdlog::debug("3. Number of inliers ({}) < threshold ({})", num_valid_obs2, min_num_valid_obs2);
++            if (util::lt_on()) lt_cx(8);
+             return false;
+         }
+ 
+@@ -565,6 +756,7 @@
+         }
+         if (scales.size() < 1) {
+             spdlog::debug("not enough scale references {}", scales.size());
++            if (util::lt_on()) lt_cx(9);
+             continue;
+         }
+         const Mat33_t rot_12 = rot_1w_in_cand * candidate->get_rot_cw().transpose();
+@@ -574,15 +766,37 @@
+ 
+         // perforn non-linear optimization of the estimated Sim3
+ 
+-        projection_matcher.match_keyframes_mutually(cur_keyfrm_, candidate, curr_match_lms_observed_in_cand,
+-                                                    scale_12, rot_12, trans_12, 7.5);
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("SCL");
++            util::lt_u(scales.size());
++            util::lt_d(static_cast<double>(scale_12));
++            util::lt_mat33(rot_12);
++            util::lt_vec3(trans_12);
++            util::lt_end();
++        }
++        const auto num_mutual = projection_matcher.match_keyframes_mutually(cur_keyfrm_, candidate, curr_match_lms_observed_in_cand,
++                                                                            scale_12, rot_12, trans_12, 7.5);
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("MUT");
++            util::lt_u(num_mutual);
++            util::lt_assoc(curr_match_lms_observed_in_cand);
++            util::lt_end();
++        }
+ 
+         g2o::Sim3 g2o_sim3_12(rot_12, trans_12, scale_12);
+         const auto num_optimized_inliers = transform_optimizer_.optimize(cur_keyfrm_, candidate, curr_match_lms_observed_in_cand,
+                                                                          g2o_sim3_12, 10);
+ 
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("TRF");
++            util::lt_u(num_optimized_inliers);
++            util::lt_sim3(g2o_sim3_12);
++            util::lt_assoc(curr_match_lms_observed_in_cand);
++            util::lt_end();
++        }
+         // check the threshold
+         if (num_optimized_inliers < num_optimized_inliers_thr_) {
++            if (util::lt_on()) lt_cx(10);
+             continue;
+         }
+ 
+@@ -593,6 +807,12 @@
+         // this Sim3 indicates the correct camera pose oof the current keyframe after loop correction
+         g2o_Sim3_world_to_curr = g2o_sim3_12 * g2o::Sim3(candidate->get_rot_cw(), candidate->get_trans_cw(), 1.0);
+ 
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("ACC");
++            util::lt_u(candidate->id_);
++            util::lt_sim3(g2o_Sim3_world_to_curr);
++            util::lt_end();
++        }
+         return true;
+     }
+ 
+diff -ruN a/src/stella_vslam/module/type.h b/src/stella_vslam/module/type.h
+--- a/src/stella_vslam/module/type.h
++++ b/src/stella_vslam/module/type.h
+@@ -1,6 +1,8 @@
+ #ifndef STELLA_VSLAM_MODULE_TYPE_H
+ #define STELLA_VSLAM_MODULE_TYPE_H
+ 
++#include "stella_vslam/type.h" // [reference-port] patch 0013 (id_less)
++
+ #include <g2o/types/sim3/types_seven_dof_expmap.h>
+ 
+ #include <memory>
+@@ -16,7 +18,10 @@
+ // 相互参照を避けるためにここでtypedefしておく
+ typedef std::map<std::shared_ptr<data::keyframe>,
+                  g2o::Sim3,
+-                 std::less<std::shared_ptr<data::keyframe>>,
++                 // [reference-port] patch 0013: was std::less<shared_ptr<keyframe>> (POINTER order,
++                 // ASLR-dependent iteration order in global_optimization_module::correct_loop()
++                 // and graph_optimizer). id order, nullptr last.
++                 id_less<std::shared_ptr<data::keyframe>>,
+                  Eigen::aligned_allocator<std::pair<std::shared_ptr<data::keyframe> const, g2o::Sim3>>>
+     keyframe_Sim3_pairs_t;
+ 
+diff -ruN a/src/stella_vslam/optimize/global_bundle_adjuster.cc b/src/stella_vslam/optimize/global_bundle_adjuster.cc
+--- a/src/stella_vslam/optimize/global_bundle_adjuster.cc
++++ b/src/stella_vslam/optimize/global_bundle_adjuster.cc
+@@ -12,6 +12,7 @@
+ #include "stella_vslam/optimize/internal/se3/reproj_edge_wrapper.h"
+ #include "stella_vslam/util/converter.h"
+ 
++#include <cstdlib> // [reference-port] patch 0013
+ #include <g2o/core/solver.h>
+ #include <g2o/core/block_solver.h>
+ #include <g2o/core/sparse_optimizer.h>
+@@ -43,8 +44,14 @@
+     // 2. Construct an optimizer
+ 
+     std::unique_ptr<g2o::BlockSolverBase> block_solver;
+-    auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverCSparse<g2o::BlockSolver_6_3::PoseMatrixType>>();
+-    block_solver = stella_vslam::make_unique<g2o::BlockSolver_6_3>(std::move(linear_solver));
++    if (std::getenv("STELLA_PORT_EIGEN_SOLVER")) { // [reference-port] patch 0013 (opt-in, default off; see graph_optimizer.cc)
++        auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>>();
++        block_solver = stella_vslam::make_unique<g2o::BlockSolver_6_3>(std::move(linear_solver));
++    }
++    else {
++        auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverCSparse<g2o::BlockSolver_6_3::PoseMatrixType>>();
++        block_solver = stella_vslam::make_unique<g2o::BlockSolver_6_3>(std::move(linear_solver));
++    }
+     auto algorithm = new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver));
+ 
+     optimizer.setAlgorithm(algorithm);
+diff -ruN a/src/stella_vslam/optimize/graph_optimizer.cc b/src/stella_vslam/optimize/graph_optimizer.cc
+--- a/src/stella_vslam/optimize/graph_optimizer.cc
++++ b/src/stella_vslam/optimize/graph_optimizer.cc
+@@ -6,6 +6,9 @@
+ #include "stella_vslam/optimize/internal/sim3/shot_vertex.h"
+ #include "stella_vslam/optimize/internal/sim3/graph_opt_edge.h"
+ #include "stella_vslam/util/converter.h"
++#include "stella_vslam/util/loop_trace.h" // [reference-port] patch 0013
++
++#include <cstdlib>
+ 
+ #include <Eigen/StdVector>
+ #include <g2o/core/solver.h>
+@@ -13,6 +16,7 @@
+ #include <g2o/core/sparse_optimizer.h>
+ #include <g2o/core/robust_kernel_impl.h>
+ #include <g2o/solvers/csparse/linear_solver_csparse.h>
++#include <g2o/solvers/eigen/linear_solver_eigen.h> // [reference-port] patch 0013
+ #include <g2o/core/optimization_algorithm_levenberg.h>
+ #include <g2o/core/sparse_optimizer_terminate_action.h>
+ 
+@@ -26,12 +30,22 @@
+ void graph_optimizer::optimize(const std::shared_ptr<data::keyframe>& loop_keyfrm, const std::shared_ptr<data::keyframe>& curr_keyfrm,
+                                const module::keyframe_Sim3_pairs_t& non_corrected_Sim3s,
+                                const module::keyframe_Sim3_pairs_t& pre_corrected_Sim3s,
+-                               const std::map<std::shared_ptr<data::keyframe>, std::set<std::shared_ptr<data::keyframe>>>& loop_connections,
++                               const std::map<std::shared_ptr<data::keyframe>, id_ordered_set<std::shared_ptr<data::keyframe>>, id_less<std::shared_ptr<data::keyframe>>>& loop_connections, // [reference-port] patch 0013
+                                std::unordered_map<unsigned int, unsigned int>& found_lm_to_ref_keyfrm_id) const {
+     // 1. Construct an optimizer
+ 
+-    auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverCSparse<g2o::BlockSolver_7_3::PoseMatrixType>>();
+-    auto block_solver = stella_vslam::make_unique<g2o::BlockSolver_7_3>(std::move(linear_solver));
++    // [reference-port] patch 0013: OPT-IN (env STELLA_PORT_EIGEN_SOLVER, default off) replacement of
++    // CSparse by g2o's LinearSolverEigen (SimplicialLLT + AMD), the solver the pure-C port reimplements
++    // (CSparse is LGPL and is not ported). Default behaviour is unchanged.
++    std::unique_ptr<g2o::BlockSolver_7_3> block_solver;
++    if (std::getenv("STELLA_PORT_EIGEN_SOLVER")) {
++        auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverEigen<g2o::BlockSolver_7_3::PoseMatrixType>>();
++        block_solver = stella_vslam::make_unique<g2o::BlockSolver_7_3>(std::move(linear_solver));
++    }
++    else {
++        auto linear_solver = stella_vslam::make_unique<g2o::LinearSolverCSparse<g2o::BlockSolver_7_3::PoseMatrixType>>();
++        block_solver = stella_vslam::make_unique<g2o::BlockSolver_7_3>(std::move(linear_solver));
++    }
+     auto algorithm = new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver));
+ 
+     g2o::SparseOptimizer optimizer;
+@@ -103,6 +117,13 @@
+ 
+         optimizer.addVertex(keyfrm_vtx);
+         vertices[id] = keyfrm_vtx;
++        if (util::lt_on()) { // [reference-port] patch 0013
++            util::lt_start("GV");
++            util::lt_u(id);
++            util::lt_u(keyfrm_vtx->fixed() ? 1 : 0);
++            util::lt_sim3(keyfrm_vtx->estimate());
++            util::lt_end();
++        }
+     }
+ 
+     // 3. Add edges
+@@ -122,6 +143,13 @@
+ 
+             optimizer.addEdge(edge);
+             inserted_edge_pairs.insert(std::make_pair(std::min(id1, id2), std::max(id1, id2)));
++            if (util::lt_on()) { // [reference-port] patch 0013
++                util::lt_start("GE");
++                util::lt_u(id1);
++                util::lt_u(id2);
++                util::lt_sim3(Sim3_21);
++                util::lt_end();
++            }
+         };
+ 
+     // Add loop edges only over the number of shared landmarks threshold
+@@ -247,7 +275,13 @@
+     // 4. Perform a pose graph optimization
+ 
+     optimizer.initializeOptimization();
+-    optimizer.optimize(50);
++    const int trace_num_iters = optimizer.optimize(50); // [reference-port] patch 0013 (value only traced)
++    if (util::lt_on()) {
++        util::lt_start("GOPT");
++        util::lt_i(trace_num_iters);
++        util::lt_d(optimizer.activeChi2());
++        util::lt_end();
++    }
+ 
+     delete terminateAction;
+ 
+@@ -265,6 +299,12 @@
+             auto keyfrm_vtx = static_cast<internal::sim3::shot_vertex*>(optimizer.vertex(id));
+ 
+             const g2o::Sim3& corrected_Sim3_cw = keyfrm_vtx->estimate();
++            if (util::lt_on()) { // [reference-port] patch 0013
++                util::lt_start("GX");
++                util::lt_u(id);
++                util::lt_sim3(corrected_Sim3_cw);
++                util::lt_end();
++            }
+             const float s = corrected_Sim3_cw.scale();
+             const Mat33_t rot_cw = corrected_Sim3_cw.rotation().toRotationMatrix();
+             const Vec3_t trans_cw = corrected_Sim3_cw.translation() / s;
+diff -ruN a/src/stella_vslam/optimize/graph_optimizer.h b/src/stella_vslam/optimize/graph_optimizer.h
+--- a/src/stella_vslam/optimize/graph_optimizer.h
++++ b/src/stella_vslam/optimize/graph_optimizer.h
+@@ -41,7 +41,7 @@
+     void optimize(const std::shared_ptr<data::keyframe>& loop_keyfrm, const std::shared_ptr<data::keyframe>& curr_keyfrm,
+                   const module::keyframe_Sim3_pairs_t& non_corrected_Sim3s,
+                   const module::keyframe_Sim3_pairs_t& pre_corrected_Sim3s,
+-                  const std::map<std::shared_ptr<data::keyframe>, std::set<std::shared_ptr<data::keyframe>>>& loop_connections,
++                  const std::map<std::shared_ptr<data::keyframe>, id_ordered_set<std::shared_ptr<data::keyframe>>, id_less<std::shared_ptr<data::keyframe>>>& loop_connections, // [reference-port] patch 0013
+                   std::unordered_map<unsigned int, unsigned int>& found_lm_to_ref_keyfrm_id) const;
+ 
+ private:
+diff -ruN a/src/stella_vslam/optimize/transform_optimizer.cc b/src/stella_vslam/optimize/transform_optimizer.cc
+--- a/src/stella_vslam/optimize/transform_optimizer.cc
++++ b/src/stella_vslam/optimize/transform_optimizer.cc
+@@ -3,6 +3,7 @@
+ #include "stella_vslam/optimize/transform_optimizer.h"
+ #include "stella_vslam/optimize/internal/sim3/transform_vertex.h"
+ #include "stella_vslam/optimize/internal/sim3/mutual_reproj_edge_wrapper.h"
++#include "stella_vslam/util/loop_trace.h" // [reference-port] patch 0013
+ 
+ #include <g2o/core/solver.h>
+ #include <g2o/core/block_solver.h>
+@@ -43,6 +44,14 @@
+     Sim3_12_vtx->rot_2w_ = keyfrm_2->get_rot_cw();
+     Sim3_12_vtx->trans_2w_ = keyfrm_2->get_trans_cw();
+     optimizer.addVertex(Sim3_12_vtx);
++    if (util::lt_on()) { // [reference-port] patch 0013
++        util::lt_start("TIN");
++        util::lt_u(keyfrm_1->id_);
++        util::lt_u(keyfrm_2->id_);
++        util::lt_sim3(g2o_Sim3_12);
++        util::lt_d(static_cast<double>(chi_sq));
++        util::lt_end();
++    }
+ 
+     // 3. Add landmarks and constraints
+ 
+@@ -95,6 +104,16 @@
+ 
+     // 3. Perform optimization
+ 
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> pairs;
++        util::lt_start("TEDG");
++        util::lt_u(num_valid_matches);
++        std::fputc('\t', util::g_loop_trace);
++        for (unsigned int i = 0; i < num_valid_matches; ++i) {
++            std::fprintf(util::g_loop_trace, "%s%u:%u:%u", i ? "," : "", mutual_edges.at(i).idx1_, mutual_edges.at(i).lm1_->id_, mutual_edges.at(i).lm2_->id_);
++        }
++        util::lt_end();
++    }
+     optimizer.initializeOptimization();
+     optimizer.optimize(5);
+ 
+@@ -118,6 +137,16 @@
+         ++num_outliers;
+     }
+ 
++    if (util::lt_on()) { // [reference-port] patch 0013
++        std::vector<int> outl;
++        for (unsigned int i = 0; i < num_valid_matches; ++i) {
++            if (mutual_edges.at(i).is_outlier()) outl.push_back(static_cast<int>(mutual_edges.at(i).idx1_));
++        }
++        util::lt_start("TMID");
++        util::lt_sim3(Sim3_12_vtx->estimate());
++        util::lt_ids(outl);
++        util::lt_end();
++    }
+     if (num_valid_matches - num_outliers < 10) {
+         return 0;
+     }
+diff -ruN a/src/stella_vslam/util/CMakeLists.txt b/src/stella_vslam/util/CMakeLists.txt
+--- a/src/stella_vslam/util/CMakeLists.txt
++++ b/src/stella_vslam/util/CMakeLists.txt
+@@ -6,6 +6,7 @@
+                ${CMAKE_CURRENT_SOURCE_DIR}/erasure_log.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/fancy_index.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/image_converter.h
++               ${CMAKE_CURRENT_SOURCE_DIR}/loop_trace.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/random_array.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/stereo_rectifier.h
+diff -ruN a/src/stella_vslam/util/erasure_log.cc b/src/stella_vslam/util/erasure_log.cc
+--- a/src/stella_vslam/util/erasure_log.cc
++++ b/src/stella_vslam/util/erasure_log.cc
+@@ -1,4 +1,5 @@
+ #include "stella_vslam/util/erasure_log.h"
++#include "stella_vslam/util/loop_trace.h" // [reference-port] patch 0013
+ 
+ namespace stella_vslam {
+ namespace util {
+@@ -9,6 +10,10 @@
+ std::vector<destroyed_keyframe_record> g_destroyed_keyframes; // [reference-port] patch 0011
+ int g_phase = 0;
+ bool g_log_destroyed = false;
++std::FILE* g_loop_trace = nullptr; // [reference-port] patch 0013
++unsigned int g_loop_step_index = 0;
++int g_loop_frame_idx = 0;
++std::function<void(int)> g_loop_hook;
+ 
+ } // namespace util
+ } // namespace stella_vslam
+diff -ruN a/src/stella_vslam/util/loop_trace.h b/src/stella_vslam/util/loop_trace.h
+--- a/src/stella_vslam/util/loop_trace.h
++++ b/src/stella_vslam/util/loop_trace.h
+@@ -0,0 +1,76 @@
++#ifndef STELLA_VSLAM_UTIL_LOOP_TRACE_H
++#define STELLA_VSLAM_UTIL_LOOP_TRACE_H
++
++// [reference-port] patch 0013 (module 7, loop closing). Dump-only, opt-in:
++// nothing here is executed unless the driver sets g_loop_trace to an open
++// FILE*. Text format: one event per line,
++//   <step>\t<TAG>\t<fields...>
++// numbers are exact (%a for doubles; float values are widened first), ids are
++// decimal, lists are comma separated ("idx:id" for keypoint -> landmark
++// associations). <step> is g_loop_step_index, which
++// global_optimization_module::run_step() increments once per dequeued keyframe.
++
++#include "stella_vslam/type.h"
++#include "stella_vslam/data/keyframe.h"
++#include "stella_vslam/data/landmark.h"
++
++#include <g2o/types/sim3/sim3.h>
++
++#include <cstdio>
++#include <functional>
++#include <memory>
++#include <vector>
++
++namespace stella_vslam {
++namespace util {
++
++extern std::FILE* g_loop_trace;                 // nullptr = tracing off
++extern unsigned int g_loop_step_index;          // 1-based index of the global-optimization step
++extern int g_loop_frame_idx;                    // set by the driver before each feed
++extern std::function<void(int)> g_loop_hook;    // phase 0 = before the step, 1 = after the pose graph, 2 = after an accepted loop
++
++inline bool lt_on() { return g_loop_trace != nullptr; }
++inline void lt_start(const char* tag) { std::fprintf(g_loop_trace, "%u\t%s", g_loop_step_index, tag); }
++inline void lt_end() { std::fputc('\n', g_loop_trace); }
++inline void lt_u(unsigned long v) { std::fprintf(g_loop_trace, "\t%lu", v); }
++inline void lt_i(long v) { std::fprintf(g_loop_trace, "\t%ld", v); }
++inline void lt_d(double v) { std::fprintf(g_loop_trace, "\t%a", v); }
++inline void lt_ids(const std::vector<int>& v) {
++    std::fputc('\t', g_loop_trace);
++    for (size_t i = 0; i < v.size(); ++i) {
++        std::fprintf(g_loop_trace, "%s%d", i ? "," : "", v[i]);
++    }
++}
++inline void lt_vec3(const Vec3_t& v) {
++    for (int i = 0; i < 3; ++i) lt_d(v(i));
++}
++inline void lt_mat33(const Mat33_t& m) { // row-major
++    for (int r = 0; r < 3; ++r)
++        for (int c = 0; c < 3; ++c) lt_d(m(r, c));
++}
++inline void lt_mat44(const Mat44_t& m) { // row-major
++    for (int r = 0; r < 4; ++r)
++        for (int c = 0; c < 4; ++c) lt_d(m(r, c));
++}
++inline void lt_sim3(const g2o::Sim3& s) { // qx qy qz qw tx ty tz scale
++    const auto& q = s.rotation().coeffs();
++    for (int i = 0; i < 4; ++i) lt_d(q(i));
++    lt_vec3(s.translation());
++    lt_d(s.scale());
++}
++inline int lt_kid(const std::shared_ptr<data::keyframe>& k) { return k ? static_cast<int>(k->id_) : -1; }
++// keypoint -> landmark association vector as "idx:landmark_id" of the non-null entries
++inline void lt_assoc(const std::vector<std::shared_ptr<data::landmark>>& v) {
++    std::fputc('\t', g_loop_trace);
++    bool first = true;
++    for (size_t i = 0; i < v.size(); ++i) {
++        if (!v[i]) continue;
++        std::fprintf(g_loop_trace, "%s%zu:%u", first ? "" : ",", i, v[i]->id_);
++        first = false;
++    }
++}
++
++} // namespace util
++} // namespace stella_vslam
++
++#endif // STELLA_VSLAM_UTIL_LOOP_TRACE_H

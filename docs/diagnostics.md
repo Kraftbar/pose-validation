@@ -232,3 +232,18 @@ gcc -O2 -fopenmp tools/test_plus_geometry.c -lm -o /tmp/test_plus_geometry
 
 See [the geometry-core experiment report](oneshot_geometry.md) for the full GT
 validation, unchanged-default checks, and rejected rewrite results.
+
+## Stella BoW matcher comparison
+
+`tools/build_stella_match_bow.py`, `tools/dump_stella_match_bow.py`, and
+`tools/check_stella_match_bow.py` validate the independent pure-C frame/keyframe
+and keyframe/keyframe BoW descriptor matchers against the real installed stella
+library. Results, sanitizer scope, fixture contracts, and fresh-output commands
+are in [the leaf report](../stella_port/reference_match_bow/README.md).
+Artifacts live in `runs/stella_port/match_bow/`; controlled landmark fixtures
+measure component parity, not continuous SLAM or canonical benchmark ATE.
+
+The companion `tools/{build,dump,check}_stella_landmark_descriptor.py` tools
+validate representative ORB descriptor selection and all median distances
+against real stella landmarks. See [the descriptor leaf report](../stella_port/reference_landmark_descriptor/README.md)
+for fixture scope and commands; artifacts use `runs/stella_port/landmark_descriptor/`.

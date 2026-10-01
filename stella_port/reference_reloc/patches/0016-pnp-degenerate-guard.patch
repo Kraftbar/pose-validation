@@ -1,0 +1,21 @@
+EPnP deterministic rejected-candidate guard: avoid uninitialized Eigen U/V after NumericalIssue.
+Public real-input results are checked against installed stella. Undefined fully degenerate cases need the separate all-invalid-output guard.
+
+--- a/src/stella_vslam/solve/pnp_solver.cc
++++ b/src/stella_vslam/solve/pnp_solver.cc
+@@ -393,6 +393,15 @@
+     }
+ 
+     Eigen::JacobiSVD<MatX_t> SVD(CM, Eigen::ComputeFullV | Eigen::ComputeFullU);
++    // [reference-port] Degenerate beta candidates can contain NaNs. Eigen
++    // returns NumericalIssue without initializing U/V; do not read them.
++    if (SVD.info() != Eigen::Success) {
++        reloc_trace::mat("CM", CM);
++        reloc_trace::scalar("CM_failed", 1);
++        rot.setConstant(std::numeric_limits<double>::quiet_NaN());
++        trans.setConstant(std::numeric_limits<double>::quiet_NaN());
++        return;
++    }
+     const MatX_t& CM_u = SVD.matrixU();
+     const MatX_t& CM_vt = SVD.matrixV().transpose();
+     reloc_trace::mat("CM", CM);

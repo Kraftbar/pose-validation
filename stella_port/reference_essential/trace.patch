@@ -1,0 +1,155 @@
+--- a/essential_solver.h
++++ b/essential_solver.h
+@@ -1,5 +1,5 @@
+-#ifndef STELLA_VSLAM_SOLVE_ESSENTIAL_SOLVER_H
+-#define STELLA_VSLAM_SOLVE_ESSENTIAL_SOLVER_H
++#ifndef SV_OBSERVED_ESSENTIAL_SOLVER_H
++#define SV_OBSERVED_ESSENTIAL_SOLVER_H
+ 
+ #include "stella_vslam/type.h"
+ 
+@@ -7,7 +7,7 @@
+ #include <random>
+ 
+ namespace stella_vslam {
+-namespace solve {
++namespace essential_reference {
+ 
+ class essential_solver {
+ public:
+@@ -83,4 +83,4 @@
+ } // namespace solve
+ } // namespace stella_vslam
+ 
+-#endif // STELLA_VSLAM_SOLVE_ESSENTIAL_SOLVER_H
++#endif // SV_OBSERVED_ESSENTIAL_SOLVER_H
+--- a/essential_5pt.h
++++ b/essential_5pt.h
+@@ -24,6 +24,7 @@
+ #include <Eigen/Dense>
+ 
+ #include "stella_vslam/type.h"
++#include "trace_hooks.h"
+ 
+ /**
+  * This file contains helper functions to compute the essential matrix from 5 bearing vector correspondences.
+@@ -33,6 +34,7 @@
+  */
+ 
+ namespace stella_vslam {
++namespace essential_reference {
+ 
+ // some special sized eigen matrices we only use here
+ using Mat10_t = Eigen::Matrix<double, 10, 10>;
+@@ -78,6 +80,8 @@
+     MatX_t null_space;
+     if (x1.size() == 5) {
+         const Eigen::FullPivLU<MatX_t> lu(epipolar_constraint);
++        essential_trace::matrix(essential_trace::minimal.constraint, epipolar_constraint);
++        essential_trace::minimal.rank = lu.rank();
+         success = (lu.dimensionOfKernel() >= 4);
+         null_space = lu.kernel();
+     }
+@@ -225,6 +229,7 @@
+     return M;
+ }
+ 
++} // namespace essential_reference
+ } // namespace stella_vslam
+ 
+ #endif // STELLA_VSLAM_SOLVE_ESSENTIAL_5PT_H
+--- a/essential_solver.cc
++++ b/essential_solver.cc
+@@ -1,11 +1,11 @@
+-#include "stella_vslam/solve/essential_5pt.h"
+-#include "stella_vslam/solve/essential_solver.h"
++#include "essential_5pt.h"
++#include "essential_solver.h"
+ #include "stella_vslam/util/converter.h"
+ #include "stella_vslam/util/random_array.h"
+ #include "stella_vslam/util/trigonometric.h"
+ 
+ namespace stella_vslam {
+-namespace solve {
++namespace essential_reference {
+ 
+ essential_solver::essential_solver(const eigen_alloc_vector<Vec3_t>& bearings_1, const eigen_alloc_vector<Vec3_t>& bearings_2,
+                                    const std::vector<std::pair<int, int>>& matches_12, bool use_fixed_seed)
+@@ -43,6 +43,7 @@
+     for (unsigned int iter = 0; iter < max_num_iter; iter++) {
+         // 2-1. Create a minimum set
+         const auto indices = util::create_random_array(min_set_size, 0U, num_matches - 1, random_engine_);
++        essential_trace::begin(indices);
+         for (unsigned int i = 0; i < min_set_size; ++i) {
+             const auto idx = indices.at(i);
+             min_set_bearings_1.at(i) = bearings_1_.at(matches_12_.at(idx).first);
+@@ -73,6 +74,7 @@
+                 best_num_inliers = num_inliers;
+             }
+         }
++        essential_trace::best(best_cost_, best_num_inliers, best_E_21_);
+     }
+ 
+     solution_is_valid_ = best_cost_ < std::numeric_limits<float>::max();
+@@ -143,8 +145,11 @@
+     bool success;
+     const Eigen::Matrix<double, 9, 4> E_basis = find_nullspace_of_epipolar_constraint(x1, x2, success);
+     if (!success) {
+-        return E_mats;
+-    }
++        essential_trace::finish_minimal(E_mats);
++    return E_mats;
++    }
++
++    essential_trace::matrix(essential_trace::minimal.basis, E_basis);
+ 
+     // Use the epipolar constaints to build a matrix representing
+     // ten, 3rd order polynomial equations in the 3 unknowns x,y,z
+@@ -152,9 +157,13 @@
+     // we can solve).
+     const Eigen::Matrix<double, 10, 20> constraint_matrix = form_polynomial_constraint_matrix(E_basis);
+ 
++    essential_trace::matrix(essential_trace::minimal.polynomial, constraint_matrix);
++
+     // Step 3: Apply Gauss-Jordan Elimination to the constraint matrix.
+     Eigen::FullPivLU<Mat10_t> c_lu(constraint_matrix.block<10, 10>(0, 0));
+     const Mat10_t eliminated_matrix = c_lu.solve(constraint_matrix.block<10, 10>(0, 10));
++
++    essential_trace::matrix(essential_trace::minimal.eliminated, eliminated_matrix);
+ 
+     // Solving the eliminated matrix like in the matlab code shown in Stewenius et al.
+ 
+@@ -169,11 +178,17 @@
+     action_matrix(8, 3) = -1.0;
+     action_matrix(9, 6) = -1.0;
+ 
++    essential_trace::matrix(essential_trace::minimal.action, action_matrix);
++
+     // Get the solutions to the constraint matrix (i.e. the 10 sets of solutions
+     // for our 3 unknowns)
+     Eigen::EigenSolver<Mat10_t> eigensolver(action_matrix);
+     const auto& eig_vecs = eigensolver.eigenvectors();
+     const auto& eig_vals = eigensolver.eigenvalues();
++
++    essential_trace::matrix(essential_trace::minimal.vectors_real, eig_vecs.real());
++    essential_trace::matrix(essential_trace::minimal.vectors_imag, eig_vecs.imag());
++    for(int i=0;i<10;i++){essential_trace::minimal.eigen_real[i]=eig_vals(i).real();essential_trace::minimal.eigen_imag[i]=eig_vals(i).imag();}
+ 
+     // Build essential matrices by substituting in the real solutions (there can be up to 10
+     // since we solved a 10th degree polynomial)
+@@ -186,6 +201,7 @@
+         Eigen::Map<Vec9_t>(E.data()) = E_basis * eig_vecs.col(s).tail<4>().real();
+         E_mats.emplace_back(E.transpose());
+     }
++    essential_trace::finish_minimal(E_mats);
+     return E_mats;
+ }
+ 
+@@ -261,6 +277,7 @@
+         }
+     }
+ 
++    essential_trace::inliers(cost, num_inliers, is_inlier_match);
+     return num_inliers;
+ }
+ 

@@ -1,0 +1,116 @@
+--- a/src/stella_vslam/util/erasure_log.h	2026-09-29 16:40:00.197405262 +0200
++++ b/src/stella_vslam/util/erasure_log.h	2026-09-29 16:42:21.503838989 +0200
+@@ -90,6 +90,25 @@
+ 
+ extern std::vector<kf_insert_record> g_kf_inserts;
+ 
++// [reference-port] patch 0011 (module 6 lifetime schedule): keyframe objects
++// are destroyed only when the last shared_ptr drops, and stella's covisibility
++// maps key on weak_ptr<keyframe> with a comparator that dereferences them, so
++// WHEN an erased keyframe expires is observable (lookups in the graph nodes
++// that still hold its weak_ptr). g_destroyed_keyframes logs every keyframe
++// destruction with the mapping phase it happened in (g_phase: 0 = tracking /
++// keyframe insertion, 1 = mapping_with_new_keyframe() up to
++// remove_redundant_keyframes(), 2 = from there on (keyframes culled by the pass
++// expire here, then the global optimization step), 3 = set by the driver
++// after the frame). Recording is
++// off unless the driver sets g_log_destroyed (static destruction safety).
++struct destroyed_keyframe_record {
++    unsigned int id = 0;
++    int phase = 0;
++};
++extern std::vector<destroyed_keyframe_record> g_destroyed_keyframes;
++extern int g_phase;
++extern bool g_log_destroyed;
++
+ } // namespace util
+ } // namespace stella_vslam
+ 
+--- a/src/stella_vslam/util/erasure_log.cc	2026-09-29 16:40:00.200405228 +0200
++++ b/src/stella_vslam/util/erasure_log.cc	2026-09-29 16:40:00.222404984 +0200
+@@ -6,6 +6,9 @@
+ std::vector<erased_landmark_record> g_erased_landmarks;
+ std::vector<erased_keyframe_record> g_erased_keyframes;
+ std::vector<kf_insert_record> g_kf_inserts; // [reference-port] patch 0009
++std::vector<destroyed_keyframe_record> g_destroyed_keyframes; // [reference-port] patch 0011
++int g_phase = 0;
++bool g_log_destroyed = false;
+ 
+ } // namespace util
+ } // namespace stella_vslam
+--- a/src/stella_vslam/data/keyframe.cc	2026-09-29 16:40:00.202405206 +0200
++++ b/src/stella_vslam/data/keyframe.cc	2026-09-29 16:40:00.222404984 +0200
+@@ -137,6 +137,12 @@
+ 
+ keyframe::~keyframe() {
+     SPDLOG_TRACE("keyframe::~keyframe: {}", id_);
++    if (util::g_log_destroyed) { // [reference-port] patch 0011
++        util::destroyed_keyframe_record rec;
++        rec.id = id_;
++        rec.phase = util::g_phase;
++        util::g_destroyed_keyframes.push_back(rec);
++    }
+ }
+ 
+ std::shared_ptr<keyframe> keyframe::make_keyframe(unsigned int id, const frame& frm) {
+--- a/src/stella_vslam/data/graph_node.h	2026-09-29 16:40:00.204405184 +0200
++++ b/src/stella_vslam/data/graph_node.h	2026-09-29 16:40:00.222404984 +0200
+@@ -64,6 +64,11 @@
+      */
+     std::vector<std::shared_ptr<keyframe>> get_covisibilities() const;
+ 
++    //! [reference-port] patch 0011: raw covisibility state INCLUDING entries whose keyframe
++    //! has expired (id = -1): `connected` in the std::map's in-order sequence, `ordered` =
++    //! ordered_covisibilities_ with the parallel ordered_num_shared_lms_ value
++    void get_raw_state(std::vector<std::pair<int, unsigned int>>& connected, std::vector<std::pair<int, unsigned int>>& ordered) const;
++
+     /**
+      * Get the top-n covisibility keyframes
+      */
+--- a/src/stella_vslam/data/graph_node.cc	2026-09-29 16:40:00.207405151 +0200
++++ b/src/stella_vslam/data/graph_node.cc	2026-09-29 16:40:00.222404984 +0200
+@@ -180,6 +180,20 @@
+     }
+ }
+ 
++void graph_node::get_raw_state(std::vector<std::pair<int, unsigned int>>& connected, std::vector<std::pair<int, unsigned int>>& ordered) const { // [reference-port] patch 0011
++    std::lock_guard<std::mutex> lock(mtx_);
++    connected.clear();
++    ordered.clear();
++    for (const auto& kv : connected_keyfrms_and_num_shared_lms_) {
++        const auto kf = kv.first.lock();
++        connected.emplace_back(kf ? static_cast<int>(kf->id_) : -1, kv.second);
++    }
++    for (size_t i = 0; i < ordered_covisibilities_.size(); ++i) {
++        const auto kf = ordered_covisibilities_.at(i).lock();
++        ordered.emplace_back(kf ? static_cast<int>(kf->id_) : -1, ordered_num_shared_lms_.at(i));
++    }
++}
++
+ std::set<std::shared_ptr<keyframe>> graph_node::get_connected_keyframes() const {
+     std::lock_guard<std::mutex> lock(mtx_);
+     std::set<std::shared_ptr<keyframe>> keyfrms;
+--- a/src/stella_vslam/mapping_module.cc	2026-09-29 16:40:00.210405117 +0200
++++ b/src/stella_vslam/mapping_module.cc	2026-09-29 16:42:21.503838989 +0200
+@@ -1,4 +1,5 @@
+ #include <cstdio>
++#include "stella_vslam/util/erasure_log.h" // [reference-port] patch 0011
+ #include "stella_vslam/type.h"
+ #include "stella_vslam/mapping_module.h"
+ #include "stella_vslam/tracking_module.h"
+@@ -172,6 +173,7 @@
+ }
+ 
+ void mapping_module::mapping_with_new_keyframe() {
++    util::g_phase = 1; // [reference-port] patch 0011: pass start (the dequeue below may drop the previous cur_keyfrm_)
+     // dequeue
+     {
+         std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
+@@ -277,6 +279,7 @@
+         }
+     }
+ 
++    util::g_phase = 2; // [reference-port] patch 0011: keyframes culled below expire when remove_redundant_keyframes() returns
+     fprintf(stderr, "[TRACE] remove_redundant_keyframes begin\n"); fflush(stderr);
+     local_map_cleaner_->remove_redundant_keyframes(cur_keyfrm_);
+     last_pass_trace_.culled_keyframe_ids = local_map_cleaner_->get_last_culled_keyframe_ids(); // [reference-port]

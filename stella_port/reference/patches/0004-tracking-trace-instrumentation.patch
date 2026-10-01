@@ -1,0 +1,316 @@
+--- a/src/stella_vslam/tracking_module.h
++++ b/src/stella_vslam/tracking_module.h
+@@ -52,6 +52,50 @@
+     //! Destructor
+     ~tracking_module();
+ 
++    //-----------------------------------------
++    // [reference-port] per-frame trace for stella_port/reference dumps.
++    // Populated during track()/track_current_frame()/
++    // optimize_current_frame_with_local_map()/update_local_map(); read by
++    // the driver after feed_frame() returns, before
++    // system::synchronize_background_modules() is called for that frame
++    // (see stella_port/reference/README.md "Dump timing"). Plain public
++    // members, not getters: tracking_module has no private section, so this
++    // matches its existing style.
++
++    //! which frame_tracker variant (if any) produced the pose this frame
++    //! ended up with, before local-map tracking; NONE if every variant (and
++    //! relocalization, if attempted) failed
++    enum class track_path_t {
++        none,
++        motion_model,
++        bow_match,
++        robust_match,
++        relocalize_by_pose,
++        relocalize_auto,
++    };
++    track_path_t last_track_path_ = track_path_t::none;
++    //! pose right after track_current_frame()/relocalize*() succeeded, i.e.
++    //! before local-map tracking's own pose optimization; identity/invalid
++    //! if that stage did not succeed
++    Mat44_t last_pose_after_initial_track_ = Mat44_t::Identity();
++    bool last_pose_after_initial_track_valid_ = false;
++    //! outputs of optimize_current_frame_with_local_map(): final inlier
++    //! (tracked) landmark count and reliable (multiply-observed) count,
++    //! after outlier rejection from the local-map pose optimization
++    unsigned int last_num_tracked_lms_ = 0;
++    unsigned int last_num_reliable_lms_ = 0;
++    //! local map acquired by update_local_map(), in local_map_updater's
++    //! order (local_landmarks_ is already a tracking_module member; its ids
++    //! at dump time are this frame's local landmark set)
++    std::vector<unsigned int> last_local_keyframe_ids_;
++
++    //! [reference-port] local_landmarks_ and keyfrm_inserter_ are protected
++    //! members (see below); small public forwarding getters so the driver
++    //! can read this frame's local landmark set and the most recent
++    //! keyframe-insertion decision trace without widening their access.
++    const std::vector<std::shared_ptr<data::landmark>>& get_local_landmarks() const { return local_landmarks_; }
++    const module::keyframe_inserter::decision_trace& get_last_kf_decision() const { return keyfrm_inserter_.get_last_decision(); }
++
+     //! Set the mapping module
+     void set_mapping_module(mapping_module* mapper);
+ 
+--- a/src/stella_vslam/tracking_module.cc
++++ b/src/stella_vslam/tracking_module.cc
+@@ -201,10 +201,18 @@
+     // set the reference keyframe of the current frame
+     curr_frm_.ref_keyfrm_ = last_frm_.ref_keyfrm_;
+ 
++    // [reference-port] reset per-frame trace; track_current_frame() fills in
++    // last_track_path_, this function fills the relocalize_* paths directly
++    last_track_path_ = track_path_t::none;
++    last_pose_after_initial_track_valid_ = false;
++
+     bool succeeded = false;
+     if (bow_db_ && relocalize_by_pose_is_requested()) {
+         // Force relocalization by pose
+         succeeded = relocalize_by_pose(get_relocalize_by_pose_request());
++        if (succeeded) {
++            last_track_path_ = track_path_t::relocalize_by_pose;
++        }
+     }
+     else if (!relocalization_is_needed) {
+         SPDLOG_TRACE("tracking_module: track_current_frame (curr_frm_={})", curr_frm_.id_);
+@@ -222,8 +230,16 @@
+         if (succeeded) {
+             last_reloc_frm_id_ = curr_frm_.id_;
+             last_reloc_frm_timestamp_ = curr_frm_.timestamp_;
++            last_track_path_ = track_path_t::relocalize_auto;
+         }
+     }
++    // [reference-port] snapshot the pose this frame has right after whichever
++    // path above succeeded, before local-map tracking gets a chance to
++    // re-optimize it
++    if (succeeded && curr_frm_.pose_is_valid()) {
++        last_pose_after_initial_track_ = curr_frm_.get_pose_cw();
++        last_pose_after_initial_track_valid_ = true;
++    }
+ 
+     // update the local map and optimize current camera pose
+     unsigned int fixed_keyframe_id_threshold = map_db_->get_fixed_keyframe_id_threshold();
+@@ -337,6 +353,9 @@
+     if (twist_is_valid_) {
+         // if the motion model is valid
+         succeeded = frame_tracker_.motion_based_track(curr_frm_, last_frm_, twist_);
++        if (succeeded) {
++            last_track_path_ = track_path_t::motion_model; // [reference-port]
++        }
+     }
+     if (!succeeded) {
+         // Compute the BoW representations to perform the BoW match
+@@ -345,10 +364,16 @@
+         }
+         if (curr_frm_.bow_is_available() && curr_frm_.ref_keyfrm_->bow_is_available()) {
+             succeeded = frame_tracker_.bow_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
++            if (succeeded) {
++                last_track_path_ = track_path_t::bow_match; // [reference-port]
++            }
+         }
+     }
+     if (!succeeded) {
+         succeeded = frame_tracker_.robust_match_based_track(curr_frm_, last_frm_, curr_frm_.ref_keyfrm_);
++        if (succeeded) {
++            last_track_path_ = track_path_t::robust_match; // [reference-port]
++        }
+     }
+ 
+     return succeeded;
+@@ -479,6 +504,12 @@
+         // increment the number of tracked frame
+         lm->increase_num_observed();
+     }
++    // [reference-port] snapshot inlier counts after this pose optimization's
++    // outlier rejection; overwritten if track_local_map_without_temporal_keyframes
++    // re-runs this function, which is correct -- that rerun's counts are the
++    // ones that end up in num_tracked_lms/num_reliable_lms returned by track()
++    last_num_tracked_lms_ = num_tracked_lms;
++    last_num_reliable_lms_ = num_reliable_lms;
+ 
+     constexpr unsigned int num_tracked_lms_thr = 20;
+ 
+@@ -520,6 +551,14 @@
+     // update the variables
+     local_landmarks_ = local_map_updater.get_local_landmarks();
+     auto nearest_covisibility = local_map_updater.get_nearest_covisibility();
++    // [reference-port] local_map_updater itself is local to this function;
++    // its keyframe list would otherwise be lost once it goes out of scope
++    last_local_keyframe_ids_.clear();
++    for (const auto& kf : local_map_updater.get_local_keyframes()) {
++        if (kf) {
++            last_local_keyframe_ids_.push_back(kf->id_);
++        }
++    }
+ 
+     // update the reference keyframe for the current frame
+     if (nearest_covisibility) {
+--- a/src/stella_vslam/module/keyframe_inserter.h
++++ b/src/stella_vslam/module/keyframe_inserter.h
+@@ -54,6 +54,31 @@
+ 
+     static void check_marker_initialization(data::marker& mkr, size_t needed_observations_for_initialization);
+ 
++    //! [reference-port] decision inputs + verdict from the most recent
++    //! new_keyframe_is_needed() call, for stella_port/reference dumps.
++    //! Mirrors the local variables new_keyframe_is_needed() already computes
++    //! (and already SPDLOG_TRACEs individually); this just keeps them alive
++    //! past the call so the driver can read them.
++    struct decision_trace {
++        unsigned int num_reliable_lms_ref = 0;
++        unsigned int num_reliable_lms = 0;
++        unsigned int num_tracked_lms = 0;
++        float distance_traveled = -1.0f;
++        bool max_interval_elapsed = false;
++        bool min_interval_elapsed = true;
++        bool max_distance_traveled = false;
++        bool min_distance_traveled = true;
++        bool view_changed = false;
++        bool not_enough_lms = false;
++        bool enough_keyfrms = false;
++        bool tracking_is_unstable = false;
++        bool almost_all_lms_are_tracked = false;
++        bool mapper_is_skipping_localBA = false;
++        bool mapper_paused_or_pausing = false;
++        bool verdict = false;
++    };
++    const decision_trace& get_last_decision() const { return last_decision_; }
++
+ private:
+     std::shared_ptr<data::keyframe> create_new_keyframe(data::map_database* map_db, data::frame& curr_frm);
+ 
+@@ -74,6 +99,10 @@
+     const bool wait_for_local_bundle_adjustment_ = false;
+ 
+     const size_t required_keyframes_for_marker_initialization_ = 3;
++
++    //! [reference-port] see get_last_decision(); new_keyframe_is_needed() is
++    //! const, so this has to be mutable to be written from there.
++    mutable decision_trace last_decision_;
+ };
+ 
+ } // namespace module
+--- a/src/stella_vslam/module/keyframe_inserter.cc
++++ b/src/stella_vslam/module/keyframe_inserter.cc
+@@ -57,6 +57,9 @@
+     assert(mapper_);
+     // Any keyframes are not able to be added when the mapping module stops
+     if (mapper_->is_paused() || mapper_->pause_is_requested()) {
++        last_decision_ = decision_trace{}; // [reference-port]
++        last_decision_.mapper_paused_or_pausing = true;
++        last_decision_.verdict = false;
+         return false;
+     }
+ 
+@@ -120,11 +123,29 @@
+     SPDLOG_TRACE("keyframe_inserter: tracking_is_unstable={}", tracking_is_unstable);
+     SPDLOG_TRACE("keyframe_inserter: almost_all_lms_are_tracked={}", almost_all_lms_are_tracked);
+     SPDLOG_TRACE("keyframe_inserter: mapper_is_skipping_localBA={}", mapper_is_skipping_localBA);
+-    return (max_interval_elapsed || max_distance_traveled || view_changed || not_enough_lms)
+-           && (!enough_keyfrms || (min_interval_elapsed && min_distance_traveled))
+-           && !tracking_is_unstable
+-           && !almost_all_lms_are_tracked
+-           && !mapper_is_skipping_localBA;
++    const bool verdict = (max_interval_elapsed || max_distance_traveled || view_changed || not_enough_lms)
++                         && (!enough_keyfrms || (min_interval_elapsed && min_distance_traveled))
++                         && !tracking_is_unstable
++                         && !almost_all_lms_are_tracked
++                         && !mapper_is_skipping_localBA;
++    // [reference-port] persist this call's inputs + verdict for the driver
++    last_decision_.num_reliable_lms_ref = num_reliable_lms_ref;
++    last_decision_.num_reliable_lms = num_reliable_lms;
++    last_decision_.num_tracked_lms = num_tracked_lms;
++    last_decision_.distance_traveled = distance_traveled;
++    last_decision_.max_interval_elapsed = max_interval_elapsed;
++    last_decision_.min_interval_elapsed = min_interval_elapsed;
++    last_decision_.max_distance_traveled = max_distance_traveled;
++    last_decision_.min_distance_traveled = min_distance_traveled;
++    last_decision_.view_changed = view_changed;
++    last_decision_.not_enough_lms = not_enough_lms;
++    last_decision_.enough_keyfrms = enough_keyfrms;
++    last_decision_.tracking_is_unstable = tracking_is_unstable;
++    last_decision_.almost_all_lms_are_tracked = almost_all_lms_are_tracked;
++    last_decision_.mapper_is_skipping_localBA = mapper_is_skipping_localBA;
++    last_decision_.mapper_paused_or_pausing = false;
++    last_decision_.verdict = verdict;
++    return verdict;
+ }
+ 
+ std::shared_ptr<data::keyframe> keyframe_inserter::create_new_keyframe(
+--- a/src/stella_vslam/util/random_array.h
++++ b/src/stella_vslam/util/random_array.h
+@@ -4,6 +4,8 @@
+ #include <vector>
+ #include <random>
+ #include <memory>
++#include <atomic>
++#include <cstdint>
+ 
+ namespace stella_vslam {
+ namespace util {
+@@ -15,6 +17,22 @@
+ std::vector<T> create_random_array(const size_t size, const T rand_min, const T rand_max,
+                                    std::mt19937& random_engine);
+ 
++// [reference-port] process-lifetime counters so a driver/port can align its
++// own RNG stream with stella_vslam's: how many random_engine instances were
++// created (each RANSAC solver -- fundamental/essential/homography/pnp --
++// and each initializer/relocalizer/loop_detector construction gets its own
++// via create_random_engine()), how many create_random_array() calls were
++// made (one per RANSAC iteration that draws a fresh minimal sample), and
++// the total number of samples drawn across those calls (a lower bound on
++// mt19937::operator() invocations -- std::shuffle inside
++// create_random_array() draws roughly `size` more per call, on top of the
++// uniform_int_distribution draws already counted by g_random_array_elements_requested).
++// Not reset between frames; the driver reads the cumulative values before
++// and after each frame to get a per-frame delta.
++extern std::atomic<uint64_t> g_random_engines_created;
++extern std::atomic<uint64_t> g_random_array_calls;
++extern std::atomic<uint64_t> g_random_array_elements_requested;
++
+ } // namespace util
+ } // namespace stella_vslam
+ 
+--- a/src/stella_vslam/util/random_array.cc
++++ b/src/stella_vslam/util/random_array.cc
+@@ -9,7 +9,13 @@
+ namespace stella_vslam {
+ namespace util {
+ 
++// [reference-port] see random_array.h
++std::atomic<uint64_t> g_random_engines_created{0};
++std::atomic<uint64_t> g_random_array_calls{0};
++std::atomic<uint64_t> g_random_array_elements_requested{0};
++
+ std::mt19937 create_random_engine(bool use_fixed_seed) {
++    g_random_engines_created.fetch_add(1, std::memory_order_relaxed); // [reference-port]
+     std::mt19937 random_engine;
+     if (use_fixed_seed) {
+         return std::mt19937();
+@@ -29,6 +35,10 @@
+     assert(rand_min <= rand_max);
+     assert(size <= static_cast<size_t>(rand_max - rand_min + 1));
+ 
++    // [reference-port]
++    g_random_array_calls.fetch_add(1, std::memory_order_relaxed);
++    g_random_array_elements_requested.fetch_add(size, std::memory_order_relaxed);
++
+     std::uniform_int_distribution<T> uniform_int_distribution(rand_min, rand_max);
+ 
+     // Create a random sequence slightly larger than the 'size' (because duplication possibly exists)
+--- a/src/stella_vslam/system.h
++++ b/src/stella_vslam/system.h
+@@ -82,6 +82,14 @@
+     //! relying on the (absent) background threads.
+     void startup_single_threaded(const bool need_initialize = true);
+ 
++    //! [reference-port] read-only access to the tracking module, for the
++    //! per-frame trace fields tracking_module.h adds (last_track_path_,
++    //! last_pose_after_initial_track_*, last_num_tracked_lms_,
++    //! last_num_reliable_lms_, last_local_keyframe_ids_, local_landmarks_).
++    //! tracking_module has no private section, so these are plain public
++    //! members once reached through this getter.
++    tracking_module* get_tracker() const { return tracker_; }
++
+     //! Drain the mapping module's keyframe queue and, transitively, the
+     //! global optimization module's queue, synchronously on the calling
+     //! thread, in the same per-keyframe order the mapping/global-optimization
