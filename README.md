@@ -118,7 +118,7 @@ with `tools/tum_eval.py` (Sim3 ATE over tracked frames). Details and caveats:
 | System | License | Mean ATE | Tracked frames | Speed (× real time) | Notes |
 |---|---|---:|---:|---:|---|
 | stella_vslam (upstream) | BSD-2 | **1.9 cm** | 96% | 1.8–2.5× | C++/OpenCV/Eigen/g2o, multi-thread, loop closing |
-| **stella C port (ours)** | BSD-2 / MPL-2.0 | 2.4 cm | 97% | **2.3–2.9×** | pure C99, no libraries, 1 thread, bit-exact to stella reference |
+| **stella C port (ours)** | BSD-2 / MPL-2.0 | 2.2 cm³ | 96% | **2.3–2.9×** | pure C99, no libraries, 1 thread, bit-exact to stella reference |
 | ORB-SLAM2 (upstream) | GPLv3 | 1.9 cm¹ | 67% | 0.2–2.5×² | never initializes on fr1_floor |
 | ORB-SLAM2 C port (ours, not in repo) | GPLv3-derived | 1.6 cm¹ | 67% | 0.2–0.4×² | matches upstream; kept private for licensing |
 | DSO (no photometric calibration) | GPLv3 | 13 cm | 16% | 0.8–3.3× | loses track on most frames |
@@ -132,12 +132,16 @@ normal ORB-SLAM2 speed. Speed = sequence duration / wall time on this machine
 (TUM is 30 Hz; >1× is faster than real time). The stella port reads
 pre-decoded frames (12.5–14.3 ms/frame).
 
+³ Per-sequence shipped camera calibration (fr1/fr2/fr3 `TUM_RGBD_mono_{1,2,3}`),
+same as upstream; speed not re-measured. Remaining gap to upstream is fr2_xyz
+(0.016 vs 0.004 m), unexplained, see `stella_port/HANDOVER.md` "Calibration gap check".
+
 ### Per sequence (ATE m / tracked frames)
 
 | System | fr1_xyz | fr1_desk | fr1_floor | fr2_xyz | fr3_long_office |
 |---|---|---|---|---|---|
 | stella_vslam (upstream) | 0.025 / 99% | 0.020 / 88% | 0.022 / 98% | 0.004 / 98% | 0.022 / 99% |
-| **stella C port (ours)** | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.019 / 99% | 0.037 / 99% |
+| **stella C port (ours)** | 0.026 / 99% | 0.018 / 89% | 0.022 / 97% | 0.016 / 98% | 0.025 / 99% |
 | ORB-SLAM2 (upstream) | 0.011 / 72% | 0.014 / 64% | never inits | 0.018 / 100% | 0.034 / 99% |
 | ORB-SLAM2 C port (ours) | 0.011 / 72% | 0.014 / 64% | never inits | 0.012 / 100% | 0.028 / 99% |
 | DSO | 0.063 / 18% | 0.211 / 24% | 0.258 / 17% | 0.020 / 3% | 0.089 / 19% |
@@ -147,7 +151,9 @@ pre-decoded frames (12.5–14.3 ms/frame).
 The stella C port matches the deterministic single-threaded stella reference
 byte-for-byte (identical trajectories on all five sequences; 56 harness rows,
 0 mismatches via `python3 tools/check_stella_port.py`). Its numbers differ from
-the upstream row only because upstream maps asynchronously in threads. It is
+the upstream row on fr2_xyz (0.016 vs 0.004 m) and fr3_long_office (0.025 vs
+0.022 m, within upstream's 0.017-0.057 run spread); the fr2 gap is not yet
+explained (upstream maps asynchronously in threads). It is
 not yet wired into `benchmark.py`; that needs a full `--all_gt` sweep. Status
 and method: `stella_port/HANDOVER.md`.
 

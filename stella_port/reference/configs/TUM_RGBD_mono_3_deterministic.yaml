@@ -1,0 +1,94 @@
+# stella_port reference config (fr3 camera: ONLY the Camera section differs from
+# TUM_RGBD_mono_1_deterministic.yaml), derived from stella_vslam's own shipped
+# external/candidates/stella_vslam/example/tum_rgbd/TUM_RGBD_mono_3.yaml
+# (BSD-2, same camera/feature/mapping numbers, unchanged), with three
+# additions that remove nondeterminism sources at the config level instead
+# of a code patch (see stella_port/reference/README.md "Nondeterminism
+# sources"):
+#   - use_fixed_seed: true under Initializer/Relocalizer/LoopDetector, so
+#     RANSAC (fundamental/essential/homography/PnP solvers) uses
+#     std::mt19937() (default-constructed, fixed seed) instead of
+#     std::random_device.
+#   - Mapping.enable_interruption_of_landmark_generation: false and
+#     Mapping.enable_interruption_before_local_BA: false, so
+#     mapping_module::mapping_with_new_keyframe() never spawns the
+#     std::async landmark-generation thread or takes an early-return branch
+#     whose outcome depends on mapping_module's keyframe queue state at an
+#     arbitrary wall-clock instant. (In the single-threaded reference driver
+#     the queue is always empty when this runs anyway, since nothing feeds
+#     it concurrently -- but removing the thread/race outright is the
+#     smaller, more obviously-correct fix.)
+# Built with -DDETERMINISTIC=ON (see patches/ -- this is an upstream stella_vslam
+# CMake option, not our patch) which switches the pointer-hash-ordered
+# std::unordered_set/unordered_map<shared_ptr<keyframe|landmark>> used at
+# most sites (type.h nondeterministic:: aliases) to std::set/std::map
+# ordered by ::id_ instead.
+
+#==============#
+# Camera Model #
+#==============#
+
+Camera:
+  name: "TUM RGBD monocular 03"
+  setup: "monocular"
+  model: "perspective"
+
+  fx: 535.4
+  fy: 539.2
+  cx: 320.1
+  cy: 247.6
+
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+  fps: 30.0
+  cols: 640
+  rows: 480
+
+  color_order: "RGB"
+
+#=====================#
+# Tracking Parameters #
+#=====================#
+
+Preprocessing:
+  min_size: 800
+
+#================#
+# ORB Parameters #
+#================#
+
+Feature:
+  name: "default ORB feature extraction setting"
+  scale_factor: 1.2
+  num_levels: 8
+  ini_fast_threshold: 20
+  min_fast_threshold: 7
+
+#====================#
+# Mapping Parameters #
+#====================#
+
+Mapping:
+  baseline_dist_thr_ratio: 0.02
+  redundant_obs_ratio_thr: 0.9
+  num_covisibilities_for_landmark_generation: 20
+  num_covisibilities_for_landmark_fusion: 20
+  enable_interruption_of_landmark_generation: false
+  enable_interruption_before_local_BA: false
+
+#=========================#
+# Determinism (see above) #
+#=========================#
+
+Initializer:
+  use_fixed_seed: true
+
+Relocalizer:
+  use_fixed_seed: true
+
+LoopDetector:
+  use_fixed_seed: true

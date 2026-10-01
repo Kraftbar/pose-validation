@@ -198,6 +198,8 @@ typedef struct sv_run_opts {
     int enable_loop;
     int verbose;
     long blank_from, blank_to; /* --blank A-B: feed a flat gray image for frames A..B (forces Lost / relocalization / reset) */
+    int has_camera;
+    double camera[9]; /* --camera fx,fy,cx,cy,k1,k2,p1,p2,k3: override the default (fr1) camera, e.g. TUM_RGBD_mono_2/3.yaml */
 } sv_run_opts;
 
 static void write_snapshot(FILE* fk, FILE* fl, sv_system* sys, long frame) {
@@ -266,6 +268,17 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
         return 2;
     }
     sv_system_params_default(&p, &vocab);
+    if (o->has_camera) {
+        p.cam.fx = o->camera[0];
+        p.cam.fy = o->camera[1];
+        p.cam.cx = o->camera[2];
+        p.cam.cy = o->camera[3];
+        p.cam.k1 = o->camera[4];
+        p.cam.k2 = o->camera[5];
+        p.cam.p1 = o->camera[6];
+        p.cam.p2 = o->camera[7];
+        p.cam.k3 = o->camera[8];
+    }
     p.resume_mapper_after_loop = o->resume_mapper;
     p.enable_loop_closure = o->enable_loop;
     sys = sv_system_create(&p);
@@ -455,7 +468,7 @@ int main(int argc, char** argv) {
     int i;
     if (argc < 5) {
         fprintf(stderr, "usage: sv_run <vocab.fbow> <tum_seq_dir> <fixtures_dir> <out_dir> [max_frames] [--snap-every N] [--no-snap] "
-                        "[--snap-from F] [--snap-loop] [--resume-mapper] [--no-loop] [--blank A-B]\n");
+                        "[--snap-from F] [--snap-loop] [--resume-mapper] [--no-loop] [--blank A-B] [--camera fx,fy,cx,cy,k1,k2,p1,p2,k3]\n");
         return 1;
     }
     memset(&o, 0, sizeof(o));
@@ -484,6 +497,14 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--blank") && i + 1 < argc) {
             sscanf(argv[++i], "%ld-%ld", &o.blank_from, &o.blank_to);
+        }
+        else if (!strcmp(argv[i], "--camera") && i + 1 < argc) {
+            o.has_camera = sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &o.camera[0], &o.camera[1], &o.camera[2],
+                                  &o.camera[3], &o.camera[4], &o.camera[5], &o.camera[6], &o.camera[7], &o.camera[8]) == 9;
+            if (!o.has_camera) {
+                fprintf(stderr, "sv_run: --camera needs fx,fy,cx,cy,k1,k2,p1,p2,k3\n");
+                return 1;
+            }
         }
         else {
             o.max_frames = atol(argv[i]);

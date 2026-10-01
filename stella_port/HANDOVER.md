@@ -1150,3 +1150,39 @@ The port is now faster than the reference on all five (reference numbers are the
 with ~2.3-2.9x margin. Remaining cost is ~95 % ORB extraction: FAST ~40 %, blur ~21 %, descriptors + IC angle ~15 %, pyramid ~11 %.
 Possible further (exact) ideas: the BoW vector of a keyframe is computed twice (`sv_loop` `kf_bow` and `sv_system` `db_add`; ~1 ms per keyframe, negligible now);
 blur only the tiles that contain keypoint patches (probably ~20 % of blur at best).
+
+## Calibration gap check (2026-10-01)
+
+Question: why upstream multi-thread stella (mean 1.9 cm) vs deterministic reference / bit-exact port (2.4 cm)?
+
+**H1 (calibration) is a real but partial cause.** Upstream (`external/candidates/run_stella.sh`) used the shipped
+per-sequence camera (`TUM_RGBD_mono_1` for fr1_*, `_2` for fr2_xyz, `_3` for fr3_long_office). The deterministic
+reference (and thus every dump / the port's default `sv_system_params_default`) used the fr1 camera for ALL sequences.
+Added `stella_port/reference/configs/TUM_RGBD_mono_{2,3}_deterministic.yaml` (mono_1_deterministic with ONLY the Camera
+section replaced by the shipped mono_2/mono_3 values; the other sections of shipped mono_1/2/3 are identical) and
+`sv_run --camera fx,fy,cx,cy,k1,k2,p1,p2,k3` (overrides the default camera; the fixtures are gray images, camera-independent;
+no other port code touched; canonical dumps/harnesses stay on fr1). Runs: `runs/stella_port/calib_gap/` (reference `--light`,
+`STELLA_PORT_EIGEN_SOLVER=1 --loop-dump` for fr3 because the port equals the Eigen-solver reference; the CSparse reference
+differs from it at the ~1e-9 ULP level on fr3 only, same ATE to 5 digits).
+
+| seq | config | upstream MT ATE (median of 3; runs) | det-reference ATE | port ATE | port==ref? |
+|---|---|---|---:|---:|---|
+| fr2_xyz | fr1 camera (old) | 0.004 (0.0040/0.0041/0.0058) | 0.019 | 0.019 | yes (old) |
+| fr2_xyz | mono_2 (shipped) | same runs | **0.0163** | **0.0163** | yes, byte-identical trajectory (3600 poses) |
+| fr3_long_office | fr1 camera (old) | 0.022 (0.0171/0.0223/0.0573) | 0.037 | 0.037 | yes (old) |
+| fr3_long_office | mono_3 (shipped) | same runs | **0.0250** | **0.0250** | yes, byte-identical to the Eigen-solver reference (2558 poses; CSparse ref differs at ULP, same ATE) |
+
+Mean over 5 sequences, port/reference: 0.024 -> 0.0215 m (upstream 0.019). fr3 is now inside upstream's run-to-run spread.
+
+**H2 (async mapping nondeterminism) does not explain fr2_xyz.** The existing 3 upstream runs with the correct config
+(`runs/tum_compare/stella_vslam/fr2_xyz/run{1,2,3}`) span only 0.0040-0.0058, all far below 0.0163 (so no rerun was needed);
+fr3 spans 0.017-0.057 (genuinely nondeterministic). Keyframe counts match (fr2: 33/31/33 upstream vs 33 ours). Per-time-slice
+ATE shows our fr2 error is concentrated in the first ~1200 frames (0.027, 0.018, 0.009, then 0.002-0.004) with Sim3 scale
+1.16 -> 1.08, while upstream is flat 0.002-0.006 from the start; upstream initializes at frame 12-74 depending on the run
+(ours at frame 69), so initialization timing alone is not it. Cause of the early-phase difference (async local mapping
+refining the young map between tracked frames vs. synchronous mapping) is NOT established; untested hypotheses: the
+synchronous driver's per-frame mapping order, and mapping-thread keyframe-queue-dependent behaviour disabled by the
+deterministic config flags. Not pursued further (would need a reference-side experiment).
+
+Docs updated with the per-camera numbers: `docs/slam_candidates_comparison_20260925.md`, README "Full-SLAM Comparison".
+`runs/tum_compare/stella_vslam_st/` (old fr1-camera fr2/fr3 scores) and `table.md` left as is. Speed not re-measured.
