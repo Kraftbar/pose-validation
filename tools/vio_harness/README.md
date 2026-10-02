@@ -7,6 +7,8 @@ targets a checkout under `external/vio/` (gitignored). Paths are hard-coded to t
 - `fetch_seq.py` + `remotezip.py`: stream one EuRoC ASL sequence out of the ETH Research Collection
   (HTTP range requests into the nested zip; robotics.ethz.ch hangs). Data is deleted after each sequence.
   EuRoC licence: "In Copyright - Non-Commercial Use Permitted". Never commit the data.
+- `fetch_seq_stream.py <seq> [cam0,imu0,...]`: same source as `fetch_seq.py` but parses the nested ASL zip as a stream and writes only the requested sensor folders
+  (default cam0 + imu0 + sensor yamls): no 1.5 GB temporary zip, no cam1 (used by the okvis_port reference runs).
 - `run_<system>.sh <seq> [mode]`, `run_all.sh <seq>`: run one system, write `runs/vio_compare/<system>/<seq>/{trajectory.tum,run.json}`.
 - Scoring: `tools/vio_prep_gt.py` (GT -> TUM) and `tools/vio_eval.py` (uses `benchmark.umeyama_alignment/ate_rmse`).
 - `orbslam3_stubs/`: headless replacements for ORB-SLAM3's Viewer.cc / MapDrawer.cc + fake `pangolin/pangolin.h`
