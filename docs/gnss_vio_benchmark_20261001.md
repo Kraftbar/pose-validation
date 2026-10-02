@@ -237,3 +237,125 @@ beats the fixes alone on the same epochs (2.7-3.4 vs 4.5 m), but that is only 40
 
 Not done / limits: single run per system; no second phone sequence; ORB-SLAM3 mono-inertial on the GVINS rig crashed so no cam+IMU reference exists there; OpenVINS got only three cheap config tries per dataset (no tuning beyond FAST/num_pts/init window/gravity);
 Outdoor-1 GT is in a local frame with an estimated clock offset, so absolute metres are indicative; camera-only scores use the camera pose against the rig GT (lever arm ignored).
+
+
+## 9. More phone sequences (2026-10-02)
+
+Question: is the Outdoor-1 failure pattern (section 8) specific to that sequence? Benchmark only, nothing ported, our stella C port (`stella_port/`, `stella_vio/`) deliberately not built or run. Single run per system (OKVIS2-X repeated once on the two sequences where it looked like an outlier; the final BA of OKVIS was killed after "Finished!" because it took 20-60 min on 300-450 s of data and does not change the scored trajectory, section 8). Scoring, log parsing and RTF as in section 8
+(`phone_score.py` reuses `robust_score.py` / `gnss_eval.score` / `benchmark.umeyama_alignment`; "RTF" for OKVIS = tracking phase only, 2-4 jobs shared the 16 threads so RTFs are indicative). Results: `runs/gnss_compare/phone_more/` (`table.md` = every run incl. variants and fusion, `table.json`, `seq_stats.txt`, `gnss_alone.txt`, `<run>/{metrics.json,traj.txt}`, `raw/<run>/{run.json,log_tail.txt}`).
+
+### 9.1 Data and licences
+
+| dataset / sequence | licence | what was used | notes |
+|---|---|---|---|
+| Mobile-GVIO `Indoor-1`, `Indoor-2`, `Outdoor-2` (same Honor phone and calibration as Outdoor-1) | CC BY 4.0 (Zenodo 20525157) | whole Indoor-1 (119 s) and Indoor-2 (102 s), first 450 s of Outdoor-2 (of 19 GB); every 2nd frame = 15 fps, 1280x720, IMU 100 Hz | fixes: indoors the iPhone GNSS is useless (reported sigma about 67 m), so no GNSS fusion there, Outdoor-2 sigma 14 m at 1 Hz. GT = LiDAR-rig frame with its own clock offset (gyro-vs-GT-angular-speed cross-correlation, `estimate_offset.py`): Indoor-1 -282.52 s (r = 0.93), Indoor-2 -282.99 s (0.91), Outdoor-2 -293.93 s (0.60, unique peak; Outdoor-1 was -292.89 s, 0.75), so SE3 only for IMU systems |
+| ADVIO `advio-15` (office, indoor, 52 s, 0.43 m/s) and `advio-20` (outdoor, 302 s, 1.65 m/s, 474 m) | **CC BY-NC 4.0** (Zenodo 1476931; non-commercial: fine for this internal benchmark, not for a product) | iPhone video 720x1280 portrait 60 fps -> every 2nd frame = 30 fps, gyro + accelerometer 100 Hz, ARKit/Tango/ARCore ignored, GT camera poses (IMU-integration based, 100 Hz, fix-point anchored), CoreLocation fixes (advio-20: 301 fixes, sigma 30 -> 5 m, advio-15: 38 indoor) | 0.07-0.26 GB per sequence zip. Calibration batches 13-17 / 20-23 from the ADVIO calibration README (iphone-03/04), Kalibr T_cam_imu, IMU noise from the same README. Accelerometer is stored in m/s^2 as specific force (+up at rest): confirmed by OKVIS2-X working on advio-15 (scale 1.04). Frame stamps are the real (jittered) platform stamps, GT stamps are 0.311-0.315 s ahead of the sensor clock (cross-correlation r = 1.000 on both) |
+| not run | | other ADVIO sequences (mall, metro), Mobile-GVIO IO-1/2/3 (14-23 GB each), a third public set | time |
+
+Disk: peak new about 7.5 GB (JPEG images of the five sequences, deleted after each sequence's runs; `advio20` was fetched twice because OpenVINS needed the images after a disk-full incident), 0.6 GB of run outputs left in `external/gnss/rob/out`, 14 MB of results in `runs/`, fixtures (imu / gt / gnss csv) 2-8 MB per sequence kept, images regenerable (below). Nothing committed.
+
+### 9.2 Reproduce / reusable fixtures (for the stella-port agent)
+
+```bash
+G=external/gnss; PY=$G/venv/bin/python; T=tools/gnss_harness; R=$G/rob
+# Mobile-GVIO (streams the zip over HTTP, ~25-40 min per 450 s; images 15 fps JPEG, ~0.3-0.5 MB/s output)
+$PY $T/mobilegvio_to_euroc.py Indoor-1 $R/indoor1 1e9 --every 2        # Indoor-2 -> indoor2; Outdoor-2 $R/outdoor2 450 --every 2
+# ADVIO (download advio-NN.zip from https://zenodo.org/records/1476931/files/advio-NN.zip?download=1)
+$PY $T/advio_to_euroc.py advio-20.zip $R/advio20 --every 2             # 2.4 GB of JPEG for 302 s; advio-15 -> advio15 (0.23 GB)
+for s in indoor1 indoor2 outdoor2 advio15 advio20; do $PY $T/make_layout.py $R/$s; $PY $T/mobile_make_gps.py $R/$s; done   # EuRoC mav0/, times.txt, TUM-style tum/{rgb,depth}.txt (sv_run), gps0 + gnss_enu.txt
+$PY $T/make_phone_cfgs.py   # robust_cfg/<seq>/{stella,stella_lowfast,orb3_mono,orb3_mi,orb3_mi_ds,okvis_default}.yaml, ov/, port_camera.txt  (needs make_robust_cfgs.py run once for the outdoor1 templates)
+# clock offsets of GT vs sensors are in $T/phone_offsets.json (estimate_offset.py), Mobile-GVIO GT must be shifted by it (GT.from_tum(path, dt=offset)); ADVIO stamps carry a +1.6e9 s base (see docstring)
+for s in stella_up orb3_mono orb3_mi_ds okvis_default ov_mono; do $T/gpl_glue/run_rob.sh $s indoor1; done   # or gpl_glue/run_phone_seq.sh <seq>; OKVIS_NOBA=1 skips the final BA; SCFG=stella_lowfast selects the low-FAST stella config
+$PY $T/phone_score.py; $PY $T/phone_fusion.py <seq> <src_run> <out_run> [--cam-only] [--fit]; $PY $T/phone_gnss_alone.py <seq> [runs]; $PY $T/phone_stats.py
+```
+Port notes for the stella-port agent: ADVIO frames are 720x1280 portrait (the port's `sv_run` rejects anything but 640x480 and `sv_extract.c` overflows at 720p/1280x720 per section 8.4); `port_camera.txt` and `tum/rgb.txt` are generated, nothing was run.
+
+### 9.3 Results per sequence
+
+Columns as in 8.1. Sim3 for camera-only systems is the only meaningful figure (arbitrary scale); the scale column is the Sim3 scale. Coverage = poses / camera frames (span = time covered). losses / resets / maps from each system's log (stella "tracking lost"; ORB-SLAM3 "Fail to track local map" / "Reseting active map" / "New Map created"; OKVIS "TRACKING FAILURE", with the RANSAC FAIL count in the text).
+
+**Mobile-GVIO `Indoor-1`** (corridors, 119 s, 15 fps, 138 m at 1.3 m/s, gyro mean 0.26 rad/s; white walls, motion blur)
+
+| system | ATE Sim3 | ATE SE3 | scale | coverage | losses / resets / maps | RTF |
+|---|---|---|---|---|---|---|
+| stella upstream mono, default | no initialisation | - | - | 0% | 0 / 0 / 0 | 0.33 |
+| stella upstream mono, FAST 10/4 | 1.85 | - | 2.26 | 74% (30-119 s) | 0 / 0 / 1 | 0.35 |
+| ORB-SLAM3 mono | 15.26 | - | 6.04 | 98% | 6 / 0 / 1 | 0.61 |
+| ORB-SLAM3 mono-inertial (dataset cfg) | 0.51 (2 s) | 0.51 | 1.42 | **2%** (last 2 s) | 124 / 124 / 63 | 0.47 |
+| OKVIS2-X mono default | 4.78 | **8.26** | 0.73 | 100% | 0 TRACKING FAILURE, 1352 RANSAC FAIL | 1.14 (1.50) |
+| OpenVINS mono | no initialisation | - | - | 0% | - | 0.26 |
+
+**Mobile-GVIO `Indoor-2`** (corridor/hall, 102 s, 92 m at 1.06 m/s)
+
+| system | ATE Sim3 | ATE SE3 | scale | coverage | losses / resets / maps | RTF |
+|---|---|---|---|---|---|---|
+| stella upstream mono, default | 0.38 | - | 7.62 | 97% (span 98%) | 0 / 0 / 1 | 0.32 |
+| stella upstream mono, FAST 10/4 | 0.25 | - | 9.67 | 99% | 0 / 0 / 1 | 0.40 |
+| ORB-SLAM3 mono | 0.29 | - | 9.74 | 99% | 0 / 0 / 1 | 0.65 |
+| ORB-SLAM3 mono-inertial (dataset cfg) | 0.20 (4 s) | 0.33 | 3.33 | **4%** (last 4 s) | 26 / 26 / 14 | 0.48 |
+| OKVIS2-X mono default | 9.19 | **27.0** | 0.25 | 100% | 0 TF, 1343 RANSAC FAIL | 1.26 (1.90) |
+| OpenVINS mono | no initialisation | - | - | 0% | - | 0.26 |
+
+**Mobile-GVIO `Outdoor-2`** (first 450 s, 587 m at 1.3 m/s, gyro mean 0.37 rad/s; same kind of scene as Outdoor-1)
+
+| system | ATE Sim3 | ATE SE3 | scale | coverage | losses / resets / maps | RTF |
+|---|---|---|---|---|---|---|
+| stella upstream mono | 50.5 (11-97 m per 30 s bin, growing) | - | 16.6 | 100% | 2 / 0 / 1 | 0.58 |
+| ORB-SLAM3 mono | 0.30 (330-424 s only) | - | 20.8 | **22%** | 1790 / 43 / 54 | 0.98 |
+| ORB-SLAM3 mono-inertial (dataset cfg) | 56.3 | **8961 (diverged)** | 0.005 | 61% (many short gaps) | 564 / 176 / 91 | 0.60 |
+| OKVIS2-X mono default | 86.7 | **8943 (diverged)** | 0.005 | 100% | 111 TF, 2974 RANSAC FAIL | 1.99 (2.20) |
+| OKVIS2-X mono default, repeat | 87.7 | **6409 (diverged)** | 0.007 | 100% | 109 TF | 2.07 |
+| OpenVINS mono | no initialisation | - | - | 0% | - | 0.33 |
+
+**ADVIO `advio-15`** (iPhone, office, 52 s, 30 fps, 21 m at 0.43 m/s, gyro mean 0.25 rad/s)
+
+| system | ATE Sim3 | ATE SE3 | scale | coverage | losses / resets / maps | RTF |
+|---|---|---|---|---|---|---|
+| stella upstream mono | 0.81 | - | 2.56 | 80% (gap at 22-29 s) | 4 / 0 / 1 | 0.74 |
+| ORB-SLAM3 mono | 0.89 | - | 3.12 | 98% (span 92%) | 92 / 0 / 2 | 1.03 |
+| ORB-SLAM3 mono-inertial (dataset noise; and noise inflated to 1e-2 / 1e-1) | no map survives (both) | - | - | 0% | 51 / 48 / 27 (56 / 52 / 29) | 1.42 |
+| OKVIS2-X mono default | 1.65 | **1.65** | 1.04 | 99% | 21 TF, 710 RANSAC FAIL | 2.18 (3.27) |
+| OpenVINS mono | 1.59 (initialises at 21 s) | 850 (scale collapse) | 0.001 | 60% | - | 0.41 |
+
+**ADVIO `advio-20`** (iPhone, outdoor urban, 302 s, 30 fps, 474 m at 1.65 m/s, gyro mean 0.39 / max 2.1 rad/s)
+
+| system | ATE Sim3 | ATE SE3 | scale | coverage | losses / resets / maps | RTF |
+|---|---|---|---|---|---|---|
+| stella upstream mono | 53.7 (27-101 m per 30 s bin) | - | 11.3 | 99% | 1 / 0 / 1 | 0.98 |
+| ORB-SLAM3 mono | 5.98 (1.0-10.8 m per bin) | - | 3.70 | 89% (2-267 s) | 278 / 1 / 5 | 0.96 |
+| ORB-SLAM3 mono-inertial (dataset noise) | no map survives | - | - | 0% | 1033 / 975 / 517 | 1.44 |
+| OKVIS2-X mono default | 55.8 | 58.8 | 1.94 | 100% | 404 TF, 1884 RANSAC FAIL | 3.86 (8.5 incl. BA) |
+| OKVIS2-X mono default, repeat | 63.6 | **880 (diverged)** | 0.026 | 100% | 559 TF | 4.10 |
+| OpenVINS mono | no initialisation | - | - | 0% | - | 0.73 |
+
+### 9.4 Fusion with the phone GNSS fixes (`phone_fusion.py`, own smoother of section 8; sensitivities not tuned)
+
+Only the two outdoor sequences have usable fixes (Outdoor-2: 450 fixes at 1 Hz, sigma 14 m; advio-20: 301 fixes, sigma 30 -> 5 m; indoors none). GNSS alone is scored on the same epochs as each run's poses. SE3 ATE vs GT unless noted.
+
+| sequence | input | raw | fused batch smoother | Sim3 fit to fixes | GNSS alone (same fixes) |
+|---|---|---|---|---|---|
+| Outdoor-2 | ORB-SLAM3 mono + gravity (22%, 330-424 s) | (Sim3 0.30) | **2.13** | 2.06 | 7.08 (96 fixes) |
+| Outdoor-2 | stella upstream mono + gravity (100%) | (Sim3 50.5) | 39.6 | 50.6 | **14.66** (450 fixes) |
+| Outdoor-2 | ORB-SLAM3 mono-inertial (61%) | 8961 | 29.6 | - | 15.20 (300 fixes) |
+| Outdoor-2 | OKVIS2-X mono (100%) | 8943 | 19.7 | - | **14.66** |
+| advio-20 | ORB-SLAM3 mono + gravity (89%) | (Sim3 5.98, SE3 49.0) | 12.10 (Sim3 4.17) | 12.44 (Sim3 5.98) | 12.16 SE3 / 6.31 Sim3 (265 fixes) |
+| advio-20 | stella upstream mono + gravity (99%) | (Sim3 53.7) | 42.8 | 54.0 | **12.00** SE3 / 6.21 Sim3 (301 fixes) |
+| advio-20 | OKVIS2-X mono (100%) | 58.8 | 50.8 | - | 12.00 |
+
+Same conclusion as Outdoor-1: the raw phone fixes beat every full-coverage fusion (Outdoor-2 14.7 m, advio-20 12.0 m SE3 / 6.2 Sim3); the only gain is on the short good ORB-SLAM3 mono stretch of Outdoor-2 (2.1 m vs 7.1 m), and on advio-20 the fusion of ORB-SLAM3 mono does not beat the fixes in SE3 (the iPhone fixes there carry a large scale/shape bias against the ADVIO GT: 12.0 SE3 vs 6.2 Sim3).
+
+### 9.5 Does the Outdoor-1 pattern repeat? Per-system diagnosis
+
+Outdoor-1 pattern (8.1): OKVIS2-X diverges or collapses scale; stella has full coverage but a large Sim3 error from scale/drift; ORB-SLAM3 mono is accurate on a short surviving map; ORB-SLAM3 mono-inertial survives only 55%; OpenVINS never initialises; raw GNSS beats all full-coverage fusion. **It repeats on the long outdoor walks (Outdoor-2, ADVIO-20) almost point for point, and indoors the IMU-based systems fail in the same way while the vision-only ones do fine.** The one counter-example is the short, slow ADVIO office sequence where OKVIS2-X is the best system (1.65 m SE3, correct scale).
+
+- **OKVIS2-X (BRISK, IMU)**: Outdoor-2 diverges like Outdoor-1 (SE3 8943 / 6409 m in two runs, scale 0.005, 111 TRACKING FAILURE, 2974 RANSAC FAIL); advio-20 is erratic (58.8 m and 880 m in two runs, 404-559 tracking failures, 1884 RANSAC FAIL); indoors it tracks 100% but scale-collapses (0.73 / 0.25, SE3 8.3 / 27 m, 1.3k RANSAC FAIL on 100 s). Where it works (advio-15: 0.43 m/s, 52 s, 30 fps, only 21 TRACKING FAILURE) it is metric and best, so the failure is again front-end association over long, fast-ish, low-parallax or textureless stretches plus weak IMU observability at walking speed, not calibration (the advio-15 result also validates the ADVIO calibration / IMU convention). Non-deterministic: repeats differ by 1-3 orders of magnitude on the diverging runs.
+- **stella_vslam upstream (mono)**: reliable coverage (97-100% on 4 of 5 sequences, 80% on advio-15), few losses (0-4), real time (RTF 0.3-1.0), but initialisation is fragile on corridors (Indoor-1: no initialisation at all with the default FAST thresholds 20/7, works after lowering to 10/4, from 30 s) and the scale drifts badly outdoors (Sim3 50.5 / 53.7 m on Outdoor-2 / ADVIO-20 over 450-474 m paths; 16 m on Outdoor-1). Indoors, with a map that does not loop, it is excellent locally (Sim3 0.25-0.38 m on Indoor-2, 0.8 m on advio-15).
+- **ORB-SLAM3 mono (GPL ref)**: the most accurate where it holds a map (Outdoor-2 0.30 m, ADVIO-20 5.98 m over 89%, indoors 0.29 / 0.89 m) but outdoors it keeps losing tracking (Outdoor-2: 1790 failures, 54 maps, only the last 94 s survive; Outdoor-1 43% coverage; ADVIO-20 278 failures); Indoor-1 15 m (scale/drift over a long straight corridor).
+- **ORB-SLAM3 mono-inertial (GPL ref)**: never a usable full run: 0-4% coverage indoors (IMU initialisation succeeds only in the last 2-4 s), 0% on both ADVIO sequences (48 / 975 resets, "Not enough motion for initializing", maps born with 130-190 points), 61% but diverged on Outdoor-2 (SE3 8961 m, 91 maps). The Outdoor-1 55% with a tuned yaml is the best this system did on phones.
+- **OpenVINS (GPL ref)**: initialises on none of the 4 new Mobile/ADVIO-20 sequences ("not enough feats to compute disp: 0,34 < 15", only 33 valid features of 48 needed for the dynamic init, num_pts 200 / FAST 20 on a 1-config budget); advio-15 initialises at 21 s then loses scale (SE3 850 m). Same as Outdoor-1.
+
+Cause ranking from these data (not isolated by experiment): (1) initialisation of mono and mono-inertial systems on low-parallax / textureless / planar scenes (corridors, track, pedestrian walking with 0.3-0.4 rad/s mean rotation), (2) scale observability and drift of mono over long walks without loops (stella 50 m, OKVIS scale collapse), (3) feature front-end robustness (white corridor walls; BRISK association; ORB with default FAST thresholds; not measured per frame here), (4) rolling shutter and motion blur remain plausible but unproven (no readout time in Mobile-GVIO, ADVIO lists line delay 0 for a rolling-shutter iPhone camera; none of the systems models it); (5) timestamps are not the issue: frame / IMU stamps are regular (Mobile: frame dt std 0.0-0.8 ms with one 75 ms gap at 15 fps, IMU 100.0 Hz, ADVIO: frame stamps real and exactly 33.3 ms apart after subsampling, IMU 99.9-100 Hz with 12 ms max gap; `seq_stats.txt`), the GT clock offsets are found to better than 0.01 s, and OKVIS runs correctly on advio-15 with the same stamping.
+
+**Best system on phones overall**: no system is both metric and full-coverage on the long outdoor walks. Ranked by robustness across the 6 sequences incl. Outdoor-1: stella_vslam upstream (BSD, usable coverage everywhere, 0.25-0.8 m Sim3 indoors, 16-54 m outdoors from scale drift) and ORB-SLAM3 mono (best local accuracy, 22-98% coverage); the IMU-based systems (OKVIS2-X, ORB-SLAM3 mono-inertial, OpenVINS) are worse than the vision-only ones on 5 of 6 sequences. The recommendation of 8.5 stands: ORB-style front end at full resolution with robust initialisation, IMU only as gravity / scale aid, GNSS as safety net (the raw fixes beat every full-coverage result outdoors on all three phone sequences: 5.7 / 14.7 / 12.0 m).
+
+Limits: one run per system (two for OKVIS on two sequences); OpenVINS and stella got one or two cheap config tries; no ORB-SLAM3 mono-inertial tuning on ADVIO (dataset noise and 1e-2 / 1e-1 noise tried on advio-15); Mobile-GVIO frame rate 15 fps (every 2nd frame), ADVIO 30 fps; Outdoor-2 truncated at 450 s; Mobile GT absolute metres indicative (LiDAR frame + estimated clock offset, camera pose vs rig GT, no lever arm); no cross-device (phone camera vs separate iPhone GNSS) sync information; RTFs measured with 2-4 concurrent jobs.
