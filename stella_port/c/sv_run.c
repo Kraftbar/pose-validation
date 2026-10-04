@@ -15,6 +15,8 @@
  *                                       --snap-loop: only right after an accepted loop and after the last frame)
  *   loop_log.tsv       (accepted loops, keyframe lifetime log, run statistics)
  *
+ * Frame size: from the first fixture's PGM header (or --size WxH); the camera intrinsics default to TUM fr1 unless --camera.
+ *
  * usage: sv_run <vocab.fbow> <tum_seq_dir> <fixtures_dir> <out_dir> [max_frames] [--snap-every N] [--no-snap]
  *               [--snap-from F] [--resume-mapper] [--no-loop]
  */
@@ -118,11 +120,13 @@ static uint8_t* read_pgm(const char* path, int* w, int* h) {
 }
 
 #ifndef SV_RUN_NO_MAIN /* sequence association: only the stand-alone driver needs it (the harness takes exact timestamps from the dump) */
-/* tum_rgbd_sequence::acquire_image_information: 3 header lines, then `timestamp file` rows */
+/* tum_rgbd_sequence::acquire_image_information skips the first 3 lines of rgb.txt / depth.txt (the TUM header).
+ * Here every line starting with '#' is skipped instead, which is identical for TUM files (exactly 3 '#' lines) and
+ * also correct for files with a different number of header lines (including none). */
 static int read_index(const char* seq_dir, const char* name, double** ts_out, unsigned int* n_out) {
     char path[4096], line[1024];
     FILE* f;
-    unsigned int n = 0, cap = 0, skip = 3;
+    unsigned int n = 0, cap = 0;
     double* ts = NULL;
     snprintf(path, sizeof(path), "%s/%s", seq_dir, name);
     f = fopen(path, "r");
@@ -132,11 +136,7 @@ static int read_index(const char* seq_dir, const char* name, double** ts_out, un
     while (fgets(line, sizeof(line), f)) {
         double t;
         char file[512];
-        if (skip) {
-            --skip;
-            continue;
-        }
-        if (line[0] == '\n' || line[0] == '\0') {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
             continue;
         }
         if (sscanf(line, "%lf %511s", &t, file) < 1) {
@@ -198,6 +198,7 @@ typedef struct sv_run_opts {
     int enable_loop;
     int verbose;
     long blank_from, blank_to; /* --blank A-B: feed a flat gray image for frames A..B (forces Lost / relocalization / reset) */
+    int width, height; /* --size WxH; 0 = take the size from the first fixture image */
     int has_camera;
     double camera[9]; /* --camera fx,fy,cx,cy,k1,k2,p1,p2,k3: override the default (fr1) camera, e.g. TUM_RGBD_mono_2/3.yaml */
 } sv_run_opts;
@@ -278,6 +279,21 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
         p.cam.p1 = o->camera[6];
         p.cam.p2 = o->camera[7];
         p.cam.k3 = o->camera[8];
+    }
+    if (o->width > 0 && o->height > 0) {
+        p.cols = o->width;
+        p.rows = o->height;
+    }
+    else { /* frame size from the first fixture's PGM header */
+        int fw, fh;
+        uint8_t* g0;
+        snprintf(path, sizeof(path), "%s/%06u.pgm", fixtures_dir, 0u);
+        g0 = read_pgm(path, &fw, &fh);
+        if (g0) {
+            p.cols = fw;
+            p.rows = fh;
+            free(g0);
+        }
     }
     p.resume_mapper_after_loop = o->resume_mapper;
     p.enable_loop_closure = o->enable_loop;
@@ -468,7 +484,7 @@ int main(int argc, char** argv) {
     int i;
     if (argc < 5) {
         fprintf(stderr, "usage: sv_run <vocab.fbow> <tum_seq_dir> <fixtures_dir> <out_dir> [max_frames] [--snap-every N] [--no-snap] "
-                        "[--snap-from F] [--snap-loop] [--resume-mapper] [--no-loop] [--blank A-B] [--camera fx,fy,cx,cy,k1,k2,p1,p2,k3]\n");
+                        "[--snap-from F] [--snap-loop] [--resume-mapper] [--no-loop] [--blank A-B] [--size WxH] [--camera fx,fy,cx,cy,k1,k2,p1,p2,k3]\n");
         return 1;
     }
     memset(&o, 0, sizeof(o));
@@ -497,6 +513,12 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--blank") && i + 1 < argc) {
             sscanf(argv[++i], "%ld-%ld", &o.blank_from, &o.blank_to);
+        }
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &o.width, &o.height) != 2 || o.width <= 0 || o.height <= 0) {
+                fprintf(stderr, "sv_run: --size needs WxH\n");
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--camera") && i + 1 < argc) {
             o.has_camera = sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &o.camera[0], &o.camera[1], &o.camera[2],

@@ -1186,3 +1186,42 @@ deterministic config flags. Not pursued further (would need a reference-side exp
 
 Docs updated with the per-camera numbers: `docs/slam_candidates_comparison_20260925.md`, README "Full-SLAM Comparison".
 `runs/tum_compare/stella_vslam_st/` (old fr1-camera fr2/fr3 scores) and `table.md` left as is. Speed not re-measured.
+
+## Frame-size robustness fixes (2026-10-02)
+Two minimal fixes for non-640x480 input (found in the phone/handheld study, `docs/gnss_vio_benchmark_20261001.md` section 8.4); no output changes where nothing overflowed.
+- `sv_extract.c`: `sv_kp_push` now grows the per-level candidate array (starts at the old 8192, doubles) instead of only counting past `cap`; at 1280x720 the old fixed `cap = 8192`
+  made `sv_distribute_keypoints` read past the buffer (heap overflow under ASan).
+- `sv_run.c`: the frame size is read from the first fixture's PGM header (override: `--size WxH`; every later fixture must match); `rgb.txt` / `depth.txt` parsing skips every line
+  starting with `#` instead of exactly 3 lines (identical for the TUM files, which have 3 `#` lines; files without a header no longer lose their first 3 frames).
+Verification: `python3 tools/check_stella_port.py` -> 56/56 rows PASS, 0 mismatches; continuous run fr1_xyz byte-identical to the stored pre-fix trajectory (787 poses); ASan+UBSan build
+of `sv_run` (detect_leaks=0) on a 1280x720 sequence runs clean. The development copy that diverges on purpose lives in `stella_vio/` (this directory stays exact).
+
+## fr2_xyz gap investigation (2026-10-02)
+
+Question: fr2_xyz upstream MT ATE 0.004 vs deterministic reference / bit-exact port 0.0163 (mono_2 camera). Results and scripts:
+`runs/stella_port/fr2_gap/` (`summary.md`, `score.py`, `run_st.sh`, `run_mt.sh`). Reference-side only; `stella_port/c/`, `stella_vio/` untouched.
+New opt-in `stella_port/reference/patches/0014-opt-in-fixed-seed-value.patch`: with `use_fixed_seed=true`, env `STELLA_PORT_SEED=<uint>` selects the
+mt19937 seed instead of the default-constructed one (seed 5489); unset = byte-identical (checked: rerun of canonical and a run with the patched
+function preloaded are cmp-identical to `runs/stella_port/calib_gap/ref_fr2_xyz/trajectory.tum`). NOTE: the patch is not applied to
+`reference_build/src` and the lib was NOT rebuilt (the /tmp OpenCV was gone); the runs used an LD_PRELOAD shim compiled from the patched
+`random_array.cc`. Rebuilding via `tools/build_stella_reference.py` picks the patch up (untested).
+
+**Cause: the fixed RNG seed, not asynchrony.** The deterministic config's `use_fixed_seed: true` gives every RANSAC engine (initializer F/H/E, and
+the tracker robust matcher, which takes the initializer's flag) `std::mt19937()` = seed 5489. With that one stream the init map/early trajectory is
+poor (ATE 0.0163; first 1200 frames 0.027/0.023/0.010). Same ST driver with other RNG streams:
+- Initializer.use_fixed_seed=false (random_device), 5 completed runs: 0.0034, 0.0084, 0.0036, 0.0033, 0.0059.
+- Fixed seeds 1,2,4..11 (10 completed runs): 0.0040-0.0084, median 0.0053 (seed 3 lost tracking right after init and hit a system reset, which the ST driver cannot do: hang).
+- So seed 5489 is an outlier (3x the median) of an otherwise 0.003-0.008 distribution that matches upstream MT (0.0040/0.0041/0.0045/0.0058).
+Hypotheses: **H1 async mapping** - refuted as the cause: the reference lib driven multi-threaded by the upstream example with seed 5489 (U3, --no-sleep) gives
+0.0124 (still bad, first slice 0.024); MT with seed 7 gives 0.0076 vs ST seed 7 0.0040 (MT adds spread, no systematic gain). **H2 init frame** - init frame is not it: seeds
+2 and 8 init at frame 62 like the bad run and score 0.0044/0.0058 (upstream run1/run3 also init at 62: 0.0058/0.0041); the early error depends on the init map the
+RANSAC stream yields, not on the frame. **H3 config** - diff of shipped mono_2 vs deterministic yaml: only the determinism keys (3 x use_fixed_seed, 2 x Mapping.enable_interruption_*=false)
+and the Pangolin section; Camera identical; no other mapping/BA/keyframe params. Feeding identical (same imread, no frame skip). **H4 keyframe logic** - keyframe counts are 31-33 in all runs (base 33, seeds 31-32, upstream 33/31/33);
+`mapper_is_skipping_localBA`/queue cases cannot occur in ST (queue empty), and MT with the same seed (U3, 33 KFs) is no better, so not a driver of the gap.
+Also found: the shipped examples binary + the deps `libstella_vslam.so` need `LD_LIBRARY_PATH` without the reference install (else the patched lib is picked).
+
+**Recommendation for stella_vio:** do not emulate the MT mapper. (1) Do not rely on the default-constructed seed: either seed the RANSAC engines from a fixed value other than 5489 (e.g. a
+fixed non-default seed; 7 gives 0.0040) with the understanding that this is a draw from a 0.003-0.008 distribution, or (better) make the initializer less seed-sensitive (e.g. run
+the init RANSAC with more iterations / pick the best of several seeded attempts by inlier count and reprojection error, deterministic). (2) Report fr2_xyz with seed spread
+(median ~0.005 over seeds) rather than the single 5489 value 0.0163; the port stays bit-exact against the 5489 reference, so keep canonical dumps on 5489.
+(3) Make the ST driver survive `reset()` (seed 3 case) if multi-seed sweeps are wanted.

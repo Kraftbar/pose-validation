@@ -1,0 +1,119 @@
+0001: deterministic single-threaded schedule for the OKVIS2 reference build.
+ - ThreadedSlam::processFrame: join the realtime optimisation thread, then run the background
+   (loop-closure / pose-graph) optimisation to completion inside the same frame, so import timing
+   no longer depends on wall-clock races (isLoopClosing_/isLoopClosureAvailable_ were read unlocked
+   by the realtime thread while the full-graph thread wrote them).
+ - ThreadedSlam: publication queue pushes block instead of dropping (causal trajectory file is complete).
+ - Frontend::matchToMap{,Uninitialised}: the num_matching_threads keypoint segments are executed one
+   after another on the calling thread (identical partition => identical results; the segmentation is
+   semantic because reprErr is averaged per segment).
+ - opengv SampleConsensusProblem/MultiSampleConsensusProblem: RANSAC RNG always seeded 12345 (upstream
+   default is time(0)+clock()).
+diff -ru pristine/external/opengv/include/opengv/sac/implementation/MultiSampleConsensusProblem.hpp work/external/opengv/include/opengv/sac/implementation/MultiSampleConsensusProblem.hpp
+--- pristine/external/opengv/include/opengv/sac/implementation/MultiSampleConsensusProblem.hpp	2026-10-01 18:15:27.756774940 +0200
++++ work/external/opengv/include/opengv/sac/implementation/MultiSampleConsensusProblem.hpp	2026-10-01 20:24:59.467243772 +0200
+@@ -39,7 +39,7 @@
+ {
+   rng_dist_.reset(new std::uniform_int_distribution<>( 0, std::numeric_limits<int>::max () ));
+   // Create a random number generator object
+-  if (randomSeed)
++  if (false && randomSeed) // DETERMINISTIC REFERENCE: always the fixed seed
+     rng_alg_.seed(static_cast<unsigned>(time(0)) + static_cast<unsigned>(clock()) );
+   else
+     rng_alg_.seed(12345u);
+diff -ru pristine/external/opengv/include/opengv/sac/implementation/SampleConsensusProblem.hpp work/external/opengv/include/opengv/sac/implementation/SampleConsensusProblem.hpp
+--- pristine/external/opengv/include/opengv/sac/implementation/SampleConsensusProblem.hpp	2026-10-01 18:15:27.756774940 +0200
++++ work/external/opengv/include/opengv/sac/implementation/SampleConsensusProblem.hpp	2026-10-01 20:24:55.343279763 +0200
+@@ -40,7 +40,7 @@
+ {
+   rng_dist_.reset(new std::uniform_int_distribution<>( 0, std::numeric_limits<int>::max() ));
+   // Create a random number generator object
+-  if(randomSeed)
++  if(false && randomSeed) // DETERMINISTIC REFERENCE: always the fixed seed
+     rng_alg_.seed(static_cast<unsigned>(time(0)) + static_cast<unsigned>(clock()) );
+   else
+     rng_alg_.seed(12345u);
+diff -ru pristine/okvis_frontend/src/Frontend.cpp work/okvis_frontend/src/Frontend.cpp
+--- pristine/okvis_frontend/src/Frontend.cpp	2026-10-01 18:15:19.384859176 +0200
++++ work/okvis_frontend/src/Frontend.cpp	2026-10-01 20:24:55.343279763 +0200
+@@ -1466,20 +1466,15 @@
+     std::vector<size_t> ctrs(num_matching_threads);
+     std::vector<double> reprErrors(num_matching_threads);
+ 
+-    std::vector<std::thread*> threads(num_matching_threads, nullptr);
++    // DETERMINISTIC REFERENCE: same keypoint partition, executed sequentially on this thread.
+     for(size_t t = 0; t<num_matching_threads; ++t) {
+-      threads[t] = new std::thread(
+-          &Frontend::matchToMapByThread<CAMERA_GEOMETRY>, this, t, num_matching_threads,
++      matchToMapByThread<CAMERA_GEOMETRY>(
++              t, num_matching_threads,
+               std::cref(estimator), std::cref(params), currentFrameId,
+               loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
+               std::cref(landmarksToMatch), numKeypoints,
+               std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
+               std::ref(lmIds), std::ref(hps_W), std::ref(ctrs), std::ref(reprErrors));
+-    }
+-
+-    for(size_t t = 0; t<num_matching_threads; ++t) {
+-      threads[t]->join();
+-      delete threads[t];
+       reprErr += reprErrors[t];
+     }
+ 
+@@ -1579,10 +1574,10 @@
+     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
+     std::vector<size_t> ctrs(num_matching_threads);
+ 
+-    std::vector<std::thread*> threads(num_matching_threads, nullptr);
++    // DETERMINISTIC REFERENCE: same keypoint partition, executed sequentially on this thread.
+     for(size_t t = 0; t<num_matching_threads; ++t) {
+-      threads[t] = new std::thread(
+-          &Frontend::matchToMapByThreadUnitialised<CAMERA_GEOMETRY>, this, t, num_matching_threads,
++      matchToMapByThreadUnitialised<CAMERA_GEOMETRY>(
++              t, num_matching_threads,
+               std::cref(estimator), std::cref(params), currentFrameId,
+               loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
+               std::cref(landmarksToMatchVec[im]), numKeypoints,
+@@ -1590,11 +1585,6 @@
+               std::ref(lmIds), std::ref(hps_W), std::ref(ctrs));
+     }
+ 
+-    for(size_t t = 0; t<num_matching_threads; ++t) {
+-      threads[t]->join();
+-      delete threads[t];
+-    }
+-
+     // now insert observations
+     for(size_t k = 0; k < numKeypoints; ++k) {
+       uint64_t previousId = multiFrame->landmarkId(im,k);
+diff -ru pristine/okvis_multisensor_processing/src/ThreadedSlam.cpp work/okvis_multisensor_processing/src/ThreadedSlam.cpp
+--- pristine/okvis_multisensor_processing/src/ThreadedSlam.cpp	2026-10-01 18:15:19.388859135 +0200
++++ work/okvis_multisensor_processing/src/ThreadedSlam.cpp	2026-10-01 20:24:55.342279771 +0200
+@@ -551,6 +551,8 @@
+   }
+   optimisationThread_ = std::thread(&ThreadedSlam::optimisePublishMarginalise,
+                                     this, multiFrame, gyr);
++  // DETERMINISTIC REFERENCE: finish the realtime optimisation before anything else touches the estimator.
++  optimisationThread_.join();
+ 
+   // kick off posegraph optimisation, if needed, too...
+   if(estimator_.needsFullGraphOptimisation()) {
+@@ -563,6 +565,9 @@
+           parameters_.estimator.full_graph_iterations,
+           std::ref(posegraphOptimisationSummary_),
+           parameters_.estimator.full_graph_num_threads, false);
++    // DETERMINISTIC REFERENCE: the background (loop-closure) optimisation always completes within the
++    // current frame, so its import into the realtime graph happens at a fixed frame.
++    fullGraphOptimisationThread_.join();
+   }
+ 
+   return true;
+@@ -713,7 +718,7 @@
+     }
+     
+     // now publish in separate thread. queue size 3 to ensure nothing ever lost.
+-    const bool overrun = publicationQueue_.PushNonBlockingDroppingIfFull(publicationData,3);
++    const bool overrun = !publicationQueue_.PushBlockingIfFull(publicationData,3); // DETERMINISTIC REFERENCE: never drop
+     if(overrun) {
+       LOG(ERROR) << "publication (full update) overrun: dropping";
+     }

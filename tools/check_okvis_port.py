@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Build and run every okvis_port/c/check_*.c harness over the reference dumps, print a table, and exit
+non-zero on any mismatch (or build/run failure). Mirrors tools/check_stella_port.py.
+
+Each harness declares its sources on its first line:
+    /* OK_PORT_SOURCES: check_x.c a.c b.c */  (paths relative to okvis_port/c/; the harness lists itself)
+and must accept
+    <seq_label> <fixtures_dir|-> <dump_dir> [max_records]
+printing "<label>: <mismatches>/<total>" as its last stdout line (optionally preceded by indented per-kind
+lines "  <kind>: <m>/<t> (...)") and exiting 0 iff mismatches == 0.
+
+Dumps: runs/okvis_port/reference_runs/<seq>/<tag>/dumps/ produced by
+    python3 tools/run_okvis_reference.py <seq> --tag run1 --dump --dump-every "prop=1,preint=1,append=5,eval=200"
+
+Usage:
+    python3 tools/check_okvis_port.py [--seqs MH_01_easy] [--tag run1[,cov,...]] [--max N] [--eigen-tests]
+
+--tag takes a comma-separated list of run tags (each with its own dumps dir); every harness is run over every
+tag. The M2 harnesses (check_ok_kin*, check_ok_cam*) read the kin_*.bin files that patch 0005 writes into the same
+dumps dir as the M1 imu_*.bin files.
+
+The M4 harness (check_ok_solve) reads solve.bin (patch 0008, run_okvis_reference.py --solve-dump); tags with only a
+solve.bin (m4, s4) run just that harness, tags without one skip it. The M5 harnesses read graph.bin (check_ok_graph:
+TwoPose* terms, updateLandmarks) and problem.bin (check_ok_problem: ceres::Problem program order), both from
+patch 0009 / --graph-dump (m5, s5).
+
+--eigen-tests additionally builds okvis_port/reference_tools/eigen_*_test.cc against the real Eigen 3.4.0
+(external/vio/deps, flags -O2 -DNDEBUG -ffp-contract=off -fno-fast-math) and runs them (random-case,
+tolerance-0 comparisons of the C evaluation-order models), and okvis_port/reference_tools/okvis_*_test.cc, which
+compare the C modules against the real OKVIS2 classes (okvis_time, okvis_kinematics, okvis_cv; headers/sources from
+external/vio/okvis2, OpenCV from external/vio/deps/opencv) on random inputs including edge values.
+okvis_solve_dense_test / okvis_solve_sparse_test compare the M4 kernels against real Eigen and the header-only Ceres
+kernels (small_blas.h, invert_psd_matrix.h from the Ceres source tree inside external/vio/okvis2).
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+C_DIR = ROOT / "okvis_port/c"
+TOOLS_DIR = ROOT / "okvis_port/reference_tools"
+RUNS = ROOT / "runs/okvis_port/reference_runs"
+BUILD_DIR = ROOT / "runs/okvis_port/c_build"
+EIGEN_INC = ROOT / "external/vio/deps/root/usr/include/eigen3"
+OKVIS_SRC = ROOT / "external/vio/okvis2"
+OCV = ROOT / "external/vio/deps/opencv"
+TEST_SRC_RE = re.compile(r"//\s*OK_PORT_TEST_SRC:\s*(.+)")
+TEST_C_RE = re.compile(r"//\s*OK_PORT_TEST_C:\s*(.+)")
+TEST_LIBS_RE = re.compile(r"//\s*OK_PORT_TEST_LIBS:\s*(.+)")
+CERES = ROOT / "external/vio/deps/ceres"
+VROOT = ROOT / "external/vio/deps/root/usr"
+SOURCES_RE = re.compile(r"/\*\s*OK_PORT_SOURCES:\s*(.+?)\s*(?:\*/)?\s*$")
+CFLAGS = ["-std=c99", "-Wall", "-Wextra", "-O2", "-ffp-contract=off", "-fno-fast-math"]
+
+
+def run(cmd, **kw):
+    print("+", " ".join(str(c) for c in cmd), flush=True)
+    return subprocess.run(cmd, check=True, **kw)
+
+
+def discover_harnesses(globs):
+    out = []
+    paths = sorted({p for g in globs for p in C_DIR.glob(g + ".c")})
+    for path in paths:
+        with open(path) as f:
+            first = f.readline()
+        m = SOURCES_RE.search(first)
+        if not m:
+            print(f"warning: {path} has no /* OK_PORT_SOURCES: ... */ first line, skipping", file=sys.stderr)
+            continue
+        out.append((path, m.group(1).split()))
+    return out
+
+
+def build_harness(path, sources):
+    out = BUILD_DIR / path.stem
+    run(["gcc", *CFLAGS, "-o", str(out)] + [str(C_DIR / s) for s in sources] + ["-lm"])
+    return out
+
+
+def eigen_tests():
+    """Build+run the C++ cross-checks against real Eigen / the real OKVIS2 classes. Returns list of (name, ok)."""
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    obj = BUILD_DIR / "ok_eigen.o"
+    run(["gcc", *CFLAGS, "-c", str(C_DIR / "ok_eigen.c"), "-o", str(obj)])
+    results = []
+    for src in sorted(TOOLS_DIR.glob("eigen_*_test.cc")):
+        exe = BUILD_DIR / src.stem
+        run(["g++", "-std=c++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", f"-I{EIGEN_INC}",
+             str(src), str(obj), "-o", str(exe)])
+        proc = subprocess.run([str(exe)], capture_output=True, text=True)
+        print(proc.stdout, end="")
+        results.append((src.stem, proc.returncode == 0))
+    for src in sorted(TOOLS_DIR.glob("okvis_*_test.cc")):
+        head = src.read_text().splitlines()[:8]
+        srcs = [m.group(1).split() for l in head for m in [TEST_SRC_RE.search(l)] if m]
+        cs = [m.group(1).split() for l in head for m in [TEST_C_RE.search(l)] if m]
+        srcs = srcs[0] if srcs else []
+        cs = cs[0] if cs else []
+        libs = [m.group(1).split() for l in head for m in [TEST_LIBS_RE.search(l)] if m]
+        libs = libs[0] if libs else []
+        objs = []
+        for c in cs:
+            o = BUILD_DIR / (Path(c).stem + ".o")
+            run(["gcc", *CFLAGS, "-c", str(C_DIR / c), "-o", str(o)])
+            objs.append(str(o))
+        exe = BUILD_DIR / src.stem
+        incs = [f"-I{EIGEN_INC}", f"-I{OCV}/include/opencv4"] + [f"-I{p}" for p in sorted(OKVIS_SRC.glob("okvis_*/include"))]
+        extra_link = []
+        if "ceres" in libs:  # okvis_ceres classes derive from ceres::SizedCostFunction / Manifold (BSD-3, reference only)
+            incs += [f"-I{CERES}/include", f"-I{OKVIS_SRC}/external/ceres-solver/internal",  # header-only internals
+                     f"-I{VROOT}/include", f"-I{VROOT}/include/x86_64-linux-gnu"]
+            extra_link = [f"{CERES}/lib/libceres.a", f"-L{VROOT}/lib/x86_64-linux-gnu", "-lglog", "-lgflags", "-fopenmp", "-lpthread",
+                          f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu"]
+        run(["g++", "-std=c++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", *incs, str(src),
+             *[str(OKVIS_SRC / s) for s in srcs], *objs, f"-L{OCV}/lib", "-lopencv_core", "-lopencv_imgproc",
+             f"-Wl,-rpath,{OCV}/lib", *extra_link, "-lm", "-o", str(exe)])
+        env = dict(os.environ, LD_LIBRARY_PATH=f"{OCV}/lib:{VROOT}/lib/x86_64-linux-gnu")
+        proc = subprocess.run([str(exe)], capture_output=True, text=True, env=env)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        print("\n".join(lines[-1:]))  # the summary line; per-section lines only on failure
+        if proc.returncode != 0:
+            print("\n".join(l for l in lines if not l.split()[-1].startswith("0/")))
+        results.append((src.stem, proc.returncode == 0))
+    return results
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seqs", default=None, help="comma-separated sequence names (default: all with dumps)")
+    ap.add_argument("--tag", default="run1", help="comma-separated run tags")
+    ap.add_argument("--max", type=int, default=-1)
+    ap.add_argument("--eigen-tests", action="store_true")
+    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*",
+                    help="comma-separated globs of okvis_port/c/ harnesses that consume the reference dumps "
+                         "(other modules, e.g. check_ok_brisk*, have their own dump trees/runners)")
+    args = ap.parse_args()
+
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    harnesses = discover_harnesses(args.harness.split(","))
+    if not harnesses:
+        print("error: no okvis_port/c/check_*.c harnesses found", file=sys.stderr)
+        return 1
+    tags = args.tag.split(",")
+    runs = []  # (seq, tag)
+    for tag in tags:
+        tag_seqs = args.seqs.split(",") if args.seqs else sorted(
+            p.name for p in RUNS.iterdir() if (p / tag / "dumps").is_dir()) if RUNS.exists() else []
+        runs += [(seq, tag) for seq in tag_seqs]
+    if not runs:
+        print(f"error: no dumps under {RUNS}/<seq>/{args.tag}/dumps -- run tools/run_okvis_reference.py --dump",
+              file=sys.stderr)
+        return 1
+
+    built = [(p.stem, build_harness(p, srcs)) for p, srcs in harnesses]
+    rows = []  # (harness, seq, kind lines, m, t, ok)
+    any_fail = False
+    for name, exe in built:
+        for seq0, tag in runs:
+            seq = seq0 if len(tags) == 1 else f"{seq0}/{tag}"
+            dump_dir = RUNS / seq0 / tag / "dumps"
+            # every harness needs its own dump files; tags recorded without them are skipped
+            if name.startswith(("check_ok_err", "check_ok_param")) and not list(dump_dir.glob("err_*.bin")):
+                continue  # tag recorded before patch 0007: no M3 dumps
+            if name.startswith("check_ok_solve") and not (dump_dir / "solve.bin").exists():
+                continue  # tag without the M4 solver dump (patch 0008, --solve-dump)
+            if name.startswith("check_ok_graph") and not (dump_dir / "graph.bin").exists():
+                continue  # tag without the M5 graph dump (patch 0009, --graph-dump)
+            if name.startswith("check_ok_problem") and not (dump_dir / "problem.bin").exists():
+                continue  # tag without the M5 Problem log (patch 0009, --graph-dump)
+            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem")) and not list(dump_dir.glob("imu_*.bin")):
+                continue  # solver/graph-only tag (m4/s4/m5/s5): no M1-M3 dumps
+            cmd = [str(exe), seq, "-", str(dump_dir)] + ([str(args.max)] if args.max > 0 else [])
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            lines = proc.stdout.rstrip().splitlines()
+            last = lines[-1] if lines else ""
+            m = re.match(r".*:\s*(\d+)/(\d+)\s*$", last)
+            if not m:
+                print(proc.stdout)
+                print(proc.stderr, file=sys.stderr)
+                rows.append((name, seq, [], None, None, False))
+                any_fail = True
+                continue
+            mism, total = int(m.group(1)), int(m.group(2))
+            ok = mism == 0 and total > 0 and proc.returncode == 0  # nothing compared == failure
+            any_fail |= not ok
+            rows.append((name, seq, [l for l in lines[:-1] if l.startswith("  ")], mism, total, ok))
+            if not ok and proc.stderr:
+                print(proc.stderr[-2000:], file=sys.stderr)
+
+    print()
+    print(f"{'harness':<16} {'seq':<18} {'mismatches':>12} {'compared':>14}  status")
+    print("-" * 74)
+    for name, seq, kinds, mism, total, ok in rows:
+        for k in kinds:
+            print(f"  {k.strip()}")
+        print(f"{name:<16} {seq:<18} {str(mism) if mism is not None else '?':>12} "
+              f"{str(total) if total is not None else '?':>14}  {'PASS' if ok else 'FAIL'}")
+
+    if args.eigen_tests:
+        print("\nEigen cross-checks (real Eigen 3.4.0 vs C evaluation-order models):")
+        for name, ok in eigen_tests():
+            print(f"  {name:<28} {'PASS' if ok else 'FAIL'}")
+            any_fail |= not ok
+    return 1 if any_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

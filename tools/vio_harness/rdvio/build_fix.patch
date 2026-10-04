@@ -1,0 +1,47 @@
+--- /tmp/rd_CMakeLists.orig	2026-10-03 13:16:37.471470542 +0200
++++ CMakeLists.txt	2026-10-03 13:16:37.474470501 +0200
+@@ -7,15 +7,15 @@
+ ## cxx standard
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+-set(CMAKE_BUILD_TYPE "Debug")
++set(CMAKE_BUILD_TYPE "Release")
+ 
+ ## cmake warnings
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-result -Wno-ignored-attributes")
+ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-result -Wno-ignored-attributes")
+ 
+ ## cmake optimize
+-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Og -msse -msse2 -msse3 -ffast-math -mtune=native")
+-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Og -msse -msse2 -msse3 -ffast-math -mtune=native")
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -msse -msse2 -msse3 -ffast-math -mtune=native")
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -msse -msse2 -msse3 -ffast-math -mtune=native")
+ 
+ ## ccache
+ find_program(CCACHE_EXE ccache)
+@@ -42,4 +42,4 @@
+ add_subdirectory(src)
+ 
+ ## example
+-add_subdirectory(examples)
+\ No newline at end of file
++#add_subdirectory(examples)  # needs Pangolin; headless driver is built separately
+\ No newline at end of file
+--- a/src/rdvio/include/rdvio/feature_tracker.h	2026-10-03 13:18:08.344502449 +0200
++++ src/rdvio/include/rdvio/feature_tracker.h	2026-10-03 13:18:08.346502437 +0200
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <optional>
+ #include <rdvio/types.h>
+ #include <rdvio/estimation/state.h>
+ 
+--- a/src/rdvio/include/rdvio/types.h	2026-10-03 13:24:11.818682080 +0200
++++ src/rdvio/include/rdvio/types.h	2026-10-03 13:24:11.820682061 +0200
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <optional>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>

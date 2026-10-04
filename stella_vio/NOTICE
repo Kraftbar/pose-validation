@@ -1,0 +1,120 @@
+stella pure-C port — source and license notices
+Audit date: 2026-10-01
+
+This directory is a collection of differently licensed components. SPDX
+headers describe individual files; there is no blanket MIT/BSD license
+covering the whole port. LICENSES/files.json maps every c/ file and the
+production Eigen PnP helper to its license and recorded provenance.
+An AND expression retains the terms of each component in a mixed file;
+it does not relicense the upstream material. Existing notices are retained.
+
+New project-authored harnesses, data records and driver additions are MIT,
+Copyright (c) 2026 Pose Validation contributors (LICENSES/MIT.txt).
+Their linked implementations retain their own licenses. These labels do
+not extend to third-party input fixtures or vocabulary data.
+
+stella_vslam
+------------
+Source: https://github.com/stella-cv/stella_vslam, pin e445b545 (v0.7.0).
+Copyright (c) 2019, National Institute of Advanced Industrial Science and
+Technology (AIST). Copyright (c) 2022, stella-cv. All rights reserved.
+BSD-2-Clause: LICENSES/stella-BSD-2-Clause-{original,fork}.txt.
+The C modules adapt the upstream algorithms and data structures to C99;
+their comments identify the corresponding classes/functions. The TUM
+association behavior used by sv_run.c also has the examples utility notice
+in LICENSES/tum-rgbd-util-BSD-2-Clause.txt.
+
+OpenCV
+------
+Source: external/opencv_4.6.0_src (OpenCV 4.6.0), plus the legacy ORB code
+and point-pair table incorporated by stella. Upstream notices are preserved
+in LICENSES/opencv-source-notices.txt, including Intel, Willow Garage,
+Itseez and Edward Rosten copyrights. The old BSD-3 notices already in the
+C files are retained too.
+sv_fast, sv_undistort, the ORB table and the OpenCV parts of sv_extract
+derive from files bearing BSD-3-Clause notices. sv_image mixes BSD-3
+resize/blur code with fastAtan2 from core/src/mathfuncs_core.simd.hpp;
+that file refers to the OpenCV 4.6 top-level Apache-2.0 license, copied to
+LICENSES/Apache-2.0.txt. sv_image is therefore Apache-2.0 AND BSD-3-Clause.
+These are modified C99 specializations, not unmodified OpenCV files.
+Release-wide licensing alone does not replace individual BSD notices.
+https://opencv.org/license/
+
+Eigen
+-----
+Source: external/eigen (Eigen 3.4 headers identified in the code).
+The sv_eigen_* files, sv_linalg.{c,h}, and
+reference_reloc/c/sv_eigen_pnp.{c,h} are modified Eigen-derived source under
+MPL-2.0, not BSD/MIT. LICENSES/MPL-2.0.txt contains the full license;
+LICENSES/eigen-notices.txt retains upstream authors and source-file notices.
+Calling these modules alone does not label every caller MPL. Distribution
+of executables containing them must satisfy MPL source-availability and
+notice requirements for the covered files; keep this source with releases.
+https://www.mozilla.org/en-US/MPL/2.0/FAQ/
+
+Eigen's Amd.h and SimplicialCholesky_impl.h explicitly record Timothy A.
+Davis's permission for the CSparse/LDL adaptations to be distributed as
+part of Eigen under MPL-2.0. Those notices are retained. These modules were
+ported from those Eigen files, not from GPL/LGPL SuiteSparse modules.
+
+g2o
+---
+Source: external/candidates/g2o, core and types/slam3d, types/sim3 portions.
+Copyright (C) 2011 Rainer Kuemmerle, Giorgio Grisetti, Hauke Strasdat,
+Kurt Konolige, and Wolfram Burgard; additional per-file notices retained.
+The inspected source headers have two redistribution conditions:
+BSD-2-Clause, correcting earlier C comments that called them BSD-3.
+See LICENSES/g2o-BSD-2-Clause.txt and LICENSES/g2o-source-notices.txt.
+The C port uses its Eigen-derived solvers, not csparse_extension, CHOLMOD,
+the g2o viewer or incremental GPL components. Native reference tooling is
+separate and can link LGPL CXSparse; this notice is not clearance to ship
+that reference build with the C port under the C port's licenses.
+
+FBoW, libmv and OpenGV
+---------------------
+sv_bow: FBoW, Copyright (c) 2017 Rafael Muñoz-Salinas, MIT; full notice in
+LICENSES/fbow-MIT.txt. Source: stella's 3rd/FBoW dependency.
+sv_solve_essential_5pt: libmv polynomial code, Copyright (c) 2011 libmv
+authors, MIT (LICENSES/libmv-MIT.txt), plus the BSD-2 stella adapter.
+sv_pnp: stella's README attributes its EPnP implementation to OpenGV.
+Retain OpenGV's Copyright (c) 2013 Laurent Kneip, ANU, BSD-3-Clause notice
+in LICENSES/opengv-BSD-3-Clause.txt, alongside stella's BSD-2 notice.
+LICENSES/opengv-provenance.txt records the fetched notice hashes, URLs
+and OpenGV's acknowledgment of the original EPFL EPnP authors.
+
+Vocabulary data
+---------------
+vocab/own_orb_v1.fbow is separately licensed CC-BY-4.0. Preserve its
+vocab/ATTRIBUTION.md, vocab/own_orb_v1.json and the provenance in
+docs/stella_vocab.md (at the repository root).
+The trainer's MIT license does not make the vocabulary MIT. The original
+orb_vocab.fbow is external reference input with unresolved training
+provenance; it is not included here or cleared by this notice.
+
+GPL audit scope and unresolved provenance
+----------------------------------------
+The inspection covered the complete stella_port tree, source notices,
+reference patches, C include/link declarations, and the named upstream
+dependencies. No file declaring GPL/LGPL as its own license, bundled
+GPL implementation, ORB-SLAM source include, binary library, or symlink
+to such code was identified. Documentation references to GPL, native
+reference CSparse calls, and MPL's secondary-license wording are not
+themselves GPL-covered implementations in the C port.
+
+This is not an unconditional certification that every file is GPL-free.
+sv_rng, sv_umap_order and sv_rbtree reproduce libstdc++ behavior. Their
+existing BSD-2 declarations have been retained. sv_umap_order documents
+measured behavior; sv_rng explicitly records reading GCC headers; sv_rbtree
+records reproducing SGI/libstdc++ tree operations. GCC 13 headers carry
+GPL-3.0-or-later with the GCC Runtime Library Exception, not LGPL. This
+notice pass cannot establish independent authorship from behavior tests
+or a source comment alone. Review those helpers' derivation before making
+an unrestricted GPL-free distribution claim; adding SPDX does not settle
+that question or relicense any copied code.
+
+stella_vio (development fork)
+-----------------------------
+This directory is a copy of stella_port/c (+ sv_eigen_pnp.{c,h} from
+stella_port/reference_reloc/c) that diverges on purpose. All notices above
+and the SPDX headers of the copied files are retained; project-authored
+changes are MIT (LICENSES/MIT.txt) unless a file header says otherwise.

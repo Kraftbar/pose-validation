@@ -1,0 +1,55 @@
+{
+ "name": "indoor1",
+ "dataset": "Mobile-GVIO (CC BY 4.0)",
+ "data_dir": "external/gnss/rob/indoor1",
+ "rgb_dir": "external/gnss/rob/indoor1/tum",
+ "imu": "external/gnss/rob/indoor1/imu0/data.csv",
+ "size": "1280x720",
+ "camera": "996.4948765107108,995.8706613911386,651.7912725410048,364.86680915422824,0.06513753258976974,-0.23698184370758457,0.0007685090700979932,0.005825777305547826,0.0",
+ "camera_note": "fx,fy,cx,cy,k1,k2,p1,p2,k3 from tools/gnss_harness/robust_cfg/indoor1/port_camera.txt (dataset calibration)",
+ "imu_ext": [
+  0.017629638,
+  -0.999677718,
+  -0.018266257,
+  -0.999828418,
+  -0.017730305,
+  0.005363899,
+  -0.005686037,
+  0.01816856,
+  -0.99981877,
+  0.03133239,
+  9.802e-05,
+  0.00177312
+ ],
+ "imu_ext_note": "R_BC (9, row-major) + t (3): runs/stella_vio/imu/ext_indoor1_stella_fit.txt, rotation fitted from a visual trajectory + gyro of the SAME sequence (stella_vio/tools/ext_fit.py); the dataset-calibration variant is ext_indoor1_stella_cal.txt / ext_indoor1.txt",
+ "imu_toff": -0.005,
+ "imu_toff_note": "camera->IMU clock offset [s] from the same fit (ext_fit.py)",
+ "imu_bg": [
+  -0.00101,
+  0.00098,
+  -0.00112
+ ],
+ "imu_bg_note": "gyro bias from the first <=60 s visual fit (runs/stella_vio/imu/gyro_pred.md); only used by gyro=1",
+ "fixes": null,
+ "fixes_note": "indoor fixes are unusable (sigma 20-67 m): the run is GNSS-free",
+ "gait": {
+  "mode": "user",
+  "c": 0.3774599763762112,
+  "note": "per-user constant fitted on the GT speed of the OTHER three Mobile-GVIO sequences (gnss_fusion/work/gait_cal.json, gf_gait_study.fit_c); this sequence is held out"
+ },
+ "imu_ext_cal": [
+  0.01916709,
+  -0.99980408,
+  -0.00494212,
+  -0.99955275,
+  -0.01904832,
+  -0.02305337,
+  0.02295471,
+  0.00538177,
+  -0.99972202,
+  0.03133239,
+  9.802e-05,
+  0.00177312
+ ],
+ "imu_ext_cal_note": "dataset-calibration extrinsic (runs/stella_vio/imu/ext_indoor1_stella_cal.txt), no fit to the sequence; used by the sensitivity variant fullcal"
+}

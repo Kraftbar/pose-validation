@@ -359,3 +359,527 @@ Cause ranking from these data (not isolated by experiment): (1) initialisation o
 **Best system on phones overall**: no system is both metric and full-coverage on the long outdoor walks. Ranked by robustness across the 6 sequences incl. Outdoor-1: stella_vslam upstream (BSD, usable coverage everywhere, 0.25-0.8 m Sim3 indoors, 16-54 m outdoors from scale drift) and ORB-SLAM3 mono (best local accuracy, 22-98% coverage); the IMU-based systems (OKVIS2-X, ORB-SLAM3 mono-inertial, OpenVINS) are worse than the vision-only ones on 5 of 6 sequences. The recommendation of 8.5 stands: ORB-style front end at full resolution with robust initialisation, IMU only as gravity / scale aid, GNSS as safety net (the raw fixes beat every full-coverage result outdoors on all three phone sequences: 5.7 / 14.7 / 12.0 m).
 
 Limits: one run per system (two for OKVIS on two sequences); OpenVINS and stella got one or two cheap config tries; no ORB-SLAM3 mono-inertial tuning on ADVIO (dataset noise and 1e-2 / 1e-1 noise tried on advio-15); Mobile-GVIO frame rate 15 fps (every 2nd frame), ADVIO 30 fps; Outdoor-2 truncated at 450 s; Mobile GT absolute metres indicative (LiDAR frame + estimated clock offset, camera pose vs rig GT, no lever arm); no cross-device (phone camera vs separate iPhone GNSS) sync information; RTFs measured with 2-4 concurrent jobs.
+
+## 10. Own C library for the loose fusion: `gnss_fusion/` (2026-10-02)
+
+Own code, MIT, C99 (`<stdint.h> <math.h> <stdlib.h> <string.h> <limits.h>` only, own block-tridiagonal Gauss-Newton with 5x5 Cholesky blocks),
+re-implementing `tools/gnss_loose_fusion.py` (section 2/3: 4-DoF + scale pose graph, Huber GNSS factors, 1 s nodes) and extending it. Folder layout, API and
+model are in `gnss_fusion/README.md`; `gnss_fusion/tools/run_all.sh` re-runs everything below (outputs in the git-ignored `gnss_fusion/work/`).
+Library: `gf_geo.{h,c}` (WGS-84 LLA/ECEF/ENU), `gf_fusion.{h,c}` (`gf_add_odom`, `gf_add_fix`, `gf_get_pose`, `gf_solve_batch`, `gf_query`),
+driver `gf_run.c` (text in, TUM out, timing). No data or binaries committed; inputs are the saved trajectories / fixes of sections 3, 8, 9
+(`external/gnss/...`, OKVIS2 VIO on GVINS complex_environment with the RTK and simulated-SPP fixes, real iPhone / ADVIO fixes, ORB-SLAM3 / stella / OKVIS2 phone runs).
+
+### 10.1 Python vs C, same inputs
+
+Same node grid, same initial alignment, same Gauss-Newton schedule (batch: 25 iterations on the whole graph; causal: 30 s window, 4 iterations per node, 10 settle
+iterations on the first 11 nodes), same Huber IRLS. `gnss_fusion/tools/compare_py.py`, per odometry pose (positions; TUM text output rounds to 1 micrometre):
+
+| case | mode | poses | max diff (mm) | rms (mm) | python s | C s (incl. file I/O) |
+|---|---|---|---|---|---|---|
+| complex_rtk | batch | 8714 | 0.0008 | 0.0005 | 2.2 | 0.15 |
+| complex_rtk | causal | 8714 | 0.0131 | 0.0009 | 9.8 | 0.16 |
+| complex_sim | batch | 8714 | 0.0008 | 0.0005 | 0.8 | 0.11 |
+| complex_sim | causal | 8714 | 0.0008 | 0.0005 | 14.5 | 0.96 |
+| complex_rtk_blk | batch | 8714 | 0.0009 | 0.0005 | 2.0 | 0.09 |
+| complex_rtk_blk | causal | 8714 | 0.0139 | 0.0010 | 12.1 | 0.22 |
+| complex_sim_blk | batch | 8714 | 0.0008 | 0.0005 | 0.9 | 0.06 |
+| complex_sim_blk | causal | 8714 | 0.0008 | 0.0005 | 11.0 | 0.31 |
+| o1_okvis | batch | 5898 | 0.0008 | 0.0005 | 2.3 | 0.05 |
+| o1_okvis | causal | 5898 | 0.3141 | 0.0184 | 12.8 | 0.29 |
+| o2_okvis | batch | 6736 | 0.0009 | 0.0005 | 3.2 | 0.06 |
+| o2_okvis | causal | 6736 | 3843.5252 | 352.7449 | 12.5 | 0.42 |
+| o1_orb3mono | batch | 2516 | 0.0008 | 0.0005 | 0.4 | 0.02 |
+| o1_orb3mono | causal | 2516 | 0.0008 | 0.0005 | 4.5 | 0.10 |
+| o2_orb3mono | batch | 1454 | 0.0008 | 0.0005 | 0.2 | 0.02 |
+| o2_orb3mono | causal | 1454 | 0.0008 | 0.0005 | 2.4 | 0.04 |
+
+Batch agrees to 0.001 mm (floating point noise plus the 6-decimal text output) on all 8 cases, including the camera-only ORB-SLAM3 cases (gravity from the
+accelerometer through `gf_set_gravity`, scale from the fixes), node yaw to 0.005 microrad and scale to 5e-7. Causal agrees to 0.3 mm or better on 7 of 8 cases;
+Outdoor-2 OKVIS2 (a diverged VIO, scale 0.005) is chaotic under 4-iteration windows and drifts apart after node 223 (max 3.8 m, rms 0.35 m), same behaviour class
+as the python result itself (154 m ATE). Causal equivalence is obtained by feeding the fixes 0.5 s ahead (`--lookahead 0.5`): python associates a node with the
+nearest fix up to half a node later, the real-time library attaches a fix as soon as it arrives and re-solves (one extra window solve), so it is not bit-identical to the
+python replay in normal use. Geodetics (`tools/test_geo.py`, 404 random points): LLA->ENU 5e-7 m and ECEF 5e-5 m (print precision) vs the numpy conversion of the harness, ENU->LLA round trip 1e-7 m.
+Differences by design: (i) python needs gaps bridged by pseudo-poses (`fill_gaps`), the library segments instead; (ii) monocular scale: python pre-normalises with one
+global Sim3 scale, the library estimates a unit per odometry frame at the alignment (same numbers when there is one frame); (iii) python reads every fix of 1 s nodes only, the
+library keeps the same one-fix-per-node nearest rule.
+
+### 10.2 Results (ATE SE3 in m, `gnss_eval.score`; geo-referenced error where the output is in the ENU frame of the fixes)
+
+Columns: raw odometry (SE3-aligned) | GNSS fixes alone (all fixes / only fixes within 1 s of an emitted pose, for the partial ORB-SLAM3 maps) | python smoother batch / causal 30 s | C smoother with python-equivalent
+settings batch / causal 30 s | C smoother with `gf_config_robust()` (consistency test, 120 s drift test, chi2 gate 16.27 + 1 m floor, trimmed init, free monocular scale) batch / causal 30 s / live
+output of `gf_get_pose` after init. Causal columns are scored from 30 s after the start (the alignment time) for both python and C. `complex_*` = GVINS complex_environment, OKVIS2 mono VIO,
+`rtk` = receiver RTK fixes (also the GT, optimistic: GNSS alone 0.00), `sim` = simulated SPP-grade 1 Hz fixes (1.5 m / 3 m), `blk` = 100-220 s blackout; `o1/o2` = Outdoor-1/2 (iPhone fixes, reported sigma 14 m), `a15/a20` = ADVIO-15/20.
+`okvis` = OKVIS2-X mono VIO, `orb3mono` = ORB-SLAM3 mono (partial maps with gaps, camera only: gravity from the accelerometer, scale from fixes), `stella` = stella_vslam upstream mono.
+
+| sequence | raw odometry | GNSS alone (all / on covered epochs) | python batch / causal30 | C batch / causal30 | C robust batch / causal30 / live |
+|---|---|---|---|---|---|
+| complex_rtk | 8.02 | 0.00 / 0.00 | 0.08 / 0.09 | 0.08 / 0.09 | 0.08 / 0.09 / 0.10 |
+| complex_sim | 8.02 | 4.18 / 4.18 | 2.04 / 2.16 | 2.04 / 2.16 | 2.04 / 2.16 / 2.15 |
+| complex_rtk_blk | 8.02 | 0.00 / 0.00 | 0.26 / 0.67 | 0.26 / 0.67 | 0.26 / 0.67 / 0.67 |
+| complex_sim_blk | 8.02 | 4.33 / 4.33 | 1.88 / 2.17 | 1.88 / 2.17 | 1.88 / 2.17 / 2.16 |
+| o1_okvis | 46.86 | 5.73 / 5.73 | 33.22 / 43.18 | 33.22 / 43.18 | 6.20 / 8.20 / 8.22 |
+| o2_okvis | 8943.46 | 14.66 / 14.66 | 19.66 / 153.94 | 19.66 / 154.07 | 14.41 / 16.62 / 16.63 |
+| a15_okvis | 1.65 | 1.56 / 1.56 | 1.65 / 1.48 | 1.65 / 1.48 | 1.65 / 1.48 / 1.47 |
+| a20_okvis | 58.84 | 12.00 / 12.00 | 50.82 / 56.62 | 50.82 / 56.62 | 11.93 / 12.13 / 12.12 |
+| o1_orb3mono | 40.52 | 5.73 / 4.47 | 2.68 / 7.76 | 2.68 / 7.76 | 2.17 / 3.06 / 3.02 |
+| o2_orb3mono | 30.99 | 14.66 / 7.08 | 2.59 / 1.14 | 2.59 / 1.14 | 2.53 / 2.58 / 2.52 |
+| a15_orb3mono | 1.36 | 1.56 / 1.56 | 1.21 / 0.84 | 1.21 / 0.84 | 1.26 / 1.04 / 1.02 |
+| a20_orb3mono | 48.97 | 12.00 / 12.16 | 12.08 / 13.88 | 12.08 / 13.88 | 12.12 / 12.57 / 12.52 |
+| o1_stella | 68.90 | 5.73 / 5.73 | 10.70 / 37.24 | 10.70 / 37.24 | 6.22 / 15.19 / 15.19 |
+| o2_stella | 95.04 | 14.66 / 14.66 | 38.95 / 61.24 | 38.95 / 61.24 | 13.78 / 38.29 / 38.34 |
+
+| sequence (geo-referenced ENU only) | GNSS alone | python batch / causal30 | C batch / causal30 | C robust batch / causal30 |
+|---|---|---|---|---|
+| complex_rtk | 0.00 | 0.09 / 0.10 | 0.09 / 0.10 | 0.09 / 0.10 |
+| complex_sim | 5.50 | 4.07 / 4.39 | 4.07 / 4.39 | 4.07 / 4.39 |
+| complex_rtk_blk | 0.00 | 0.27 / 0.76 | 0.27 / 0.76 | 0.27 / 0.76 |
+| complex_sim_blk | 5.35 | 4.28 / 4.64 | 4.28 / 4.64 | 4.28 / 4.64 |
+
+Reading: (1) python and C columns are identical to the printed digits wherever the python is deterministic. (2) With the consistency test the fused result is never worse than
+the raw iPhone fixes by more than 1-3 m when the VIO is bad (Outdoor-1 OKVIS2: 33.2 -> 6.2 m batch, GNSS alone 5.7; Outdoor-2: 19.7 -> 14.4, alone 14.7; ADVIO-20 50.8 -> 11.9, alone 12.0) and it
+is unchanged when the odometry is good (complex_*, a15). Causal is 1-3 m behind batch on the bad-VIO sequences (8.2 vs 5.7, 16.6 vs 14.7): the distrust verdict needs a window of fixes, so the
+newest seconds are fused with the unreliable odometry. (3) Monocular cam-only, full coverage (stella): batch 6.2 / 13.8 m is on par with GNSS alone (5.7 / 14.7), but causal is still 15 / 38 m (see 10.6).
+(4) The partial ORB-SLAM3 maps (22-88 % coverage) stay far better than GNSS alone on the covered epochs, e.g. o1 3.1 vs 4.5 m causal, o2 2.6 vs 7.1 m.
+
+### 10.3 (a) Robust loss, gating, "trust GNSS when the odometry is inconsistent"
+
+Mechanism (`trust=1`): per node, in a +-15 s window, the odometry positions at the fixes are fitted with a trimmed 4-DoF + scale similarity. The odometry is distrusted for that node if
+(metric odometry) the fitted scale leaves [1/1.5, 1.5] while the fixes move more than 3 times their own noise (second differences, MAD), or the fit residual exceeds 4 times the GNSS noise and 5 m, or the 120 s window residual exceeds 8 m. Distrusted
+links lose their odometry factor (a weak position link of 1 m + 3 m/s * dt remains, yaw/scale random walks are relaxed), so the nodes there follow the fixes only (smoothed GNSS) and the output between nodes
+is interpolated. Gate: a fix is dropped if its normalised residual `sum(r^2/(sigma^2+1 m^2)) > 16.27` (never inside a segment with < 5 fixes, never when > 50 % of the window would be dropped).
+Two things this does not use: the reported fix sigma (the iPhone's 14 m says nothing; the second-difference noise of the fixes is 0.2-0.4 m, the error is a slow bias) and any ground truth. Thresholds were set from physical reasoning and the first looks at the
+Outdoor-1 / Outdoor-2 windows, then checked on the other sequences; they were not tuned per sequence, but the sequences are few, so treat the margins as indicative.
+
+Synthetic outliers on top of good odometry / real fixes (`gf_studies.py outliers`: 5 % spikes of 15 m + 5-12 reported sigmas in a random direction; two 20 s multipath bursts with a 25 m common offset, reported sigma unchanged; ATE SE3 m, GNSS alone in the second column; H = python Huber 2.5, N = no loss, C = Cauchy 2.385, Hg / Cg = Huber / Cauchy + gate + trimmed init, R = full robust preset):
+
+| sequence | variant | GNSS alone | batch: H / N / C / Hg / Cg / R | causal: H / N / C / Hg / Cg / R |
+|---|---|---|---|---|
+| complex_sim | clean | 4.18 | 2.04 / 2.04 / 1.84 / 2.04 / 1.84 / 2.04 | 2.16 / 2.17 / 2.03 / 2.16 / 2.02 / 2.16 |
+| complex_sim | spikes | 7.63 | 2.00 / 2.12 / 1.82 / 2.03 / 1.84 / 2.03 | 2.14 / 2.58 / 2.01 / 2.15 / 2.01 / 2.19 |
+| complex_sim | burst | 8.40 | 2.84 / 4.92 / 1.84 / 1.96 / 1.76 / 2.87 | 6.97 / 7.35 / 6.03 / 5.28 / 3.45 / 7.99 |
+| complex_sim | both | 10.60 | 2.85 / 4.93 / 1.83 / 1.94 / 1.73 / 2.86 | 7.05 / 7.60 / 6.09 / 5.46 / 3.95 / 7.90 |
+| o1_orb3mono | clean | 5.73 | 2.68 / 2.68 / 2.68 / 2.70 / 2.70 / 2.17 | 7.76 / 7.76 / 7.99 / 7.76 / 7.99 / 3.06 |
+| o1_orb3mono | spikes | 32.08 | 5.79 / 5.93 / 5.79 / 2.71 / 2.71 / 2.45 | 63.69 / 49.51 / 103.46 / 7.79 / 8.03 / 2.86 |
+| o1_orb3mono | burst | 8.79 | 3.56 / 3.56 / 3.52 / 3.56 / 3.52 / 6.89 | 7.84 / 7.84 / 8.21 / 7.84 / 8.21 / 8.24 |
+| o1_orb3mono | both | 33.49 | 2.88 / 2.91 / 2.91 / 3.81 / 3.76 / 6.95 | 76.38 / 71.53 / 136.45 / 74.63 / 139.42 / 9.20 |
+| o1_okvis | clean | 5.73 | 33.22 / 32.37 / 35.54 / 36.85 / 37.86 / 6.20 | 43.18 / 41.69 / 45.21 / 43.21 / 45.23 / 8.20 |
+| o1_okvis | spikes | 30.70 | 33.35 / 32.49 / 35.63 / 36.79 / 37.84 / 5.68 | 43.15 / 41.40 / 45.30 / 43.27 / 45.35 / 8.20 |
+| o1_okvis | burst | 8.79 | 33.32 / 32.56 / 35.64 / 37.83 / 38.38 / 8.17 | 42.91 / 41.42 / 45.17 / 42.96 / 45.19 / 9.93 |
+| o1_okvis | both | 29.61 | 33.31 / 32.30 / 35.72 / 37.92 / 38.47 / 7.79 | 41.70 / 41.00 / 44.47 / 43.16 / 45.38 / 19.60 |
+
+Findings: Huber alone (python reference) already handles spikes. A burst of consistent bad fixes is only handled by the gate (complex_sim burst, batch: 2.84 -> 1.96 Huber+gate, 1.76 Cauchy+gate; causal 6.97 -> 5.28 / 3.45). The full preset
+(consistency test on) loses that gain because a 20 s burst looks like inconsistent odometry to a 30 s window (batch 2.87, causal 7.99), a trade-off we did not resolve; a stricter AND-rule with the long window fixes some bursts but delays distrust on bad VIO (o1 OKVIS causal 8.2 -> 12.5), so it is
+available (`trust_long_and`) but off. Cauchy without the consistency test is catastrophic when the odometry is junk (it ignores the fixes), so it is not in the preset. Trimmed initialisation matters for causal mode:
+Outdoor-1 ORB-SLAM3 with spikes, causal, 63.7 m (python Huber) vs 7.8 m (gate + trimmed init).
+
+### 10.4 (b) Odometry tracking loss (gaps, new maps)
+
+`gf_add_odom` starts a new segment automatically after a gap > 2 s, or on `GF_ODOM_GAP` / `GF_ODOM_NEW_FRAME`; position is bridged by a weak link, a new frame is aligned from its own fixes once it spans 4 m (provisional state until then).
+Test (`gf_studies.py loss`): complex_sim / complex_rtk with the odometry cut for 25 s and 20 s; afterwards it restarts either in the same frame with a 15-25 m position jump (relocalisation), or in an unrelated new frame (random yaw, +-60 m origin). The python smoother
+gets the python harness' bridged gaps (constant-velocity pseudo-poses, one frame). ATE SE3 / geo-referenced error (m):
+
+| case | python batch, gaps bridged | C batch | C causal 30 s | no loss at all (C batch / causal) |
+|---|---|---|---|---|
+| sim, same frame, jump | 2.39 / 4.24 | 2.09 / 4.20 | 2.26 / 4.04 | 2.04 / 2.16 (4.07 / 4.39) |
+| sim, NEW frame | 5.19 / 6.36 | 2.04 / 4.17 | 2.17 / 3.87 | |
+| rtk, same frame, jump | 0.10 / 0.11 | 0.08 / 0.09 | 0.09 / 0.10 | 0.08 / 0.09 |
+| rtk, NEW frame | 0.19 / 0.20 | 0.08 / 0.09 | 0.10 / 0.10 | |
+
+A break costs nothing measurable relative to no loss (the fixes re-align the new frame); an unflagged new frame is also survived in the robust preset (the consistency test sees it) but not with the python-equivalent settings (causal 47.9 m), so flag new maps.
+First version of this had a bug found by the study: the chi2 gate rejected every fix after a position jump for 20 s (state not yet constrained); fixed by never gating inside segments with fewer than 5 fixes. Real partial maps (ORB-SLAM3 mono, raw trajectories with their gaps, no pseudo-poses): C robust vs python bridged, batch / causal:
+o1 2.17 / 3.06 vs 2.68 / 7.76, o2 2.53 / 2.58 vs 2.59 / 1.14, a15 1.26 / 1.04 vs 1.21 / 0.84, a20 12.12 / 12.57 vs 12.08 / 13.88 (table above).
+
+### 10.5 (c) GNSS blackout bridging
+
+`gf_studies.py blackout`: complex RTK and simulated-SPP fixes removed from 100 s for 30 / 60 / 120 / 240 s; error vs GT in the ENU frame (no alignment), RMS per time-since-blackout bin; "live" causal output of `gf_get_pose`:
+
+| RTK fixes, blackout | batch (smoother, fixes on both sides) | causal live: 0-30 s | 30-60 s | 60-120 s | 120-240 s |
+|---|---|---|---|---|---|
+| 30 s | 0.37 | 0.61 | | | |
+| 60 s | 0.39 | 0.61 | 1.09 | | |
+| 120 s | 0.43 (max 0.75) | 0.61 | 1.09 | 2.29 | |
+| 240 s | 3.21 (max 5.18) | 0.61 | 1.09 | 2.29 | 10.45 (max 16.2) |
+
+Dead-reckoning drift of OKVIS2 + the last alignment: about 0.6 m after 30 s, 1 m after 60 s, 2.3 m (60-120 s), then fast growth (yaw drift of the VIO): 10 m RMS in the 120-240 s bin. Before the blackout the error is 0.08-0.09 m. With
+SPP-grade fixes the blackout is invisible (5.2-6.4 m up to 120 s, the fixes' own bias of 4-5 m dominates), 14.5 m at 120-240 s causal. The heuristic `sigma_h` (hypot(reported sigma / sqrt(n fixes), 0.02 * path since the last fix)) is calibrated on the RTK case
+(median error / sigma 0.8-1.4, 71-93 % of epochs within 2 sigma) and optimistic for the SPP case (2.3-9: it does not know the fixes' own correlated bias). `GF_ST_NO_RECENT_FIX` flags dead reckoning after 10 s.
+
+GNSS velocity (extension, no python counterpart): Doppler-like velocity (RTK-reference velocity + 0.1 m/s) on the simulated fixes: batch 2.04 -> 1.98, causal 2.16 -> 2.05 (SE3), small because the odometry is already good.
+
+### 10.6 Timing (one thread, AMD Ryzen 7 3700X, gcc -O2)
+
+Causal complex_sim (8714 odometry samples at 20 Hz, 436 nodes, 436 fixes), `gf_run --timing`, per call:
+
+| call | python-equivalent settings | `gf_config_robust()` |
+|---|---|---|
+| `gf_add_odom` creating a node (1 per second): mean / p50 / p99 / max | 197 / 216 / 283 / 1721 microseconds (quiet machine; the max is the one-off alignment + 11-node replay at 30 s) | 469 / 437 / 672 / 3244 microseconds |
+| `gf_add_odom`, other samples | 0.07 microseconds | 0.07 microseconds |
+| `gf_add_fix` | 0.04 microseconds (queued; its cost is in the node call) | same |
+| `gf_solve_batch`, 436 nodes | 2.2 ms | |
+
+A second run during heavy load from other jobs on this 16-thread machine gave 327 / 227 / 3281 and 554 / 525 / 3534 microseconds (mean / p50 / p99), i.e. the medians hold, the tails are scheduler noise.
+
+Per `gf_add_odom` that creates a node (1 per second at node_dt = 1 s) the cost is the window re-solve; all other odometry samples (20 Hz here) and fixes (queued until their node exists) cost
+under 0.1 microsecond. At 1 node/s that is 0.02-0.05 % of one core; a 10x slower phone core would still spend about 5 ms per node. Memory in causal mode with `keep_history = 0`: window + 8 .. 4x that many nodes (about 0.4 KB each, 60 KB), no allocation per call once warm.
+
+### 10.7 Open issues
+
+- Monocular VO with an unstable scale in causal mode (stella full coverage): 15 / 38 m vs GNSS alone 5.7 / 14.7 m. The distrust verdict arrives only after 4-30 s of fixes, the spikes before it dominate the RMS; a monocular scale-jump test exists
+(`trust_scale_k_mono`) but it hurts causal results so it is off. Batch is fine (6.2 / 13.8).
+- Multipath bursts vs the consistency test interact (10.3); the gate works on its own.
+- Causal output is only as good as the 30 s alignment: nothing is geo-referenced before `init_wait_s` (odometry passed through, status without `GF_ST_INIT`).
+- Fixes during an odometry gap are dropped (no GNSS-only nodes), the segment is bridged and re-aligned when the odometry returns.
+- No marginal covariance; `sigma_h` is a heuristic. Only one fix per 1 s node is used (the nearest), 10 Hz RTK is decimated like in the python reference.
+- Tuned by reasoning and looked at on the same sequences it is evaluated on (14 sequence/VO combinations, 2 GNSS-simulation variants); the iPhone sequences are the only real GNSS; the RTK-fix variants use the GT receiver, so they are an upper bound.
+
+
+## 10. More mono-inertial systems on the phone sequences (2026-10-02)
+
+Question: does any other mono+IMU system give full coverage with metric scale on the phone data of sections 8-9? Benchmark only. XRSLAM (Apache-2.0) is the main subject; VINS-Fusion and DM-VIO are GPL reference only (executed, never copied); Kimera-VIO (BSD-2) was built and run on EuRoC only (note: `docs/vio_candidates_20261001.md` addendum). Same fixtures, GT (clock offsets of `phone_offsets.json`), scorer machinery and metrics as section 9 (`tools/vio_harness/more_phone_score.py` reuses `robust_score` / `gnss_eval.score` / `benchmark.umeyama_alignment`); images were re-fetched into `external/vio2/phone/` with `external/vio2/fetch_phone.sh` and deleted after the runs (peak about 5 GB). Results: `runs/gnss_compare/more_systems/` (`table.md`, `table.json`, `<run>/{metrics.json,traj.txt}`, `raw/<run>/{run.json,log_tail.txt}`).
+Caveats: single run per cell; machine load average 30-60 (RTF column is wall/duration under that load, so only an upper bound; XRSLAM is single threaded, CPU-s per data-second: indoor1 about 1.1, advio20 about 3.9 incl. the reader's cv::undistort of 720x1280 frames); "poses / frames" for VINS-Fusion is low because it publishes about every second frame, use "covered span". XRSLAM default IMU noise = its `iphone12.yaml` continuous covariances; `[infl]` = OKVIS-tuned phone values (1e-2 / 1e-1 densities). Skipped on request (overloaded machine): VINS-Fusion on Outdoor-1 / Outdoor-2, Kimera on the phone sequences, DM-VIO (OOM at startup, see the addendum), repeats.
+
+| sequence | system | ATE SE3 (m) | ATE Sim3 (m) | scale | coverage (poses / frames) | losses | note |
+|---|---|---|---|---|---|---|---|
+| Indoor-1 (119 s) | XRSLAM | **0.84** | 0.73 | 1.02 | 92% | 0 | first pose at ~9 s; OKVIS2-X 8.26, stella Sim3 1.85 |
+| Indoor-1 | VINS-Fusion | 802 | 14.4 | 0.01 | 49% (span 99%) | 0 | scale collapse |
+| Indoor-2 (102 s) | XRSLAM | **0.98** | 0.56 | 1.07 | 82% | 0 | OKVIS2-X 27.0 |
+| Indoor-2 | VINS-Fusion | no output | - | - | 0% | - | never initialised |
+| ADVIO-15 (52 s) | XRSLAM default | 1451 (scale collapse) | 1.59 | 0.00 | 97% | 0 | |
+| ADVIO-15 | XRSLAM [infl] | **1.55** | 1.51 | 1.71 | 97% | 0 | OKVIS2-X 1.65 |
+| ADVIO-15 | VINS-Fusion | 614 | 1.62 | 0.00 | 49% (span 97%) | 0 | |
+| ADVIO-15 | DM-VIO | no output | - | - | 0% | OOM at startup (19 GB) | |
+| ADVIO-20 (302 s) | XRSLAM default / [infl] | 143 044 / 57 265 | 60.2 / 56.7 | 0.00 / 0.00 | 99% | 0 | scale collapse; GNSS alone 12.0 SE3 |
+| ADVIO-20 | VINS-Fusion | 3610 | 8.5 | 0.01 | 18% (span 35%) | 0 | |
+| Outdoor-1 (394 s) | XRSLAM default | **6.44** | 6.10 | 1.03 | 99% | 0 | GNSS alone 5.73; best full-coverage metric result of the study (OKVIS2-X 74.8, ORB-SLAM3-MI 5.05 at 55% coverage) |
+| Outdoor-1 | XRSLAM [infl] | 35.2 | 27.5 | 1.53 | 99% | 0 | noise sensitivity: worse here, better on ADVIO-15 |
+| Outdoor-2 (450 s) | XRSLAM default | 252 768 | 67.1 | 0.00 | 98% | 0 | scale collapse; GNSS alone 14.7 |
+
+Failure diagnosis (XRSLAM, from the logs: 2 state changes per run, i.e. initialised once after 1.3-9 s, never reported TRACKING_FAIL): it keeps tracking the whole time with a visually plausible trajectory (Sim3 0.56-1.6 m indoors and on ADVIO-15, 6 m on Outdoor-1) but the metric scale is lost on the long outdoor walks (ADVIO-20, Outdoor-2: scale collapses to 0, drift 60-67 m Sim3) and on ADVIO-15 with default noise. The IMU observability at 0.4-1.6 m/s walking speed is weak, scale is then not held by the sliding-window VIO (no loop closure, no GNSS). Indoors with default noise it is metric (0.84 / 0.98 m SE3), far better than OKVIS2-X (8.3 / 27 m) and the ORB-SLAM3 mono-inertial (no map) of section 9; it initialises on all six sequences, which none of OpenVINS / ORB-SLAM3-MI / VINS-Fusion did. VINS-Fusion (shipped config, IMU noise 1e-2 / 1e-1, no loop closure) initialised on 4 of 5 but its scale collapsed on all of them.
+
+GNSS fusion (own smoother, `tools/gnss_loose_fusion.py` via `tools/vio_harness/more_fusion.py`, a copy of `robust_fusion.py` with the run directory redirected; only Outdoor-1 qualifies: full coverage with metric scale, XRSLAM default, the one all-zero first pose removed):
+
+| input | ATE SE3 (m) |
+|---|---|
+| GNSS fixes alone (394 fixes) | 5.73 |
+| XRSLAM raw | 6.44 |
+| XRSLAM + GNSS, batch smoother (median scale 1.009) | 5.76 |
+| XRSLAM + GNSS, causal 30 s | 9.26 |
+| XRSLAM, one global Sim3 fit to the fixes | 6.10 |
+
+Fusion gives 5.76 m, i.e. no better than the raw fixes (5.73 m): the 1 Hz phone fixes with 14 m reported sigma add nothing to a VIO that is already at the GNSS accuracy level on this one sequence. Outdoor-2 (14.7 m GNSS) and ADVIO-20 (12.0 m) were not fused (scale collapsed, SE3 meaningless).
+
+Answer: **no system is good on phones across the board.** XRSLAM is the best new result: full coverage, no tracking loss, metric on the three short/indoor sequences and on Outdoor-1 (0.84 / 0.98 / 1.55 / 6.44 m), but its scale collapses on ADVIO-20 and Outdoor-2, and the noise setting that fixes one sequence breaks another. It is therefore a candidate for the front end of a loosely coupled phone pipeline only if the scale is supplied externally (GNSS Sim3 fit; in the Outdoor-1 test it equals GNSS alone), not a drop-in. Licence: XRSLAM Apache-2.0 (its README notes that some optional methods carry additional licences; not used here), Kimera-VIO BSD-2; VINS-Fusion and DM-VIO GPL-3 (reference only); ADVIO data CC BY-NC 4.0, Mobile-GVIO CC BY 4.0.
+Disk: builds and tools 2.0 GB in `external/vio2/` (images and datasets deleted; the shared `external/vio/data/MH_01_easy` holds 0.9 GB of re-fetched cam0 + imu0 that was left in place), results about 80 MB in `runs/`. Nothing committed.
+
+
+## 11. gnss_fusion: fixes for the open issues of 10.7 (2026-10-03)
+
+Own code, `gnss_fusion/` only. Baseline = the first `gf_config_robust()` (section 10), still available as `preset=robust1` in `gf_run`; "now" = `gf_config_robust()` with the features below. All new features are C-only and off in `gf_config_default()`, so the python-equivalent settings are unchanged: `compare_py.py` reproduces the section-10.1 table exactly (batch max 0.0008-0.0009 mm on 8 cases, causal 0.0131 / 0.0139 mm on rtk / rtk_blk, 0.31 mm o1_okvis, o2_okvis chaotic as before). Scores: `gnss_eval.score` (`benchmark.umeyama_alignment`), ATE SE3 in m; causal scored from 30 s. New cases in `gf_table.py`: `m14_okvis`, `o1d_okvis` (INSANE mars_14 / outdoor_1 first 100 s, OKVIS2 mono body poses of `runs/drone_compare/*/okvis2_mono/trajectory.tum` + PX4 GNSS in ENU, scored against the dual-RTK midpoint with its 6 cm lever), `o1_xrslam`, `o2_xrslam`, `a20_xrslam` (`runs/gnss_compare/more_systems/*_xrslam/traj.txt`, treated as metric VIO).
+
+### 11.1 What changed
+
+| issue | change (config key) | effect |
+|---|---|---|
+| 1 mono / drifting scale, causal | `trust_state_k=1.6`: distrust when the window similarity scale differs from the scale state by more than 1.6x (catches the stella collapse of Outdoor-2 where the VO shrinks ~4000x); `scale_min/max=0.25/4` (a scale state that flipped sign was seen with other thresholds); `trust_start_m=3`: the short consistency fit starts from the best contiguous sub-set instead of the all-points fit (the all-points fit is dragged by minority blocks) | o1_stella causal 15.19 -> 6.94 (GNSS alone 5.73), o2_stella 38.29 -> 17.66 (14.66) |
+| 1b / 4 yaw locked by a poor first alignment | `grow_s=120, grow_ratio=20` (metric odometry): no frozen nodes at the start until the fixes span 20x their reported sigma or 120 s; the hard freeze pinned a yaw that was 24 deg off (xrslam o1) or arbitrary (stationary start) and corrected it only at 0.5 deg/sqrt(s) | o1_xrslam 10.62 -> 6.10, o1_okvis 8.20 -> 7.39, m14 1.93 -> 1.72, o1d 8.88 -> 1.43, a15_okvis 1.48 -> 1.37; complex_* unchanged (fix span / sigma = 25 > 20 at the alignment time) |
+| 2 odometry gaps | `gnss_only_nodes=1`: while the odometry is silent for > `gap_s`, each fix makes a node without odometry link (weak position link, yaw / scale random walk continues); `gf_get_pose` returns it (`GF_ST_NO_ODOM`), `gf_node_pose(i)` for retained ones; `gf_run` writes them into `--out` / `--out-live` | output continues through tracking loss, see 11.3 |
+| 3 burst vs trust | `trust_start_m` (above) makes the fit of a window that is mostly a common-offset burst use the burst block (a translation is free in the similarity fit) instead of calling the odometry inconsistent | partial, see 11.4 |
+
+Tried and rejected (numbers on the o1/o2 stella, xrslam, orb3mono, complex_sim sets, causal): adaptive inflation of the odometry link sigma from the window residual (no effect, <0.1 m); looser boundary link to the frozen node (`freeze_sigma` 1-10 m: stella 15 -> 9 but complex_sim 2.16 -> 2.90, o2_orb3mono 2.58 -> 4.3); GNSS error-difference factors (consecutive fix residual difference with sigma 0.5-2 m, i.e. a bias random walk model: m14 1.93 -> 17.1 at 0.5, otherwise no gain); distrusted nodes weighted by the short-term GNSS noise instead of the reported sigma (o2 15.1-15.4 but o1_orb3mono batch 2.17 -> 2.9); chi2 gate before the trust test (batch o1_okvis clean 6.2 -> 10.3: the gate starves the test of fixes); longer trust windows (45-90 s: o1_okvis clean causal 8.2 -> 12.7-26); plain long windows `window_s=60..1000` (m14 / o1d / xrslam better, but complex_rtk_blk 0.67 -> 4.1 because the majority rule of the gate never lets the post-blackout fixes in, and o2_orb3mono 2.58 -> 5.0); `grow_s_mono` (growing window on monocular odometry: o2_orb3mono 2.58 -> 5.0, so it is metric-only); `trust_scale_k_mono` 1.5-2 (stella better, orb3mono 3.06 -> 4.1-4.4); `trust_rho_min` 2-3 (stella 15 -> 41 .. 14, chaotic).
+
+### 11.2 Before / after (ATE SE3 m; batch / causal30 / causal live)
+
+| sequence | GNSS alone | C robust v1 (baseline) | C robust now |
+|---|---|---|---|
+| complex_rtk | 0.00 | 0.08 / 0.09 / 0.10 | 0.08 / 0.09 / 0.10 |
+| complex_sim | 4.18 | 2.04 / 2.16 / 2.15 | 2.04 / 2.16 / 2.15 |
+| complex_rtk_blk | 0.00 | 0.26 / 0.67 / 0.67 | 0.26 / 0.67 / 0.67 |
+| complex_sim_blk | 4.33 | 1.88 / 2.17 / 2.16 | 1.88 / 2.17 / 2.16 |
+| o1_okvis | 5.73 | 6.20 / 8.20 / 8.22 | 6.14 / 7.39 / 7.40 |
+| o2_okvis | 14.66 | 14.41 / 16.62 / 16.63 | 14.41 / 16.68 / 16.70 |
+| a15_okvis | 1.56 | 1.65 / 1.48 / 1.47 | 1.65 / 1.37 / 1.36 |
+| a20_okvis | 12.00 | 11.93 / 12.13 / 12.12 | 11.93 / 12.13 / 12.13 |
+| o1_orb3mono (cov. 4.47) | 5.73 | 2.17 / 3.06 / 3.02 | 1.61 / 2.95 / 2.98 |
+| o2_orb3mono (cov. 7.08) | 14.66 | 2.53 / 2.58 / 2.52 | 2.64 / 2.58 / 2.52 |
+| a15_orb3mono | 1.56 | 1.26 / 1.04 / 1.02 | 1.25 / 0.98 / 0.96 |
+| a20_orb3mono | 12.00 | 12.12 / 12.57 / 12.52 | 12.12 / 12.51 / 12.46 |
+| o1_stella | 5.73 | 6.22 / 15.19 / 15.19 | 5.02 / 6.94 / 6.94 |
+| o2_stella | 14.66 | 13.78 / 38.29 / 38.34 | 14.56 / 17.66 / 17.67 |
+| m14_okvis (drone) | 1.37 | 1.46 / 1.93 / 1.93 | 1.46 / 1.72 / 1.72 |
+| o1d_okvis (drone, 55 s stationary start) | 2.20 | 1.47 / 8.88 / 8.88 | 1.47 / 1.43 / 1.43 |
+| o1_xrslam (phone, metric) | 5.73 | 5.18 / 10.62 / 10.62 | 5.17 / 6.10 / 6.11 |
+| o2_xrslam (scale collapse) | 14.66 | 14.55 / 16.99 / 17.01 | 14.55 / 16.99 / 17.01 |
+| a20_xrslam (scale collapse) | 12.00 | 11.99 / 12.14 / 12.15 | 11.99 / 12.14 / 12.15 |
+
+Geo-referenced (un-aligned) error, where the output is in the ENU of the fixes: complex_* identical to v1 (e.g. complex_sim 4.07 / 4.39, sim_blk 4.28 / 4.64), m14 4.15 / 4.13 (GNSS 4.08), o1d 10.45 / 10.72 (GNSS 10.73). Causal against GNSS alone: all phone and drone cases are within 1.0-1.3x except o1_okvis (1.29x, 7.39 vs 5.73), o2_stella (1.20x) and m14 (1.26x of 1.37); the target "never worse than ~1.2x" is met on 14 of 17 sequence/odometry combinations that have GNSS-alone ATE above 1 m and missed slightly on those two, o1_stella 1.21x is at the line. Regressions on good odometry: complex_*, a15 none (<= 0.00 SE3 and geo); o2_orb3mono batch +0.11 (2.53 -> 2.64: the fixes inside the map gaps now take part in the batch solve; o1_orb3mono batch improves by 0.56 for the same reason), so one batch cell exceeds the 0.05 m budget; python-vs-C stays exact.
+
+### 11.3 GNSS-only nodes in odometry gaps (`gf_studies.py gaps`)
+
+Odometry cut for 25 / 60 / 120 s in complex_sim (same frame with a jump, or an unrelated new frame); error vs GT without alignment. Without the feature there is a single pose in the gap (the first sample after it); with it one pose per fix, equal to the GNSS error (sim fixes 4.8-5.7 m in the gap, fused 4.6-5.5; RTK fixes 0.07 m), and the 30 s after the gap and the whole-run error do not change (e.g. 60 s same frame causal: after 6.06 -> 6.04, whole 4.45 -> 4.45). The real partial maps: full time line (all fix epochs, GNSS-only poses included) o1_orb3mono 2.65 / 3.73 vs GNSS alone 5.73, o2_orb3mono 2.78 / 4.19 vs 14.66, a20_orb3mono 12.12 / 12.51 vs 12.00 (batch / causal30). The 120 s gap shows what is lost without odometry: 30 s after the gap 4.8 m causal (the VIO yaw is only re-established from the fixes).
+
+### 11.4 Burst vs trust (`gf_studies.py outliers`, complex_sim, 20 s bursts with a 25 m offset; batch / causal)
+
+gate alone (Huber + gate + trimmed init) 1.96 / 5.28; robust v1 2.87 / 7.99; now 2.70 / 6.88 (spikes + burst: 2.86 / 7.39 vs 2.86 / 7.90). o1_orb3mono burst: v1 6.89 / 8.24, now 6.74 / 5.45 (gate alone 3.56 / 7.84); both: now 6.78 / 9.15. o1_okvis burst now 8.11 / 8.53 (v1 8.17 / 9.93), spikes + burst causal 8.80 (v1 19.60). Using the robust-start fit in both windows gave complex_sim burst 1.96 / 5.51 and o1_orb3mono 3.51 / 5.01, but made o2_stella causal 17.9 -> 20.8 (the long-window rule then misses it), so it is used only for the short window. The gate and the trust test still do not agree fully: the majority rule of the gate disables it when a burst covers more than half of the 30 s window, which is the remaining causal gap to the gate-alone numbers.
+
+### 11.5 Drones, long stationary start (`gf_studies.py drone`)
+
+INSANE outdoor_1, first 55 s on the ground: the yaw of the odometry w.r.t. ENU is unobservable until the drone moves; the alignment at 30 s is arbitrary in yaw. Geo-referenced error of the causal live output over the run (from 30 s): baseline 33.9 m (45-54 m in the flight part, as bad as OKVIS2-X's 47.9 m), now 10.72 m, GNSS alone 11.32, batch 10.88 (this is PX4 receiver bias of ~10 m, OKVIS2-X has the same bias plus the 48 m yaw failure). The growing window lets the yaw be re-estimated from the first seconds of motion (bins 60-90 s: 9.5, 10.3, 12.4, 14.8 vs GNSS 10.7, 12.2, 13.4, 15.1). No explicit "yaw not yet observable" flag exists; the status has no bit for it. m14: geo 4.12 causal live vs GNSS 4.09.
+
+### 11.6 Timing and remaining issues
+
+Per `gf_add_odom` that creates a node (complex_sim, 436 nodes, machine under load from other jobs, so noisy): v1 mean 1.1 ms / p50 0.58 ms; now mean 1.0 ms / p50 0.74 ms; o1d (growing window up to 120 nodes at the start) mean 2.1 ms / p50 1.3 ms, p99 8 ms; steady state with the 30 s window is as in 10.6. Memory is bounded after the growth phase (nodes are trimmed again).
+Remaining: o1_okvis causal 1.29x GNSS; the 3 m `trust_start_m` and the 20x `grow_ratio` were set from these 19 sequences (same data used for tuning and evaluation, 6 of the phone / drone combinations are ours); a burst covering most of a window is still partly accepted by the causal gate; monocular drifting-scale odometry stays worse than GNSS alone in causal mode by 1.2x (stella) since the information about the scale of a 30 s window is weak (fix noise of 14 m reported, bias random walk of ~0.85 m/sqrt(s) measured on the iPhone fixes); no marginalisation prior for the frozen boundary (an equivalent long window helped phones and drones but broke blackout recovery through the gate majority rule and o2_orb3mono); XRSLAM scale-collapsed runs (o2, a20) are only bridged by the GNSS (fused equals GNSS alone, 14.55 vs 14.66, 11.99 vs 12.00), the collapsed VO shape (Sim3 ATE 60-67 m) is not worth using.
+
+## 12. gnss_fusion: gait (step cadence) speed prior as a factor (2026-10-03)
+
+Roadmap item 1 (`docs/roadmap_research_20261003.md`, appendix A). Own code, `gnss_fusion/` only. New: `c/gf_gait.{h,c}` (streaming step detector / cadence / speed, C99, allowed headers only, 2 us per IMU sample, fixed 15 kB state), `gf_add_speed()` + config keys in `gf_fusion.{h,c}` (all off by default; `speed=1` in `gf_run`, `--speed file`), `c/gf_gait_run.c`, python prototype `tools/gait.py`, `tools/check_gait.py` (C vs python), `tools/gf_gait_study.py` (the study below) and `tools/gf_gait_report.py` (tables). Raw outputs: `gnss_fusion/work/gait_*.json`, `work/gait_study.md` (git-ignored).
+
+### 12.1 What was built
+
+* **Producer.** `an = |a|`, high-pass (EMA 0.8 s), double EMA smoothing (2 x 0.03 s), step = local maximum above `max(0.35 std, 0.3 m/s^2)` at least 0.3 s after the previous one. Epoch every 3 s over the last 6 s: cadence `(n-1)/(t_last-t_first)` (>= 4 steps, last step < 1.2 s old, 1.0..2.8 Hz), speed `v = k c cad^2`, 1-sigma `sqrt((0.2 v)^2 + 0.1^2)` (0.1 v after a per-user calibration). Not walking (shuffling, running, irregular) = state OTHER: no measurement is emitted. Still IMU (rms of the high-passed norm < 0.12 m/s^2, mean |gyro| < 0.12 rad/s over ~1.5 s, no step for 2 s) = STATIONARY: zero-velocity measurement. Gyro heading about the low-passed gravity is integrated alongside (calibration straightness test and the PDR baseline).
+* **Model.** Generic population model: `c = 0.389`, i.e. 0.70 m step at 1.8 Hz (0.415 x 1.70 m anthropometry, fitted to nothing in this repo). The exponent 2 (step length grows with cadence) was picked by leave-one-sequence-out on the four Mobile-GVIO sequences against exponents 1, 1.5, 2.5 (cross-sequence distance-ratio spread 0.85-1.18 at exponent 1, 0.90-1.11 at 2), so the Mobile "generic" numbers carry a little optimism; ADVIO is out of sample. Appendix A's linear `a + b cad` fitted on Outdoor-1 alone had a = -1.6, b = 1.55 (unstable extrapolation) and was not used.
+* **Calibration modes.** (a) *per-user*: `c` fitted on **other** sequences with a reference (c = sum v_GT / sum cad^2 over their walking epochs): each Mobile sequence is calibrated on the pooled other three (same phone and, as far as the dataset says, same person); ADVIO has no held-out walking sequence of its own (ADVIO-15 is a 0.4 m/s shuffle), so ADVIO gets the pooled Mobile `c` and is labelled **cross-user**, not per-user. (b) *online*: `gf_gait_gnss_fix()`: every 5 s, chord between the means of the fixes in the first and last 8 s of a 30 s window (variance bias removed) divided by the gait distance between the same two centres, only on straight stretches (gyro heading change <= 20 deg) with gait distance >= 15 m and fix sigma <= 20 m; `k` = (sum chords + 150 m prior) / (sum gait + 150 m prior), clamped 0.6..1.6. (c) *generic*: nothing. A fourth row "self (leak)" (c fitted on the scored sequence itself) appears only in the accuracy table as an upper bound.
+* **Smoother factor** `gf_add_speed(g, t, v, sigma, window_s, flags)`: the measurement is the mean horizontal speed over `[t - window, t]`; it attaches to the node nearest to `t`. (1) *scale form*: `s_k * (horizontal odometry path over the window) / duration = v`, Huber (2 sigma) on the per-node scale state, along odometry links of the same frame, **including distrusted links** (they still measure the path length the scale multiplies; this is what lets the scale state catch up and un-distrust a collapsed VO, section 11.1 `trust_state_k`). (2) *position form* on bridged / GNSS-only / distrusted links: horizontal node displacement `/ dt = v` with sigma `sqrt(sigma^2 + 0.3^2)`. (3) *zero velocity*: STATIONARY marks every node of the window; displacement between consecutive marked nodes = 0 with sigma `0.05 m/s * dt` (floor 1 cm). Options: `speed_align=1` aligns an odometry frame without fixes (run has < 3 fixes) from the speed alone (scale = sum v T / sum odometry path, yaw 0, position continued; monocular frames get their unit rescaled), so Indoor sequences can be solved without any GNSS; `speed_scale_rw_rel=1` makes the scale random walk and prior relative above 1; `speed_scale_lim=1e5` replaces the 0.25..4 clamp while speed is on; `speed_scale_rw` (0 = unchanged) overrides the scale random walk. The study uses `preset=robust speed=1 speed_align=1 speed_scale_rw_rel=1`.
+* **Experience while building it (all on these sequences, so treat the settings as tuned on the test data).** (i) stella Outdoor-1 causal without the gait has 356 of 393 nodes distrusted (the VO scale is far off the scale state, so the state-vs-fit test of section 11 never passes); with the scale factor skipped across distrusted links it still had 198 (the state could not move); with the factor acting through them, 16. (ii) Aligning later map frames from the speed alone when fixes exist locked a wrong yaw (Outdoor-2 ORB-SLAM3), so `speed_align` only acts while the run has had fewer than 3 fixes. (iii) A faster scale random walk helps OKVIS indoors (Indoor-2 batch 15.95 -> 6.78 at `speed_scale_rw=0.02`, Indoor-1 7.28 -> 6.18) but makes the diverged metric VIOs and Indoor-1 / Indoor-2 stella a little worse and the diverged XRSLAM scale ratios far worse (ADVIO-15 24 -> 154), so it stays off.
+
+### 12.2 Gait accuracy (3 s epochs, 6 s window; walking = GT path speed > 0.5 m/s; GT speed = 0.5 s smoothed GT path length, an upper bound on the truth)
+
+| sequence | calibration | GT-walking epochs | detected as WALK | median [IQR] | p10..p90 | distance ratio | rms rel. error | within 1 sigma | k (online) |
+|---|---|---|---|---|---|---|---|---|---|
+| outdoor1 | generic | 128 | 127 (1 OTHER) | 1.04 [1.02, 1.07] | 1.01..1.10 | 1.06 | 0.15 | 0.97 | 1.00 |
+| outdoor1 | per-user (held-out) | 128 | 127 (1 OTHER) | 1.01 [1.00, 1.04] | 0.99..1.07 | 1.03 | 0.13 | 0.95 | 1.00 |
+| outdoor1 | online GNSS | 128 | 127 (1 OTHER) | 0.95 [0.91, 0.96] | 0.89..1.01 | 0.95 | 0.15 | 0.96 | 0.88 |
+| outdoor1 | self (leak) | 128 | 127 (1 OTHER) | 0.98 [0.97, 1.01] | 0.96..1.04 | 1.00 | 0.12 | 0.97 | 1.00 |
+| outdoor2 | generic | 149 | 149 (0 OTHER) | 0.98 [0.97, 1.01] | 0.95..1.06 | 1.00 | 0.08 | 0.98 | 1.00 |
+| outdoor2 | per-user (held-out) | 149 | 149 (0 OTHER) | 0.92 [0.90, 0.94] | 0.89..0.99 | 0.93 | 0.10 | 0.96 | 1.00 |
+| outdoor2 | online GNSS | 149 | 149 (0 OTHER) | 0.95 [0.93, 0.98] | 0.89..1.01 | 0.96 | 0.10 | 0.98 | 1.01 |
+| outdoor2 | self (leak) | 149 | 149 (0 OTHER) | 0.99 [0.97, 1.01] | 0.96..1.06 | 1.00 | 0.08 | 0.97 | 1.00 |
+| indoor1 | generic | 37 | 37 (0 OTHER) | 1.09 [1.06, 1.11] | 1.04..1.14 | 1.10 | 0.15 | 0.95 | 1.00 |
+| indoor1 | per-user (held-out) | 37 | 37 (0 OTHER) | 1.05 [1.03, 1.08] | 1.01..1.11 | 1.06 | 0.13 | 0.89 | 1.00 |
+| indoor1 | self (leak) | 37 | 37 (0 OTHER) | 0.99 [0.97, 1.01] | 0.95..1.04 | 1.00 | 0.10 | 0.92 | 1.00 |
+| indoor2 | generic | 29 | 29 (0 OTHER) | 1.09 [1.07, 1.13] | 1.03..1.17 | 1.10 | 0.13 | 0.97 | 1.00 |
+| indoor2 | per-user (held-out) | 29 | 29 (0 OTHER) | 1.06 [1.04, 1.10] | 1.00..1.13 | 1.07 | 0.10 | 0.93 | 1.00 |
+| indoor2 | self (leak) | 29 | 29 (0 OTHER) | 0.99 [0.97, 1.03] | 0.94..1.06 | 1.00 | 0.06 | 0.97 | 1.00 |
+| advio15 | generic | 4 | 3 (1 OTHER) | 1.07 [0.94, 1.36] | 0.87..1.53 | 1.17 | 0.39 | 0.67 | 1.00 |
+| advio15 | cross-user (Mobile cal) | 4 | 3 (1 OTHER) | 1.03 [0.91, 1.31] | 0.84..1.48 | 1.13 | 0.36 | 0.33 | 1.00 |
+| advio20 | generic | 98 | 97 (1 OTHER) | 0.91 [0.87, 0.99] | 0.78..1.14 | 0.93 | 0.20 | 0.80 | 1.00 |
+| advio20 | cross-user (Mobile cal) | 98 | 97 (1 OTHER) | 0.88 [0.84, 0.96] | 0.76..1.10 | 0.89 | 0.20 | 0.34 | 1.00 |
+| advio20 | online GNSS | 98 | 97 (1 OTHER) | 0.91 [0.87, 0.99] | 0.78..1.15 | 0.93 | 0.20 | 0.77 | 0.99 |
+| advio20 | self (leak) | 98 | 97 (1 OTHER) | 0.98 [0.94, 1.07] | 0.85..1.23 | 1.00 | 0.21 | 0.71 | 1.00 |
+
+per-user constants c. Reading: Mobile-GVIO (same phone, same person, 394-450 s outdoor walks at 1.3 m/s, 100-120 s indoor at 1.0-1.3 m/s) is within 10 % in median and distance ratio with any calibration; the held-out per-user fit improves Outdoor-1 (1.04 -> 1.01) and the indoor sequences (1.09 -> 1.05 / 1.06) but not Outdoor-2 (0.98 -> 0.92: the other three sequences have a slightly shorter step), so per-user calibration from a short, different sequence is worth about 3-4 % in distance, not a step change. ADVIO-20 (other phone, other person, 1.5 m/s) is 7-9 % short with the generic model and 11-12 % with the Mobile constant; the self fit (leak) is 0.98 with `c = 0.420`, i.e. the person's step is 8 % longer than the population constant and 12 % longer than the Mobile person's. The online GNSS calibration did **not** help: its chords come out short (k = 0.88 on Outdoor-1: the iPhone fixes are smoothed and have 14 m sigma; an ad-hoc check that fed the GT as 1 Hz fixes gave a chord ratio of 0.945 on the same windows (not in the scripts); k = 1.01 / 0.99 on Outdoor-2 / ADVIO-20 where the chord ratio does not reveal the 9 % gait deficit of ADVIO-20) and made Outdoor-1 worse (0.95); no sequence has fixes that are good in the sense needed (the 394 Outdoor-1 fixes have sigma 14.25 m). The 6 s window gives the per-epoch scatter (rms relative error 0.08-0.15 on Mobile, 0.20 on ADVIO-20 where walking is less regular); the reported sigma covers the error in 89-98 % of Mobile epochs but only 33-34 % for the cross-user calibration (`gf_gait_set_model` switches the relative sigma to the per-user 0.1, which is overconfident for a different person; a cross-user constant should keep the generic 0.2, the study did not). ADVIO-15 is a 0.4 m/s office shuffle: 3 of its 4 GT-walking epochs are recognised, 1 is OTHER and the sequence has only 7 usable epochs (it is a failure regime of the prior, not a result). Stationary detection is untestable on the phones (no sequence stands still); on the drone IMU of INSANE outdoor_1 (55 s on the ground) 17 of 18 still epochs are flagged, 0 of 12 moving epochs are flagged still, 1 flight epoch is read as a walk (a drone is not a pedestrian).
+
+### 12.3 With GNSS (ATE SE3 m, batch / causal30; baseline columns equal section 11)
+
+| case | GNSS alone | robust (section 11) | + gait generic | + gait per-user (held-out) / cross-user | + gait online GNSS |
+|---|---|---|---|---|---|
+| Outdoor-1 stella | 5.73 | 5.02 / 6.94 | 4.95 / 6.27 | 5.09 / 7.27 | 5.64 / 9.36 |
+| Outdoor-1 orb3mono | 5.73 | 1.61 / 2.95 | 1.34 / 2.16 | 1.82 / 2.35 | 2.91 / 3.33 |
+| Outdoor-1 okvis | 5.73 | 6.14 / 7.39 | 6.07 / 7.14 | 6.04 / 7.11 | 6.16 / 7.31 |
+| Outdoor-1 xrslam | 5.73 | 5.17 / 6.10 | 5.05 / 5.89 | 5.03 / 5.82 | 5.37 / 6.47 |
+| Outdoor-2 stella | 14.66 | 14.56 / 17.66 | 14.53 / 16.85 | 14.53 / 17.06 | 14.53 / 17.43 |
+| Outdoor-2 orb3mono | 14.66 | 2.64 / 2.58 | 0.81 / 5.38 | 2.96 / 5.48 | 1.47 / 5.47 |
+| Outdoor-2 okvis | 14.66 | 14.41 / 16.68 | 14.39 / 16.62 | 14.39 / 16.80 | 14.39 / 16.73 |
+| Outdoor-2 xrslam | 14.66 | 14.55 / 16.99 | 14.53 / 16.79 | 14.52 / 16.83 | 14.52 / 16.81 |
+| ADVIO-20 stella | 12.00 | 11.92 / 12.06 | 11.76 / 12.15 | 11.78 / 12.29 | 11.72 / 12.10 |
+| ADVIO-20 orb3mono | 12.00 | 12.12 / 12.51 | 12.02 / 12.32 | 12.21 / 12.39 | 11.99 / 12.30 |
+| ADVIO-20 okvis | 12.00 | 11.93 / 12.13 | 11.92 / 12.12 | 11.93 / 12.12 | 11.92 / 12.12 |
+| ADVIO-20 xrslam | 12.00 | 11.99 / 12.14 | 11.99 / 12.13 | 11.99 / 12.13 | 11.99 / 12.13 |
+
+Against the section-11 robust preset (24 cells = 12 cases x batch / causal): the generic prior improves 15, is within 0.05 m on 7, and worsens 2 (mean change -0.13 m, ATE of the fused output is GNSS-limited here: 5.7 / 14.7 / 12.0 m GNSS alone). The worst is Outdoor-2 ORB-SLAM3 causal, 2.58 -> 5.38 (the 96 s map, 9 nodes get distrusted once the scale state follows the gait; batch 2.64 -> 0.81 is the best cell). Per-user (held-out): 7 better / 6 worse / 3 neutral, mean +0.11 m; online: 7 / 8 / 9, mean +0.25 m (Outdoor-1 stella causal +2.4 m through k = 0.88); cross-user on ADVIO-20: 2 / 2 / 4, mean 0.00. Causal fused / GNSS alone: robust preset max 1.29x (mean 0.99), + generic gait max 1.25x (mean 0.97). So the gait prior is a modest net gain with the real fixes and a generic constant; it does not change the ranking: the full-coverage inputs (stella, OKVIS2, XRSLAM) stay within +-25 % of GNSS alone and the partial ORB-SLAM3 maps still win only because they are scored on their covered epochs (section 11.2).
+
+### 12.4 Without GNSS: what the gait does to the odometry scale
+
+SE3 / Sim3 ATE (m) / scale ratio (estimated / true, from the Sim3 alignment) / path ratio (path length / GT path length), batch and causal30. The fixes are removed from the run (indoors they are useless anyway, sigma 20-65 m). Outdoor rows show the long-walk scale behaviour with no GNSS to hide behind; the Sim3 column is the shape quality the gait cannot change.
+
+| case | raw odometry | + gait generic batch | + gait generic causal30 | + gait per-user / cross-user batch | + gait per-user / cross-user causal30 |
+|---|---|---|---|---|---|
+| Outdoor-1 stella | 68.90/16.22/0.02/0.03 | 9.23/6.58/0.91/1.01 | 9.38/6.32/0.90/0.96 | 9.77/6.53/0.90/1.00 | 10.01/6.22/0.89/0.95 |
+| Outdoor-1 orb3mono | 40.52/2.81/0.06/0.06 | 1.44/0.78/0.97/0.98 | 1.14/0.74/0.98/1.00 | 2.27/0.75/0.95/0.96 | 1.97/0.70/0.95/0.97 |
+| Outdoor-1 okvis | 46.86/46.51/0.89/0.80 | 45.88/45.37/0.87/0.76 | 47.90/46.94/0.81/0.80 | 45.17/44.55/0.86/0.73 | 47.36/46.33/0.81/0.80 |
+| Outdoor-1 xrslam | 6.44/6.10/0.97/1.00 | 6.25/5.72/0.96/0.99 | 4.47/4.31/0.98/0.96 | 6.13/5.10/0.95/0.98 | 4.06/3.68/0.98/0.96 |
+| Outdoor-2 stella | 95.04/50.52/0.06/0.04 | 57.61/50.34/0.67/0.45 | 59.79/51.22/0.64/0.42 | 59.56/50.15/0.63/0.42 | 61.86/51.17/0.59/0.39 |
+| Outdoor-2 orb3mono | 30.99/0.30/0.05/0.05 | 2.64/0.25/0.92/0.92 | 2.03/0.23/0.91/0.92 | 4.57/0.31/0.86/0.86 | 3.38/0.24/0.85/0.86 |
+| Outdoor-2 okvis | 8943/86.70/185/90.16 | 99.67/56.55/2.00/1.00 | 319/51.94/4.71/2.48 | 77.33/57.64/1.64/0.86 | 171/50.48/2.91/1.75 |
+| Outdoor-2 xrslam | 252767/67.14/3440/1492 | 261/62.77/4.28/2.03 | 246/59.35/4.00/2.06 | 240/62.76/4.00/1.89 | 227/59.39/3.76/1.94 |
+| Indoor-1 stella (indoor) | 10.75/1.85/0.44/0.42 | 0.67/0.31/1.03/1.02 | 0.61/0.37/1.03/1.02 | 0.28/0.28/1.00/0.99 | 0.35/0.34/0.99/0.99 |
+| Indoor-1 orb3mono (indoor) | 17.60/15.26/0.17/0.16 | 13.09/12.97/1.13/1.05 | 14.30/14.30/1.00/1.80 | 12.38/12.34/1.07/1.08 | 13.96/13.96/0.99/1.77 |
+| Indoor-1 okvis (indoor) | 8.26/4.78/1.38/1.13 | 7.28/4.69/1.31/1.08 | 5.85/1.85/1.29/1.20 | 6.28/4.57/1.24/1.02 | 4.84/1.99/1.23/1.16 |
+| Indoor-1 xrslam (indoor) | 0.84/0.73/0.98/0.99 | 0.79/0.74/0.98/0.99 | 0.67/0.36/0.97/0.99 | 0.83/0.73/0.98/0.99 | 0.76/0.36/0.96/0.98 |
+| Indoor-2 stella (indoor) | 11.21/0.25/0.10/0.10 | 0.38/0.25/1.02/1.04 | 0.39/0.24/1.02/1.04 | 0.27/0.25/0.99/1.01 | 0.27/0.25/0.99/1.01 |
+| Indoor-2 orb3mono (indoor) | 11.22/0.29/0.10/0.10 | 0.46/0.28/1.03/1.04 | 0.44/0.19/1.03/1.03 | 0.29/0.29/1.00/1.01 | 0.19/0.19/1.00/1.00 |
+| Indoor-2 okvis (indoor) | 27.00/9.19/3.99/3.17 | 15.95/8.57/2.48/2.17 | 23.24/7.92/3.23/3.27 | 10.77/7.76/1.76/1.69 | 19.32/7.43/2.75/2.93 |
+| Indoor-2 xrslam (indoor) | 0.98/0.56/0.93/0.92 | 0.80/0.55/0.95/0.94 | 0.91/0.38/0.93/0.93 | 0.73/0.54/0.96/0.95 | 0.85/0.37/0.93/0.94 |
+| ADVIO-15 stella (indoor) | 1.16/0.81/0.39/0.35 | 1.32/1.20/1.53/1.09 | 0.54/0.54/0.99/0.98 | 1.32/1.21/1.53/1.08 | 0.54/0.54/0.98/0.96 |
+| ADVIO-15 orb3mono (indoor) | 1.36/0.89/0.32/0.28 | 1.11/1.04/1.28/1.11 | 0.54/0.54/1.01/1.02 | 1.11/1.05/1.26/1.09 | 0.54/0.54/0.99/1.00 |
+| ADVIO-15 okvis (indoor) | 1.65/1.65/0.96/0.14 | - | - | - | - |
+| ADVIO-15 xrslam (indoor) | 1451/1.59/2036/248 | 12.47/1.66/24.44/2.05 | 4.84/1.06/6.46/4.12 | 11.68/1.66/22.70/1.94 | 4.68/1.06/6.27/3.95 |
+| ADVIO-20 stella | 65.60/53.66/0.09/0.06 | 16.47/8.65/0.79/0.81 | 23.42/20.12/0.81/0.68 | 16.46/6.99/0.78/0.80 | 18.23/11.30/0.78/0.73 |
+| ADVIO-20 orb3mono | 48.97/5.98/0.27/0.27 | 11.97/3.39/0.83/0.85 | 11.78/3.03/0.82/0.83 | 13.91/3.45/0.80/0.82 | 13.51/3.14/0.80/0.80 |
+| ADVIO-20 okvis | 58.84/55.83/0.52/0.17 | 58.90/55.75/0.51/0.17 | 56.14/51.76/0.49/0.18 | 58.99/55.66/0.49/0.17 | 56.16/51.69/0.48/0.18 |
+| ADVIO-20 xrslam | 143044/60.20/4602/1014 | 1178/61.73/43.11/9.60 | 1111/55.44/30.73/10.07 | 1119/61.72/40.97/9.12 | 1052/55.41/29.13/9.54 |
+
+* **Camera-only mono (stella, ORB-SLAM3) gets metric scale.** Indoor-1/2 SE3 10.8 / 11.2 / 11.2 m -> 0.67 / 0.38 / 0.46 m with the generic constant (distance ratio 1.02-1.04) and 0.28 / 0.27 / 0.29 with the held-out per-user constant (0.99-1.01): at that point the error is the Sim3 shape error (0.25-0.31 m). Causal30 is as good as batch (0.35 / 0.27 / 0.19 per-user). Outdoor-1 ORB-SLAM3 (partial map) 40.5 -> 1.4 m, Outdoor-2 ORB-SLAM3 31.0 -> 2.6 m, ADVIO-20 ORB-SLAM3 49.0 -> 12.0 m (scale 0.83 although the gait itself is 7-9 % short for this person; Sim3 3.4 m), Outdoor-1 stella 68.9 -> 9.2 m (scale 0.91, Sim3 6.6 m over 507 m of walk with a 0.02-scale VO).
+* **Limits.** Indoor-1 ORB-SLAM3 (6 tracking losses, Sim3 15.3 m before and 13.0 m after) is shape-limited. Outdoor-2 stella (VO shrinking ~4000x over the walk) is only partly rescued (scale 0.06 -> 0.67): the scalar state with the section-11 random walk cannot follow a continuously decaying scale. Metric VIOs whose scale diverged (Outdoor-2 OKVIS2 185x, XRSLAM 3440x, ADVIO-20 XRSLAM 4602x, ADVIO-15 XRSLAM 2036x, Indoor-2 OKVIS2 4.0x) improve by up to three orders of magnitude in scale (batch 2.0x, 4.3x, 43x, 24x, 2.5x) but are not metric, and the long ones have Sim3 shapes of 52-62 m anyway. Well-behaved metric VIOs (Indoor XRSLAM 0.93-0.98, Outdoor-1 XRSLAM 0.97) are slightly better (Indoor-1 SE3 0.84 -> 0.79 batch / 0.67 causal, Indoor-2 0.98 -> 0.80 / 0.91). ADVIO-15 is outside the model (7 epochs; stella / ORB-SLAM3 batch scale 1.53 / 1.28, causal 0.99 / 1.01 on the 30-52 s tail; OKVIS2 cannot be aligned: `gf_solve_batch` returns -2).
+* **Robustness check, 'did it hurt where scale was fine'.** Outdoor-1 OKVIS2 (scale 0.89, SE3 46.9 m raw because of yaw drift) 45.9 m: unchanged, the scale was never the problem there.
+
+### 12.5 No odometry at all: gait speed + gyro-heading PDR (+ GNSS)
+
+PDR = gait odometer integrated along the gyro heading (10 Hz poses, heading offset absorbed by the smoother's yaw), smoother settings `preset=robust odom_sp=0.3 odom_kp=0.1 yaw_rw_deg=2 scale_rw=0.02 scale_prior=0.3` (physically reasoned, not tuned); no magnetometer, no camera.
+
+| sequence | calibration | PDR alone | PDR + GNSS | GNSS alone |
+|---|---|---|---|---|
+| outdoor1 | gen | 16.59/13.28/1.14/0.98 | 5.26 / 5.71 | 5.73 |
+| outdoor1 | user | 15.51/13.28/1.12/0.95 | 5.28 / 5.95 | 5.73 |
+| outdoor1 | onl | 13.46/13.31/1.03/0.88 | 5.43 / 6.95 | 5.73 |
+| outdoor2 | gen | 10.50/10.43/1.01/0.92 | 13.83 / 17.26 | 14.66 |
+| outdoor2 | user | 11.72/10.43/0.95/0.86 | 13.84 / 18.03 | 14.66 |
+| outdoor2 | onl | 11.02/10.14/0.96/0.88 | 13.87 / 17.82 | 14.66 |
+| indoor1 | gen | 1.59/1.15/1.06/1.00 | - | - |
+| indoor1 | user | 1.26/1.15/1.03/0.97 | - | - |
+| indoor2 | gen | 2.09/1.70/1.10/1.01 | - | - |
+| indoor2 | user | 1.88/1.70/1.06/0.98 | - | - |
+| advio15 | gen | 2.80/1.58/4.01/0.50 | - | - |
+| advio15 | cross | 2.71/1.58/3.87/0.48 | - | - |
+| advio20 | gen | 22.77/22.45/1.06/0.84 | 11.74 / 11.40 | 12.00 |
+| advio20 | cross | 22.49/22.45/1.02/0.81 | 11.83 / 11.46 | 12.00 |
+| advio20 | onl | 22.80/22.47/1.06/0.84 | 11.74 / 11.40 | 12.00 |
+
+PDR alone gives 1.3-2.1 m SE3 on the short indoor walks (Sim3 1.2-1.7 m, scale 1.03-1.10), 3-6x worse than stella / ORB-SLAM3 + gait (0.3-0.7 m), and is poor outdoors on long walks (gyro heading drift: Sim3 10-13 m over 500-600 m, 22 m on ADVIO-20). PDR + GNSS (batch) is 5.26 / 13.83 / 11.74 m versus GNSS alone 5.73 / 14.66 / 12.00 ; the camera-based fusions with gait reach 4.95 / 14.39 / 11.76 (best generic-gait batch of stella / OKVIS2 / XRSLAM), so PDR + GNSS is within 0.5 m of them (and lowest on Outdoor-2); causal30 5.71 / 17.26 / 11.40 (Outdoor-2 1.18x GNSS alone). With phone fixes of 5-14 m sigma, speed and heading alone buy about as much as any of the cameras on the full-coverage runs.
+
+### 12.6 Zero-velocity factor
+
+INSANE outdoor_1 (OKVIS2 odometry + PX4 GNSS, 55 s on the ground): neutral with the full odometry (batch 1.47 -> 1.47, causal 1.43 -> 1.41; the odometry is already still). With the odometry cut for t = 12..50 s (GNSS-only nodes, only the factor models motion): batch scatter of the poses about their mean 0.84 -> 0.02 m, rms error 9.48 -> 9.09 m (the 9 m PX4 receiver bias is not removable), causal 0.91 -> 0.89 (the causal output of a GNSS-only node is the estimate at the time it was made; the factor reaches only the nodes created after the measurement, which arrives with a 3 s granularity). Not evaluated on a phone (none of the six sequences stands still).
+
+### 12.7 Python vs C, regression, timing
+
+* `tools/check_gait.py`: C `gf_gait` vs `tools/gait.py` on all 6 IMU streams in three modes (generic, user constant, online with the fixes): identical states and step counts in all 18 runs, max |difference| of speed, cadence, k, heading, odometer 5e-10 (the print resolution of `gf_gait_run`).
+* Baseline discipline: `gf_table.py` re-run with the new binary: all 608 numbers (19 cases x modes, SE3 and un-aligned) and all `gf_run` summary lines identical to the section-11 `table.json`; `compare_py.py` (8 cases) reproduces section 10.1 exactly (batch max 0.0008-0.0009 mm, causal 0.0131 / 0.0139 mm rtk / rtk_blk, 0.31 mm o1_okvis, o2_okvis chaotic as before); `test_geo.py` PASS. Gait off changes nothing: no node field is touched without `speed=1` and the speed measurements are ignored.
+* Timing (one thread, this machine, loaded by other jobs): `gf_gait_push` + estimate 2.1 us per IMU sample including file parsing (39 400 samples in 83 ms); smoother `gf_add_odom` that creates a node, Outdoor-1 stella causal (393 nodes): 323 us mean / 301 p50 / 640 p99 -> 655 / 727 / 1019 us with the speed factors (a second window solve per speed epoch); `add_fix` unchanged; the whole fusion study (24 cases, up to 8 variants each, batch + causal) takes about 30 s on 12 workers.
+
+### 12.8 Open issues
+
+* Only one person per dataset and two phones: the 'per-user' result is one user with one held-out recipe; cross-user is one person. Step length changes with fatigue, shoes, carrying; running, stairs, escalators and holding styles other than hand-held are not covered (no data); cadence outside 1.0-2.8 Hz is dropped (ADVIO-15).
+* The generic constant (and exponent) is a population guess; the online GNSS calibration is not useful with 14 m / 5-30 m phone fixes (Doppler velocity from raw Android GNSS, roadmap item 4, would give per-epoch speed and calibrate k directly).
+* The gait covers scale only; yaw drift still limits long-walk shape (Outdoor-1 / -2 stella 6.3-6.6 / 50 m Sim3). Scale that decays continuously (stella Outdoor-2) or whole-map collapses (XRSLAM / OKVIS) need a faster scale state (`speed_scale_rw`) that costs accuracy elsewhere; not solved.
+* Outdoor-2 ORB-SLAM3 causal regression (2.58 -> 5.38) and Outdoor-1 stella causal staying above GNSS alone (6.27 vs 5.73) are open; online GNSS calibration is not recommended with these fixes; the zero-velocity factor in causal mode is limited by the 3 s measurement cadence.
+* Settings (scale clamp, relative random walk, `speed_align` gate) were chosen while looking at these sequences, the exponent 2 on the four Mobile sequences; ADVIO-20 and the drone are the only out-of-sample checks.
+
+
+## 13. End-to-end phone pipeline `phone_pipeline/` (roadmap item 2, 2026-10-03)
+
+Question: can the pieces (stella_vio multi-map ORB SLAM with gravity / gyro / R-frames / merge, `gf_gait` speed prior, `gf_run` robust fusion with the phone fixes) be chained into one deterministic, permissive, all-C pipeline that
+gives a continuous metric trajectory on the six phone sequences, and how does it compare with GNSS alone, XRSLAM, RD-VIO and OKVIS2? Own code (`phone_pipeline/`, MIT; README there has the run commands), nothing from GPL sources read. Images were
+re-fetched for this study with the section-9.2 scripts (Mobile-GVIO Indoor-1/2, Outdoor-1, first 450 s of Outdoor-2: 15 fps 1280x720; ADVIO-15/20: every 2nd frame, 30 fps 720x1280) and deleted after each sequence
+(peak scratch + run disk below 8 GB, about 150 MB of results left in `runs/phone_pipeline/`: `tables.md`, `<seq>/scores.json`, `<seq>/{sv_*,fuse_*}`).
+
+### 13.1 Pipeline
+
+`sv_run` (images + IMU, `--set gravity=1 rframe=1 merge=1 gyro=1`, extrinsic / time offset / gyro bias of the existing fits) writes per-frame poses with map id, R-frame flag and segment id and the gravity-aligned trajectory of every map. The adaptor
+(`run.py make_odom`) turns it into a `gf_run` odometry stream: a new map id is `GF_ODOM_NEW_FRAME` (own scale / yaw / origin: every monocular map gets its own unit, aligned from its own fixes, or from the gait speed where there are none), a new segment of the same map
+(a part bridged through a rotation-only stretch, its scale only a speed prior) is `GF_ODOM_GAP | GF_ODOM_LOOSE`, an R-frame sample (extrapolated position) is `GF_ODOM_LOOSE` (link sigma x5), tracking gaps > 2 s are detected by `gf_run` itself and
+filled with GNSS-only nodes where fixes exist. `gf_gait_run` makes the walking speed measurements from the same phone IMU (3 s epochs, 6 s window); `gf_run` uses the robust preset + `speed=1 speed_align=1 speed_scale_rw_rel=1 speed_align_metric=1`, the fixes (outdoor
+sequences only) and runs twice: batch (`batch.out`) and causal (`causal.live` = pose returned by `gf_get_pose` after every sample, only samples with the INIT bit; the first 30 s with fixes / 12 s without fixes are the alignment phase and not scored, as in sections 11/12).
+Scoring: `gnss_eval.score` (`benchmark.umeyama_alignment`) on the output resampled to the camera-frame times (bridged / GNSS-only stretches count; linear interpolation between neighbouring poses <= 2.5 s apart; coverage = frames with a pose / frames). SE3 = rigid alignment, Sim3 = with scale, scale = estimated / true from the Sim3 fit.
+The phone GT frames are LiDAR / dataset frames, not ENU, so there is no geo error against the GT; the geo-referencing check is the rms distance of the output to the fixes themselves.
+
+### 13.2 Results (one run each, deterministic: re-running fusion gives byte-identical outputs; stella_vio is deterministic by construction)
+
+### Headline: full pipeline (stella_vio gyro+R-frames+merge, gait, GNSS where usable), ATE SE3 [m], batch / causal
+
+| sequence | full pipeline batch / causal | Sim3 batch / causal | scale ratio (est/true) batch | coverage batch / causal | rms distance to the fixes (geo-referencing check) batch / causal | GNSS alone | XRSLAM | RD-VIO (xrsetting) | OKVIS2-X | best earlier fusion, full-coverage odometry (batch / causal30) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Indoor-1 | **1.16 / 1.02** | 1.15 / 0.94 | 0.99 | 100% / 100% (90% of all frames) | n/a (no fixes) | n/a | 0.84 | 0.83 | 8.26 | 0.28 (i1_stella) / 0.35 (i1_stella) |
+| Indoor-2 | **0.31 / 0.31** | 0.30 / 0.31 | 0.99 | 100% / 100% (88% of all frames) | n/a (no fixes) | n/a | 0.98 | 1.06 | 27.00 | 0.27 (i2_stella) / 0.27 (i2_stella) |
+| Outdoor-1 | **5.50 / 7.10** | 5.50 / 6.71 | 1.00 | 100% / 100% (92% of all frames) | 2.50 / 9.63 | 5.73 | 6.44 | 4.77 | 32712 | 4.95 (o1_stella) / 5.82 (o1_xrslam) |
+| Outdoor-2 | **13.28 / 15.10** | 13.12 / 9.55 | 0.98 | 100% / 100% (93% of all frames) | 5.44 / 17.81 | 14.66 | 252768 | 254661 | 8943 | 14.39 (o2_okvis) / 16.62 (o2_okvis) |
+| ADVIO-15 | **0.90 / 0.66** | 0.83 / 0.65 | 1.24 | 93% / 85% (66% of all frames) | n/a (no fixes) | n/a | 1451 | 907.64 | 1.65 | 1.32 (a15_stella) / 0.54 (a15_stella) |
+| ADVIO-20 | **11.76 / 12.32** | 4.97 / 5.27 | 0.84 | 100% / 100% (90% of all frames) | 2.89 / 4.80 | 12.00 | 143044 | 32225 | 58.84 | 11.72 (a20_stella) / 12.06 (a20_stella) |
+
+GNSS alone = the raw fixes scored the same way (SE3); XRSLAM / RD-VIO (`xrsetting`, tuned for these sequences) / OKVIS2-X = the raw trajectories of sections 9, 10 and `runs/gnss_compare/more_systems*` (metric VIOs, SE3; XRSLAM/RD-VIO scale-collapse on Outdoor-2 and ADVIO, OKVIS2-X diverges on Outdoor-1/2); the last column is the best of the earlier
+gnss_fusion tables (section 12.3 / 12.4 incl. gait variants, all odometry systems except the partial ORB-SLAM3 maps, batch / causal30 scored at the odometry sample times, i.e. a different odometry; for Indoor-1 that is stella upstream with the low-FAST config, which covered only 74 % of the sequence (30-119 s), so 0.28 is not like for like).
+
+### Ablation (ATE SE3 [m] batch / causal; first row Sim3 per map because its scale is arbitrary)
+
+| configuration | Indoor-1 | Indoor-2 | Outdoor-1 | Outdoor-2 | ADVIO-15 | ADVIO-20 |
+|---|---|---|---|---|---|---|
+| stella_vio default, camera only (Sim3 per map, batch only) | 0.88 (100%) | 0.23 (99%) | 45.74 (100%) | 30.84 (99%) | 0.61 (85%) | 39.43 (98%) |
+| + gait speed prior (no GNSS) | 0.83 / 0.68 | 0.31 / 0.33 | 7.35 / 6.02 | 37.50 / 25.18 | 1.58 / 0.87 | 14.85 / 18.03 |
+| + GNSS fixes (no gait) | n/a (no usable fixes) | n/a (no usable fixes) | 5.53 / 6.85 | 13.73 / 18.54 | n/a (no usable fixes) | 11.86 / 12.08 |
+| + gait + GNSS | 0.83 / 0.68 | 0.31 / 0.33 | 5.67 / 7.88 | 13.66 / 26.13 | 1.58 / 0.87 | 11.78 / 12.24 |
+| + R-frames + merge, + gait + GNSS | 0.83 / 0.68 | 0.31 / 0.33 | 5.50 / 8.79 | 14.06 / 18.81 | 0.89 / 0.69 | 11.73 / 12.22 |
+| full = + gyro prior (R-frames, merge, gait, GNSS) | 1.16 / 1.02 | 0.31 / 0.31 | 5.50 / 7.10 | 13.28 / 15.10 | 0.90 / 0.66 | 11.76 / 12.32 |
+| full with the dataset-calibration extrinsic instead of the sequence-fitted one (sensitivity) | 0.64 / 0.62 | 0.28 / 0.27 | 8.13 / 12.26 | 13.32 / 15.03 | 0.85 / 0.67 | 11.76 / 12.32 |
+| full, gait only (no GNSS; metric, not geo-referenced) | 1.16 / 1.02 | 0.31 / 0.31 | 6.37 / 5.16 | 13.93 / 13.68 | 0.90 / 0.66 | 11.83 / 11.76 |
+| full, GNSS only (no gait) | n/a | n/a | 5.54 / 6.98 | 13.38 / 14.28 | n/a | 11.88 / 12.51 |
+
+Row 1 is camera-only (arbitrary scale: Sim3 with one similarity per map, coverage in brackets). Rows 2-7 are `gf_run` outputs. "full, gait only" and "full, GNSS only" switch one input off. The whole matrix (every variant x mode, Sim3, scale, coverage, tracked-only, distance to the fixes) is in `runs/phone_pipeline/tables.md`.
+
+### Timing (CPU seconds, shared machine; sv_run = whole stella_vio run incl. ORB extraction at full resolution, single thread)
+
+| sequence | frames | sv_run default CPU s (ms/frame) | sv_run full CPU s (ms/frame) | gait us/IMU sample | gf_run batch s | gf_run causal s (us/frame) |
+|---|---|---|---|---|---|---|
+| Indoor-1 | 1779 | 72 (40) | 73 (41) | 23.5 | 0.01 | 0.02 (11) |
+| Indoor-2 | 1535 | 56 (37) | 57 (37) | 4.7 | 0.01 | 0.02 (11) |
+| Outdoor-1 | 5898 | 362 (61) | 363 (62) | 1.4 | 0.04 | 0.24 (41) |
+| Outdoor-2 | 6737 | 449 (67) | 457 (68) | 1.4 | 0.04 | 0.31 (46) |
+| ADVIO-15 | 1553 | 58 (37) | 56 (36) | 4.7 | 0.01 | 0.02 (11) |
+| ADVIO-20 | 9076 | 615 (68) | 619 (68) | 1.4 | 0.05 | 0.22 (24) |
+
+### gf_run call latencies (full pipeline, causal run, one thread; us)
+
+| sequence | add_odom without node (mean) | add_odom creating a node (mean / p99 / max) | add_fix (mean / p99) |
+|---|---|---|---|
+| Indoor-1 | 0.06 | 44.14 / 86.68 / 131.15 | - |
+| Indoor-2 | 0.10 | 46.33 / 106.62 / 112.01 | - |
+| Outdoor-1 | 0.06 | 519.14 / 849.32 / 2726.79 | 0.05 / 0.13 |
+| Outdoor-2 | 0.06 | 247.32 / 359.32 / 4695.89 | 257.10 / 391.21 |
+| ADVIO-15 | 0.09 | 52.37 / 161.20 / 169.00 | - |
+| ADVIO-20 | 0.06 | 520.18 / 865.58 / 3051.68 | 1.07 / 0.14 |
+
+Per frame CPU of the whole pipeline is dominated by stella_vio at full resolution (36-68 ms per frame single thread on this loaded 16-thread machine: about real time for the 15 fps Mobile-GVIO streams, 2x too slow for 30 fps ADVIO); gait about 1.4 us per IMU sample unloaded (the 4-24 us entries are
+machine noise: the table takes the last run); `gf_run` < 0.6 ms per node creation (mean) and < 5 ms worst case, batch solve < 0.1 s for the whole sequence. Machine shared with other jobs, CPU time not wall.
+
+### stella_vio events per sequence and variant (from sv_run logs): lost frames / resets / maps / R-frames / bridges / loops accepted (the final trajectory used as odometry contains the SLAM back-end corrections of these loops)
+
+| sequence | default | rm | full | fullcal |
+|---|---|---|---|---|
+| Indoor-1 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 |
+| Indoor-2 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 | 0 / 0 / 1 / 0 / 0 / 1 |
+| Outdoor-1 | 3 / 0 / 1 / 0 / 0 / 0 | 0 / 0 / 1 / 66 / 1 / 0 | 0 / 0 / 1 / 26 / 1 / 0 | 0 / 0 / 1 / 0 / 0 / 0 |
+| Outdoor-2 | 43 / 2 / 2 / 0 / 0 / 0 | 1 / 1 / 1 / 12 / 0 / 0 | 1 / 1 / 1 / 0 / 0 / 0 | 1 / 1 / 1 / 0 / 0 / 0 |
+| ADVIO-15 | 103 / 1 / 2 / 0 / 0 / 0 | 0 / 0 / 1 / 87 / 1 / 1 | 0 / 0 / 1 / 42 / 1 / 1 | 0 / 0 / 1 / 43 / 1 / 1 |
+| ADVIO-20 | 62 / 1 / 2 / 0 / 0 / 0 | 0 / 0 / 1 / 65 / 1 / 0 | 0 / 0 / 1 / 66 / 1 / 0 | 0 / 0 / 1 / 66 / 1 / 0 |
+
+Loops accepted: only the Indoor sequences (1 each, `full`) and ADVIO-15 (1). The odometry handed to the fusion is the *final* stella_vio trajectory (including those back-end corrections and merges), so the causal columns are causal in the fusion, not in the SLAM back end; a per-frame live
+pose stream was not written (needs the map labels at the time of the frame), and its difference is not measured; outdoors, where no loop was accepted, only the local BA / keyframe corrections of the SLAM differ.
+
+### 13.3 Reading
+
+* **Against XRSLAM / RD-VIO (SE3, metric)**: ahead on 4 of 6 sequences. Indoor-2 0.31 vs 0.98 / 1.06 (3x), ADVIO-15 0.90 / 0.66 vs ~1000 (both collapse to scale 0.000-0.001; OKVIS2-X 1.65), Outdoor-2 and ADVIO-20 (13.3 / 15.1 and 11.8 / 12.3 m vs XRSLAM 2.5e5 / 1.4e5 and RD-VIO 2.5e5 / 3.2e4 m: their metric scale collapses on the long walks, the
+  gait-anchored stella_vio map does not) and equal to XRSLAM on Outdoor-1 (5.50 / 7.10 vs 6.44; RD-VIO with its sequence-tuned `xrsetting` 4.77 is better). Behind on Indoor-1 with the `full` config (1.16 / 1.02 vs 0.84 XRSLAM, 0.83 RD-VIO); with the default stella_vio it is level (0.83 / 0.68 batch / causal) and with the dataset-calibration extrinsic better (`fullcal` 0.64 / 0.62).
+  Local accuracy (Sim3, Indoor-2 0.30, Indoor-1 0.8-1.15) is the monocular stella Sim3 quality; the metric part (scale 0.99 on both Indoor sequences) comes entirely from the gait speed.
+* **Against GNSS alone (5.73 / 14.66 / 12.00 m)**: batch is marginally better on all three outdoor sequences (5.50, 13.28, 11.76: -4 %, -9 %, -2 %); causal live is **not** (7.10, 15.10, 12.32: +24 %, +3 %, +3 %). The target "beat GNSS-alone causal on Outdoor-1/2, ADVIO-20" is **not met** with fixes in the loop.
+  The same pipeline **without** the fixes (gait scale only, "full, gait only"), which is metric but not geo-referenced, is below GNSS alone in causal mode on all three (5.16, 13.68, 11.76; batch 6.37, 13.93, 11.83) and Sim3 1.92 m on Outdoor-2 (a 587 m walk; its SE3 13.9 m is the 14 % gait scale deficit of that user: scale 0.86), 4.4 m on ADVIO-20.
+  With 14 m fixes (bias random walk 0.85 m/sqrt(s)) the fusion cannot beat what the gait + visual shape already gives; it adds the geo-reference (distance to the fixes 2.5-5.4 m batch) and a safety net, and in causal mode the fixes cost 1.9 m on Outdoor-1 (7.10 with, 5.16 without).
+* **What each part buys** (ablation): the gait prior is what makes the camera-only maps metric (Indoor-1/2 scale 0.99, SE3 0.83 / 0.31 from Sim3 0.88 / 0.23; Outdoor-1 45.7 m Sim3 -> 7.4 m SE3 without fixes). On Outdoor-2 and ADVIO-20 the default stella_vio splits into two maps (Lost 43 / 62 frames, 2 and 2 maps) and the gait+default result is useless
+  (37.5 m, 14.9 m) because the second map's unit is not recovered; R-frames + merge + gyro keep one map (0 / 1 Lost frames, 1 map) and bring the gait-only result to 13.9 / 11.8 m. R-frames + merge alone are not enough on Outdoor-2 (the gait-only run lands on scale 0.77, 24.9 m), the gyro prior closes it. On Outdoor-1 the full config is 5.50 vs 5.67 (default) batch, 7.10 vs 7.88 causal.
+  ADVIO-15: only the R-frame/merge variants survive (default has two maps and a 103-frame Lost stretch: 1.58 / 0.87 vs 0.89 / 0.69).
+* **Chaos**: small input changes move single-run numbers by 40-100 % (Indoor-1 full 1.16 / default 0.83 / dataset-calibration extrinsic 0.64; Outdoor-1 fullcal 8.13 / 12.26 vs full 5.50 / 7.10). The monocular front end is chaotic (stella_vio/RESULTS.md); one run per row, so only >2x differences and the structural findings (single map, metric scale) are rankings.
+
+### 13.4 Calibration honesty
+* Gait: Mobile-GVIO sequences use a per-user constant fitted on the GT speed of the other three Mobile sequences only (leave-one-out); ADVIO uses the generic 0.389 (its person is 8 % above it: scale 0.84 on ADVIO-20, ADVIO-15 is outside the model with 7 epochs and a 1.24 batch scale).
+* **Chosen / fitted on the test sequences themselves** (the task prescribed "from the existing fits"): camera-IMU rotation and time offset (`ext_fit.py` on the sequence's own visual trajectory + gyro; the dataset-calibration variant is the `fullcal` row), gyro bias (first <= 60 s of the sequence), the stella_vio defaults and R-frame / gyro parameters (tuned on `complex_environment` and Outdoor-1), the gf robust preset and gait settings (sections 11/12, same sequences),
+  `loose_k = 5` (set a priori, not tuned; no run without it), `speed_align_metric` (added after the ADVIO-15 batch run failed with "fewer than 3 usable fixes": a test-driven fix, ADVIO-15 only affected) and the 12 s alignment wait of fix-free runs (below).
+* The headline `full` config was fixed before any result was seen (it is "everything on"); it is not the best variant on every sequence (Indoor-1: default 0.83, fullcal 0.64; Outdoor-1: default+gnss 5.53). Two settings were added after seeing a first result: `speed_align_metric` (above) and the 12 s alignment wait of fix-free runs (ADVIO-15's causal output would otherwise start at 34 s of a 52 s sequence; 12 s is the only value tried). No other setting was changed after seeing a result.
+* Exploratory, not adopted (all on `full`, both, outdoor sequences, batch / causal; baseline 5.50 / 7.10, 13.28 / 15.10, 11.76 / 12.32): `trust=0` 5.45 / 7.77, 9.37 / 14.65, 11.84 / 12.35 (Outdoor-2 batch better, nothing else); `trust_state_k=0` 5.43 / 7.95, 12.91 / 14.65, 11.84 / 12.35; fix sigma x2: 5.55 / 7.46, 12.92 / 17.70, 11.71 / 12.75; x4: 6.62 / 9.76, 12.63 / 18.80, 11.93 / 12.28. None improves the causal numbers materially (best: `trust=0` on Outdoor-2 14.65 vs 15.10, while Outdoor-1 gets worse, 7.77).
+
+### 13.5 Baseline checks (all opt-in switches off, `phone_pipeline/check_baselines.sh`, log `runs/phone_pipeline/check_baselines.log`)
+stella_vio fr1_xyz (`--set reinit_sec=0 init_max_level=0 init_confirm=1`, built per `tools/run_stella_port_replay.py`) `trajectory.tum` `cmp`-identical to stella_port's sv_run (787 poses) with the new `--wait-fixtures` option present; gnss_fusion: `gf_table.py` 893 numbers and `gf_gait_study.py fusion` 1578 numbers identical to the section-11 / 12 values saved before the change, `compare_py.py` (8 cases) and `test_geo.py` PASS.
+
+### 13.6 Open issues
+* Causal is worse than GNSS alone on all three outdoor sequences (+3 .. +24 %). The gait-only stream is better, so the weakness is how the 14 m fixes (correlated, biased) enter the 30 s window; a rigid-only (yaw + translation) geo-referencing of a gait-scaled stream, or a bias state per fix source, is the next experiment (not done here).
+* The first 30 s of a causal run with fixes (12 s without) are unaligned (88-93 % of all frames covered; ADVIO-15 66 %); no pose before the first stella initialisation (about 4 s on ADVIO-15 -> batch coverage 93 %); pure PDR bridging of those stretches is not wired in.
+* Scale is only as good as the gait constant: ADVIO-20 0.84 (a longer step person), ADVIO-15 outside the model; running / stairs / non-walking not covered (OTHER state gives no measurement). Long monocular maps keep their Sim3 shape error (Outdoor-1 5.4 m, ADVIO-20 4.4-5 m).
+* The odometry is the final stella_vio trajectory (not a per-frame live stream), stella_vio at full resolution is about real time at 15 fps only, and the fusion treats a merge or loop correction as ordinary odometry.
+* Single run per row, chaotic front end; everything is on six sequences of two datasets (ADVIO is CC BY-NC 4.0: internal benchmark only).

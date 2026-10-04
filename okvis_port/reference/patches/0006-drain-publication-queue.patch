@@ -1,0 +1,32 @@
+0006: okvis_port reference determinism fix. ThreadedSlam::stopThreading shuts the publication queue down at once;
+ the publishing thread (writes the causal trajectory csv) then exits without draining it, so a loaded machine
+ loses the last published states of causal.csv (seen: 3679 of 3682 rows). The reference now waits until the queue is
+ empty before shutting it down. final.csv and all estimator results are unaffected.
+diff -ruN a/okvis_multisensor_processing/src/ThreadedSlam.cpp b/okvis_multisensor_processing/src/ThreadedSlam.cpp
+--- a/okvis_multisensor_processing/src/ThreadedSlam.cpp	2026-10-02 17:47:03.402723571 +0200
++++ b/okvis_multisensor_processing/src/ThreadedSlam.cpp	2026-10-02 17:47:03.431723374 +0200
+@@ -47,6 +47,8 @@
+ 
+ #include <glog/logging.h>
+ 
++#include <chrono>
++#include <thread>
+ #include <okvis/ThreadedSlam.hpp>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/ceres/ImuError.hpp>
+@@ -890,6 +892,15 @@
+     optimisationThread_.join(); // this should not be necessary after having called processFrame.
+   }
+ 
++  // DETERMINISTIC REFERENCE (okvis_port 0006): let the publishing thread drain the publication queue first.
++  // Upstream shuts the queue down immediately, so under load the last published states (the tail of the causal
++  // trajectory csv) are dropped depending on how far the publishing thread lags behind.
++  if (publishingThread_.joinable()) {
++    while (!publicationQueue_.Empty()) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++  }
++
+   // shutdown queues
+   imuMeasurementsReceived_.Shutdown();
+   cameraMeasurementsReceived_.Shutdown();

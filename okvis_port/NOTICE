@@ -1,0 +1,34 @@
+okvis_port: clean-room pure-C port of OKVIS2 (work in progress)
+
+Files under okvis_port/c/ derived from OKVIS2 (okvis_ceres/ImuError, okvis_kinematics, okvis_time, okvis_cv cameras: ok_imu, ok_time, ok_kin, ok_cam, ...) carry the
+OKVIS2 BSD-3-Clause notice:
+  Copyright (c) 2015, Autonomous Systems Lab / ETH Zurich
+  Copyright (c) 2020, Smart Robotics Lab / Imperial College London
+  Copyright (c) 2024, Smart Robotics Lab / Technical University of Munich
+(full text: okvis_port/LICENSES/okvis2-BSD-3-Clause.txt). Time/Duration semantics derive from ROS time (Willow
+Garage, BSD). Eigen-derived evaluation-order models (ok_eigen.c) are MPL-2.0 (Eigen 3.4.0, (c) Gael Guennebaud,
+Benoit Jacob, Jitse Niesen and the Eigen authors; SelfAdjointEigenSolver/Tridiagonalization/Householder/
+GeneralBlockPanelKernel/SelfadjointMatrixVector; ok_kin.c / ok_cam.c / ok_param.c / ok_err.c (module 3: manifolds, error terms, Eigen LLT and small-product models) also model Eigen's Quaternion-from-matrix
+assignment, redux, 2x2 inverse and small lazy products and are therefore dual-licensed BSD-3-Clause AND MPL-2.0). BRISK files (reserved path, Codex) carry their own notices.
+Module 4 (solver): ok_solve.{h,c}, ok_solve_linear.c, ok_solve_internal.h and ok_blas.{h,c} are derived from Ceres Solver
+2.2.0 (Copyright 2023 Google Inc., BSD-3-Clause, full text okvis_port/LICENSES/ceres-solver-BSD-3-Clause.txt: internal/ceres
+solver, program, reorder_program, parameter_block_ordering, graph_algorithms, block_jacobian_writer, program_evaluator,
+residual_block, corrector, loss_function, trust_region_minimizer, trust_region_step_evaluator, dogleg_strategy,
+schur_complement_solver, schur_eliminator_impl, detect_structure, dense_cholesky, invert_psd_matrix,
+sparse_normal_cholesky_solver, inner_product_computer, block_sparse_matrix, eigensparse, small_blas, small_blas_generic)
+and from OKVIS2 (ViGraph::optimise, ViSlamBackend::optimise{Realtime,Full}Graph); the names of Google Inc. and its
+contributors may not be used to endorse derived products. ok_dense.{h,c} (dynamic-size redux, GEMV, GEBP, triangular
+solvers, rank update, LLT, blocking heuristic), ok_sparse.{h,c} (SimplicialLDLT) and ok_amd.c (AMDOrdering, the
+stella_port transliteration of Eigen's Amd.h) are Eigen-derived and MPL-2.0 (Eigen's LDL/AMD code is adapted upstream
+from Timothy A. Davis's LDL/CSparse under a licence grant for MPL-2.0 distribution inside Eigen; no CSparse, CHOLMOD or
+SuiteSparse code was read or used). The reference instrumentation (okvis_port/reference/patches/0008-solver-dump.patch,
+0009-graph-twopose-problem-dump.patch) patches files of the Ceres copy inside the OKVIS2 tree and is never distributed.
+Module 5 (graph): ok_twopose.{h,c} (TwoPoseGraphError, TwoPoseStandardGraphError(Const), TwoPoseExtrinsicsGraphError(Const),
+PseudoInverse; the Cauchy corrector transcription inside compute() follows Ceres' corrector.cc) and ok_graph.{h,c}
+(ViGraph::updateLandmarks) are OKVIS2-derived (BSD-3-Clause) and, for their Eigen 3.4.0 evaluation-order models
+(small lazy products, SelfAdjointEigenSolver for n = 3 / 6 / dynamic, GEMV, fixed-size norms), MPL-2.0; ok_problem.{h,c}
+(the ceres::Problem / ProblemImpl bookkeeping that defines the program order) is derived from Ceres Solver 2.2.0
+(internal/ceres/problem_impl.cc, program.h, parameter_block.h, residual_block.h; BSD-3-Clause, Google Inc.).
+The reference build (runs/okvis_port/reference_build) links Ceres (BSD-3 + Apache-2.0 parts), glog, gflags, OpenCV,
+Boost, OpenBLAS and is never distributed. Dumps and datasets under runs/ are EuRoC-derived (non-commercial) and
+must never be committed. See docs/okvis2_license_audit.md.

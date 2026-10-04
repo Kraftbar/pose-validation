@@ -1,0 +1,767 @@
+0007: okvis_port module M3 instrumentation (error terms, information/LLT set-up, manifolds). Adds
+ okvis_ceres/include/okvis/ceres/OkvisPortErrDump.hpp (active only with OKVIS_PORT_ERR_DUMP_DIR, per-kind sampling via
+ OKVIS_PORT_ERR_EVERY, call counts printed at exit). ReprojectionError (all camera variants),
+ PoseError, SpeedAndBiasError, RelativePoseError, HomogeneousPointError::EvaluateWithMinimalJacobians (public entry point
+ wraps a renamed *PortImpl body; Evaluate calls it), every setInformation (LLT) and the variance/diagonal constructors, and
+ the PoseManifold / HomogeneousPointManifold static plus/plusJacobian/minus/minusJacobian are dumped.
+ No numerical effect; record layouts documented in okvis_port/c/ok_err.h and okvis_port/c/ok_param.h.
+diff -ruN a/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp b/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp
+--- a/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp
++++ b/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp	2026-10-03 00:25:51.892162755 +0200
+@@ -144,6 +144,10 @@
+ 
+   // sizes
+   /// \brief Residual dimension.
++  /// okvis_port: the unmodified EvaluateWithMinimalJacobians body (the public method wraps it with a dump).
++  bool EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters, double* residuals,
++                                            double** jacobians, double** jacobiansMinimal) const;
++
+   int residualDim() const override final {
+     return kNumResiduals;
+   }
+diff -ruN a/okvis_ceres/include/okvis/ceres/HomogeneousPointLocalParameterization.hpp b/okvis_ceres/include/okvis/ceres/HomogeneousPointLocalParameterization.hpp
+--- a/okvis_ceres/include/okvis/ceres/HomogeneousPointLocalParameterization.hpp
++++ b/okvis_ceres/include/okvis/ceres/HomogeneousPointLocalParameterization.hpp	2026-10-03 00:25:51.967162206 +0200
+@@ -74,6 +74,12 @@
+   /// @param[in] delta delta.
+   /// @param[out] x_plus_delta x_plus_delta.
+   /// \return true on success.
++  // okvis_port: unmodified bodies; the public statics wrap them with a dump
++  static bool plusPortImpl(const double* x, const double* delta, double* x_plus_delta);
++  static bool plusJacobianPortImpl(const double* x, double* jacobian);
++  static bool minusPortImpl(const double* y, const double* x, double* y_minus_x);
++  static bool minusJacobianPortImpl(const double* x, double* jacobian);
++
+   static bool plus(const double* x,
+                    const double* delta,
+                    double* x_plus_delta);
+diff -ruN a/okvis_ceres/include/okvis/ceres/implementation/ReprojectionError.hpp b/okvis_ceres/include/okvis/ceres/implementation/ReprojectionError.hpp
+--- a/okvis_ceres/include/okvis/ceres/implementation/ReprojectionError.hpp
++++ b/okvis_ceres/include/okvis/ceres/implementation/ReprojectionError.hpp	2026-10-03 00:25:51.980162111 +0200
+@@ -42,6 +42,7 @@
+ #include <okvis/kinematics/Transformation.hpp>
+ 
+ #include <okvis/ceres/ReprojectionError.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -74,6 +75,7 @@
+   // perform the Cholesky decomposition on order to obtain the correct error weighting
+   Eigen::LLT<Eigen::Matrix2d> lltOfInformation(information_);
+   squareRootInformation_ = lltOfInformation.matrixL().transpose();
++  okvis_porte::lltRecord(information_, squareRootInformation_);
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+@@ -88,7 +90,7 @@
+ // This evaluates the error term and additionally computes
+ // the Jacobians in the minimal internal representation.
+ template<class GEOMETRY_T>
+-bool ReprojectionError<GEOMETRY_T>::EvaluateWithMinimalJacobians(
++bool ReprojectionError<GEOMETRY_T>::EvaluateWithMinimalJacobiansPortImpl(
+     double const* const * parameters, double* residuals, double** jacobians,
+     double** jacobiansMinimal) const {
+ 
+@@ -240,5 +242,28 @@
+ }
+ 
+ 
++
++// ---- okvis_port instrumentation wrapper (dump, then return the unmodified implementation's result) ----
++template<class GEOMETRY_T>
++bool ReprojectionError<GEOMETRY_T>::EvaluateWithMinimalJacobians(
++    double const* const * parameters, double* residuals, double** jacobians,
++    double** jacobiansMinimal) const {
++  using namespace okvis_porte;
++  if (!Dump::get().on(E_REPROJ))
++    return EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  static const int sz[3] = {7,4,7};
++  static const int msz[3] = {6,3,6};
++  Buf b;
++  cameraGeometry_->portHeader(b);
++  b.f64n(measurement_.data(), 2);
++  okvis_porte::rowmajor(b, information_);
++  okvis_porte::rowmajor(b, squareRootInformation_);
++  evalIn(b, 3, sz, parameters, jacobians, jacobiansMinimal);
++  const bool r = EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  evalOut(b, 3, 2, sz, msz, r, residuals, jacobians, jacobiansMinimal, false);
++  Dump::get().write(E_REPROJ, b);
++  return r;
++}
++
+ }
+ }
+diff -ruN a/okvis_ceres/include/okvis/ceres/OkvisPortErrDump.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortErrDump.hpp
+--- a/okvis_ceres/include/okvis/ceres/OkvisPortErrDump.hpp
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortErrDump.hpp	2026-10-03 00:25:51.991162030 +0200
+@@ -0,0 +1,163 @@
++/*
++ * okvis_port reference instrumentation (NOT upstream code): binary dumps of the error terms (ReprojectionError,
++ * PoseError, SpeedAndBiasError, RelativePoseError, HomogeneousPointError), their information/LLT set-up and the
++ * pose / homogeneous-point manifolds for the pure-C port's bit-exactness checks (module M3). Active only when
++ * OKVIS_PORT_ERR_DUMP_DIR is set; OKVIS_PORT_ERR_EVERY="reproj=1000,pplus=1,..." selects every-N sampling per
++ * record kind (0 = count only, "all=N" sets the default first). One file per kind: err_<name>.bin, native-endian raw
++ * doubles / u32. Layouts are documented in okvis_port/c/ok_err.h and ok_param.h. The destructor prints the call
++ * counts (calls / written) of every kind to stderr. No dump code reads uninitialised memory.
++ */
++#ifndef OKVIS_PORT_ERR_DUMP_HPP_
++#define OKVIS_PORT_ERR_DUMP_HPP_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include <Eigen/Core>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>
++
++namespace okvis_porte {
++
++#define OKP_E_KINDS(X) \
++  X(E_REPROJ, "reproj") X(E_POSE, "pose") X(E_SAB, "sab") X(E_RELPOSE, "relpose") X(E_HPOINT, "hpoint") \
++  X(E_LLT, "llt") X(E_CTOR, "ctor") \
++  X(M_PPLUS, "pplus") X(M_PPLUSJ, "pplusj") X(M_PMINUS, "pminus") X(M_PMINUSJ, "pminusj") \
++  X(M_HPLUS, "hplus") X(M_HPLUSJ, "hplusj") X(M_HMINUS, "hminus") X(M_HMINUSJ, "hminusj")
++
++enum Kind {
++#define X(k, n) k,
++  OKP_E_KINDS(X)
++#undef X
++  NUM_KINDS
++};
++
++using Buf = okvis_portk::Buf;
++
++class Dump {
++ public:
++  static Dump& get() { static Dump d; return d; }
++  bool on(Kind k) {  // counts every call; true if this call should be recorded
++    if (!enabled_) return false;
++    std::lock_guard<std::mutex> l(m_);
++    const uint64_t c = calls_[k]++;
++    return every_[k] > 0 && (c % every_[k]) == 0;
++  }
++  void write(Kind k, const Buf& b) {
++    std::lock_guard<std::mutex> l(m_);
++    if (!f_[k]) f_[k] = std::fopen((dir_ + "/err_" + name(k) + ".bin").c_str(), "wb");
++    std::fwrite(b.b.data(), 1, b.b.size(), f_[k]);
++    written_[k]++;
++  }
++  static const char* name(int k) {
++    static const char* names[] = {
++#define X(kk, n) n,
++        OKP_E_KINDS(X)
++#undef X
++    };
++    return names[k];
++  }
++  ~Dump() {
++    if (!enabled_) return;
++    for (int k = 0; k < NUM_KINDS; ++k) {
++      if (f_[k]) std::fclose(f_[k]);
++      std::fprintf(stderr, "okvis_port err dump %s: calls=%llu written=%llu\n", name(k),
++                   (unsigned long long)calls_[k], (unsigned long long)written_[k]);
++    }
++  }
++
++ private:
++  Dump() {
++    const char* d = std::getenv("OKVIS_PORT_ERR_DUMP_DIR");
++    enabled_ = d != nullptr;
++    if (d) dir_ = d;
++    for (int k = 0; k < NUM_KINDS; ++k) { every_[k] = 1; calls_[k] = 0; written_[k] = 0; f_[k] = nullptr; }
++    const char* e = std::getenv("OKVIS_PORT_ERR_EVERY");
++    if (e) {
++      std::string s(e);
++      size_t pos = 0;
++      while (pos < s.size()) {
++        size_t end = s.find(',', pos);
++        if (end == std::string::npos) end = s.size();
++        const std::string tok = s.substr(pos, end - pos);
++        const size_t eq = tok.find('=');
++        if (eq != std::string::npos) {
++          const std::string nm = tok.substr(0, eq);
++          const uint64_t v = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
++          for (int k = 0; k < NUM_KINDS; ++k)
++            if (nm == "all" || nm == name(k)) every_[k] = v;
++        }
++        pos = end + 1;
++      }
++    }
++  }
++  bool enabled_ = false;
++  std::string dir_;
++  std::mutex m_;
++  uint64_t every_[NUM_KINDS], calls_[NUM_KINDS], written_[NUM_KINDS];
++  FILE* f_[NUM_KINDS];
++};
++
++// Evaluate record tail shared by all error terms: [u32 nblocks] per block: u32 size, f64 params[size];
++// u32 have_J (jacobians != nullptr); per block: u32 J nonnull, u32 have_Jmin, u32 Jmin nonnull;
++// then u32 return, f64 residuals[nres], per block with nonnull J: f64 J[nres*size] (row-major as written),
++// per block where the minimal Jacobian is written (Jmin nonnull and, except for SpeedAndBiasError, J nonnull):
++// f64 Jmin[nres*minsize] (row-major).
++inline void evalIn(Buf& b, int nb, const int* sz, double const* const* parameters,
++                   double* const* jacobians, double* const* jacobiansMinimal) {
++  b.u32(uint32_t(nb));
++  for (int k = 0; k < nb; ++k) { b.u32(uint32_t(sz[k])); b.f64n(parameters[k], size_t(sz[k])); }
++  b.u32(jacobians ? 1u : 0u);
++  for (int k = 0; k < nb; ++k) {
++    b.u32(jacobians && jacobians[k] ? 1u : 0u);
++    b.u32(jacobiansMinimal ? 1u : 0u);
++    b.u32(jacobiansMinimal && jacobiansMinimal[k] ? 1u : 0u);
++  }
++}
++// minIndependent: the minimal Jacobian is written even when jacobians == nullptr (SpeedAndBiasError); otherwise
++// both Jacobians are only written inside the `jacobians[k] != nullptr` branch (all other error terms).
++inline void evalOut(Buf& b, int nb, int nres, const int* sz, const int* msz, bool ret, const double* residuals,
++                    double* const* jacobians, double* const* jacobiansMinimal, bool minIndependent) {
++  b.u32(ret ? 1u : 0u);
++  b.f64n(residuals, size_t(nres));
++  for (int k = 0; k < nb; ++k)
++    if (jacobians && jacobians[k]) b.f64n(jacobians[k], size_t(nres * sz[k]));
++  for (int k = 0; k < nb; ++k) {
++    const bool w = jacobiansMinimal && jacobiansMinimal[k] && (minIndependent || (jacobians && jacobians[k]));
++    if (w) b.f64n(jacobiansMinimal[k], size_t(nres * msz[k]));
++  }
++}
++
++// Row-major dump of an Eigen matrix expression (information matrices etc.)
++template <typename D>
++inline void rowmajor(Buf& b, const Eigen::MatrixBase<D>& m) {
++  for (Eigen::Index r = 0; r < m.rows(); ++r)
++    for (Eigen::Index c = 0; c < m.cols(); ++c) b.f64(m(r, c));
++}
++
++// LLT set-up record (setInformation of every error term): u32 n, f64 information[n*n] (row-major),
++// f64 squareRootInformation[n*n] (row-major).
++template <typename D1, typename D2>
++inline void lltRecord(const Eigen::MatrixBase<D1>& info, const Eigen::MatrixBase<D2>& sq) {
++  if (!Dump::get().on(E_LLT)) return;
++  Buf b; b.u32(uint32_t(info.rows())); rowmajor(b, info); rowmajor(b, sq);
++  Dump::get().write(E_LLT, b);
++}
++// Constructor record: u32 tag (0 PoseError(T,diag) 1 PoseError(T,tv,rv) 2 SpeedAndBiasError(sb,sv,gv,av)
++// 3 RelativePoseError(tv,rv,T) 4 HomogeneousPointError(m,variance)), u32 nin, f64 in[nin], u32 n,
++// f64 information_[n*n], f64 squareRootInformation_[n*n] (row-major).
++template <typename D1, typename D2>
++inline void ctorRecord(uint32_t tag, const double* in, uint32_t nin, const Eigen::MatrixBase<D1>& info,
++                       const Eigen::MatrixBase<D2>& sq) {
++  if (!Dump::get().on(E_CTOR)) return;
++  Buf b; b.u32(tag); b.u32(nin); b.f64n(in, nin); b.u32(uint32_t(info.rows())); rowmajor(b, info); rowmajor(b, sq);
++  Dump::get().write(E_CTOR, b);
++}
++
++}  // namespace okvis_porte
++
++#endif  // OKVIS_PORT_ERR_DUMP_HPP_
+diff -ruN a/okvis_ceres/include/okvis/ceres/PoseError.hpp b/okvis_ceres/include/okvis/ceres/PoseError.hpp
+--- a/okvis_ceres/include/okvis/ceres/PoseError.hpp
++++ b/okvis_ceres/include/okvis/ceres/PoseError.hpp	2026-10-03 00:25:51.922162535 +0200
+@@ -161,6 +161,10 @@
+ 
+   // sizes
+   /// \brief Residual dimension.
++  /// okvis_port: the unmodified EvaluateWithMinimalJacobians body (the public method wraps it with a dump).
++  bool EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters, double* residuals,
++                                            double** jacobians, double** jacobiansMinimal) const;
++
+   int residualDim() const override final {
+     return kNumResiduals;
+   }
+diff -ruN a/okvis_ceres/include/okvis/ceres/PoseLocalParameterization.hpp b/okvis_ceres/include/okvis/ceres/PoseLocalParameterization.hpp
+--- a/okvis_ceres/include/okvis/ceres/PoseLocalParameterization.hpp
++++ b/okvis_ceres/include/okvis/ceres/PoseLocalParameterization.hpp	2026-10-03 00:25:51.940162404 +0200
+@@ -72,6 +72,12 @@
+   /// @param[in] delta delta.
+   /// @param[out] x_plus_delta x_plus_delta.
+   /// \return true on success.
++  // okvis_port: unmodified bodies; the public statics wrap them with a dump
++  static bool plusPortImpl(const double* x, const double* delta, double* x_plus_delta);
++  static bool plusJacobianPortImpl(const double* x, double* jacobian);
++  static bool minusPortImpl(const double* y, const double* x, double* y_minus_x);
++  static bool minusJacobianPortImpl(const double* x, double* jacobian);
++
+   static bool plus(const double* x,
+                    const double* delta,
+                    double* x_plus_delta);
+diff -ruN a/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp b/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp
+--- a/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp
++++ b/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp	2026-10-03 00:25:51.876162872 +0200
+@@ -139,6 +139,10 @@
+ 
+   // sizes
+   /// \brief Residual dimension.
++  /// okvis_port: the unmodified EvaluateWithMinimalJacobians body (the public method wraps it with a dump).
++  bool EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters, double* residuals,
++                                            double** jacobians, double** jacobiansMinimal) const;
++
+   int residualDim() const override final {
+     return kNumResiduals;
+   }
+diff -ruN a/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp b/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp
+--- a/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp
++++ b/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp	2026-10-03 00:25:51.950162330 +0200
+@@ -47,6 +47,7 @@
+ #include <okvis/ceres/PoseLocalParameterization.hpp>
+ #include <okvis/ceres/ErrorInterface.hpp>
+ #include <okvis/ceres/ReprojectionErrorBase.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ 
+ namespace okvis {
+ namespace ceres {
+@@ -165,6 +166,10 @@
+ 
+   // sizes
+   /// \brief Residual dimension.
++  /// okvis_port: the unmodified EvaluateWithMinimalJacobians body (the public method wraps it with a dump).
++  bool EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters, double* residuals,
++                                            double** jacobians, double** jacobiansMinimal) const;
++
+   int residualDim() const override final
+   {
+     return kNumResiduals;
+diff -ruN a/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp b/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp
+--- a/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp
++++ b/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp	2026-10-03 00:25:51.908162638 +0200
+@@ -156,6 +156,10 @@
+ 
+   // sizes
+   /// \brief Residual dimension.
++  /// okvis_port: the unmodified EvaluateWithMinimalJacobians body (the public method wraps it with a dump).
++  bool EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters, double* residuals,
++                                            double** jacobians, double** jacobiansMinimal) const;
++
+   int residualDim() const override final {
+     return kNumResiduals;
+   }
+diff -ruN a/okvis_ceres/src/HomogeneousPointError.cpp b/okvis_ceres/src/HomogeneousPointError.cpp
+--- a/okvis_ceres/src/HomogeneousPointError.cpp
++++ b/okvis_ceres/src/HomogeneousPointError.cpp	2026-10-03 00:25:51.863162967 +0200
+@@ -40,6 +40,7 @@
+ #include <Eigen/LU>
+ 
+ #include <okvis/ceres/HomogeneousPointError.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ #include <okvis/ceres/HomogeneousPointLocalParameterization.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+@@ -59,6 +60,8 @@
+     const Eigen::Vector4d & measurement, double variance) {
+   setMeasurement(measurement);
+   setInformation(Eigen::Matrix3d::Identity() * 1.0 / variance);
++  { double in[5] = {measurement[0], measurement[1], measurement[2], measurement[3], variance};
++    okvis_porte::ctorRecord(4, in, 5, information_, _squareRootInformation); }
+ }
+ 
+ // Construct with measurement and variance.
+@@ -68,6 +71,7 @@
+   // perform the Cholesky decomposition on order to obtain the correct error weighting
+   Eigen::LLT<information_t> lltOfInformation(information_);
+   _squareRootInformation = lltOfInformation.matrixL().transpose();
++  okvis_porte::lltRecord(information_, _squareRootInformation);
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+@@ -79,7 +83,7 @@
+ 
+ // This evaluates the error term and additionally computes
+ // the Jacobians in the minimal internal representation.
+-bool HomogeneousPointError::EvaluateWithMinimalJacobians(
++bool HomogeneousPointError::EvaluateWithMinimalJacobiansPortImpl(
+     double const* const * parameters, double* residuals, double** jacobians,
+     double** jacobiansMinimal) const {
+ 
+@@ -124,6 +128,26 @@
+   return true;
+ }
+ 
++
++// ---- okvis_port instrumentation wrapper (dump, then return the unmodified implementation's result) ----
++bool HomogeneousPointError::EvaluateWithMinimalJacobians(
++    double const* const * parameters, double* residuals, double** jacobians,
++    double** jacobiansMinimal) const {
++  using namespace okvis_porte;
++  if (!Dump::get().on(E_HPOINT))
++    return EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  static const int sz[1] = {4};
++  static const int msz[1] = {3};
++  Buf b;
++  b.f64n(measurement_.data(), 4);
++  okvis_porte::rowmajor(b, _squareRootInformation);
++  evalIn(b, 1, sz, parameters, jacobians, jacobiansMinimal);
++  const bool r = EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  evalOut(b, 1, 3, sz, msz, r, residuals, jacobians, jacobiansMinimal, false);
++  Dump::get().write(E_HPOINT, b);
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis
+ 
+diff -ruN a/okvis_ceres/src/HomogeneousPointLocalParameterization.cpp b/okvis_ceres/src/HomogeneousPointLocalParameterization.cpp
+--- a/okvis_ceres/src/HomogeneousPointLocalParameterization.cpp
++++ b/okvis_ceres/src/HomogeneousPointLocalParameterization.cpp	2026-10-03 00:25:51.795163466 +0200
+@@ -40,11 +40,13 @@
+ #include <okvis/assert_macros.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
++
+ namespace okvis {
+ /// \brief ceres Namespace for ceres-related functionality implemented in okvis.
+ namespace ceres {
+ 
+-bool HomogeneousPointManifold::plus(
++bool HomogeneousPointManifold::plusPortImpl(
+     const double* x, const double* delta, double* x_plus_delta)
+ {
+   Eigen::Map<const Eigen::Vector3d> delta_(delta);
+@@ -61,7 +63,7 @@
+   return plus(x, delta, x_plus_delta);
+ }
+ 
+-bool HomogeneousPointManifold::plusJacobian(const double* /*x*/, double* jacobian)
++bool HomogeneousPointManifold::plusJacobianPortImpl(const double* /*x*/, double* jacobian)
+ {
+   Eigen::Map<Eigen::Matrix<double, 4, 3, Eigen::RowMajor> > Jp(jacobian);
+ 
+@@ -75,7 +77,7 @@
+   return plusJacobian(x, jacobian);
+ }
+ 
+-bool HomogeneousPointManifold::minus(
++bool HomogeneousPointManifold::minusPortImpl(
+     const double* y, const double* x, double* y_minus_x)
+ {
+ 
+@@ -94,7 +96,7 @@
+ }
+ 
+ 
+-bool HomogeneousPointManifold::minusJacobian(const double* /*x*/, double* jacobian)
++bool HomogeneousPointManifold::minusJacobianPortImpl(const double* /*x*/, double* jacobian)
+ {
+   Eigen::Map<Eigen::Matrix<double, 3, 4, Eigen::RowMajor> > Jp(jacobian);
+ 
+@@ -108,5 +110,48 @@
+   return minusJacobian(x, jacobian);
+ }
+ 
++
++// ---- okvis_port instrumentation wrappers (dump, then return the unmodified implementation's result) ----
++bool HomogeneousPointManifold::plus(const double* x, const double* delta, double* x_plus_delta)
++{
++  using namespace okvis_porte;
++  if (!Dump::get().on(M_HPLUS)) return plusPortImpl(x, delta, x_plus_delta);
++  Buf b; b.f64n(x, 4); b.f64n(delta, 3);
++  const bool r = plusPortImpl(x, delta, x_plus_delta);
++  b.u32(r ? 1u : 0u); b.f64n(x_plus_delta, 4);
++  Dump::get().write(M_HPLUS, b);
++  return r;
++}
++
++bool HomogeneousPointManifold::plusJacobian(const double* x, double* jacobian)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_HPLUSJ);
++  Buf b; if (rec) b.f64n(x, 4);
++  const bool r = plusJacobianPortImpl(x, jacobian);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(jacobian, 12); Dump::get().write(M_HPLUSJ, b); }
++  return r;
++}
++
++bool HomogeneousPointManifold::minus(const double* y, const double* x, double* y_minus_x)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_HMINUS);
++  Buf b; if (rec) { b.f64n(y, 4); b.f64n(x, 4); }
++  const bool r = minusPortImpl(y, x, y_minus_x);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(y_minus_x, 3); Dump::get().write(M_HMINUS, b); }
++  return r;
++}
++
++bool HomogeneousPointManifold::minusJacobian(const double* x, double* jacobian)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_HMINUSJ);
++  Buf b; if (rec) b.f64n(x, 4);
++  const bool r = minusJacobianPortImpl(x, jacobian);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(jacobian, 12); Dump::get().write(M_HMINUSJ, b); }
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis
+diff -ruN a/okvis_ceres/src/PoseError.cpp b/okvis_ceres/src/PoseError.cpp
+--- a/okvis_ceres/src/PoseError.cpp
++++ b/okvis_ceres/src/PoseError.cpp	2026-10-03 00:25:51.821163275 +0200
+@@ -37,6 +37,7 @@
+  */
+ 
+ #include <okvis/ceres/PoseError.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ #include <okvis/ceres/PoseLocalParameterization.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+@@ -56,6 +57,10 @@
+   setMeasurement(measurement);
+   information_ = informationDiagonal.asDiagonal();
+   squareRootInformation_ = informationDiagonal.array().sqrt().matrix().asDiagonal();
++  { double in[13];
++    for (int i = 0; i < 7; ++i) in[i] = measurement.coeffs().data()[i];
++    for (int i = 0; i < 6; ++i) in[7 + i] = informationDiagonal[i];
++    okvis_porte::ctorRecord(0, in, 13, information_, squareRootInformation_); }
+ }
+ 
+ // Construct with measurement and variance.
+@@ -80,6 +85,7 @@
+   // perform the Cholesky decomposition on order to obtain the correct error weighting
+   Eigen::LLT<information_t> lltOfInformation(information_);
+   squareRootInformation_ = lltOfInformation.matrixL().transpose();
++  okvis_porte::lltRecord(information_, squareRootInformation_);
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+@@ -90,7 +96,7 @@
+ 
+ // This evaluates the error term and additionally computes
+ // the Jacobians in the minimal internal representation.
+-bool PoseError::EvaluateWithMinimalJacobians(double const* const * parameters,
++bool PoseError::EvaluateWithMinimalJacobiansPortImpl(double const* const * parameters,
+                                              double* residuals,
+                                              double** jacobians,
+                                              double** jacobiansMinimal) const {
+@@ -144,5 +150,25 @@
+   return true;
+ }
+ 
++
++// ---- okvis_port instrumentation wrapper (dump, then return the unmodified implementation's result) ----
++bool PoseError::EvaluateWithMinimalJacobians(
++    double const* const * parameters, double* residuals, double** jacobians,
++    double** jacobiansMinimal) const {
++  using namespace okvis_porte;
++  if (!Dump::get().on(E_POSE))
++    return EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  static const int sz[1] = {7};
++  static const int msz[1] = {6};
++  Buf b;
++  b.f64n(measurement_.coeffs().data(), 7);
++  okvis_porte::rowmajor(b, squareRootInformation_);
++  evalIn(b, 1, sz, parameters, jacobians, jacobiansMinimal);
++  const bool r = EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  evalOut(b, 1, 6, sz, msz, r, residuals, jacobians, jacobiansMinimal, false);
++  Dump::get().write(E_POSE, b);
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis
+diff -ruN a/okvis_ceres/src/PoseLocalParameterization.cpp b/okvis_ceres/src/PoseLocalParameterization.cpp
+--- a/okvis_ceres/src/PoseLocalParameterization.cpp
++++ b/okvis_ceres/src/PoseLocalParameterization.cpp	2026-10-03 00:25:51.809163363 +0200
+@@ -42,11 +42,13 @@
+ #include <okvis/kinematics/Transformation.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
++
+ namespace okvis {
+ /// \brief ceres Namespace for ceres-related functionality implemented in okvis.
+ namespace ceres {
+ 
+-bool PoseManifold::plus(
++bool PoseManifold::plusPortImpl(
+     const double* x, const double* delta, double* x_plus_delta)
+ {
+   Eigen::Map<const Eigen::Matrix<double, 6, 1> > delta_(delta);
+@@ -73,7 +75,7 @@
+   return plus(x, delta, x_plus_delta);
+ }
+ 
+-bool PoseManifold::plusJacobian(const double* x, double* jacobian)
++bool PoseManifold::plusJacobianPortImpl(const double* x, double* jacobian)
+ {
+   Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor> > Jp(jacobian);
+   Jp.setZero();
+@@ -90,7 +92,7 @@
+   return plusJacobian(x, jacobian);
+ }
+ 
+-bool PoseManifold::minus(
++bool PoseManifold::minusPortImpl(
+     const double* y, const double* x, double* y_minus_x)
+ {
+   y_minus_x[0] = y[0] - x[0];
+@@ -107,7 +109,7 @@
+   return minus(y, x, y_minus_x);
+ }
+ 
+-bool PoseManifold::minusJacobian(const double* x, double* jacobian)
++bool PoseManifold::minusJacobianPortImpl(const double* x, double* jacobian)
+ {
+   Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor> > J_lift(jacobian);
+   const Eigen::Quaterniond q_inv(x[6], -x[3], -x[4], -x[5]);
+@@ -156,5 +158,48 @@
+   }
+ }
+ 
++
++// ---- okvis_port instrumentation wrappers (dump, then return the unmodified implementation's result) ----
++bool PoseManifold::plus(const double* x, const double* delta, double* x_plus_delta)
++{
++  using namespace okvis_porte;
++  if (!Dump::get().on(M_PPLUS)) return plusPortImpl(x, delta, x_plus_delta);
++  Buf b; b.f64n(x, 7); b.f64n(delta, 6);
++  const bool r = plusPortImpl(x, delta, x_plus_delta);
++  b.u32(r ? 1u : 0u); b.f64n(x_plus_delta, 7);
++  Dump::get().write(M_PPLUS, b);
++  return r;
++}
++
++bool PoseManifold::plusJacobian(const double* x, double* jacobian)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_PPLUSJ);
++  Buf b; if (rec) b.f64n(x, 7);
++  const bool r = plusJacobianPortImpl(x, jacobian);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(jacobian, 42); Dump::get().write(M_PPLUSJ, b); }
++  return r;
++}
++
++bool PoseManifold::minus(const double* y, const double* x, double* y_minus_x)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_PMINUS);
++  Buf b; if (rec) { b.f64n(y, 7); b.f64n(x, 7); }
++  const bool r = minusPortImpl(y, x, y_minus_x);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(y_minus_x, 6); Dump::get().write(M_PMINUS, b); }
++  return r;
++}
++
++bool PoseManifold::minusJacobian(const double* x, double* jacobian)
++{
++  using namespace okvis_porte;
++  const bool rec = Dump::get().on(M_PMINUSJ);
++  Buf b; if (rec) b.f64n(x, 7);
++  const bool r = minusJacobianPortImpl(x, jacobian);
++  if (rec) { b.u32(r ? 1u : 0u); b.f64n(jacobian, 42); Dump::get().write(M_PMINUSJ, b); }
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis
+diff -ruN a/okvis_ceres/src/RelativePoseError.cpp b/okvis_ceres/src/RelativePoseError.cpp
+--- a/okvis_ceres/src/RelativePoseError.cpp
++++ b/okvis_ceres/src/RelativePoseError.cpp	2026-10-03 00:25:51.845163099 +0200
+@@ -37,6 +37,7 @@
+  */
+ 
+ #include <okvis/ceres/RelativePoseError.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ #include <okvis/ceres/PoseLocalParameterization.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+@@ -72,6 +73,7 @@
+   // perform the Cholesky decomposition on order to obtain the correct error weighting
+   Eigen::LLT<information_t> lltOfInformation(information_);
+   squareRootInformation_ = lltOfInformation.matrixL().transpose();
++  okvis_porte::lltRecord(information_, squareRootInformation_);
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+@@ -82,7 +84,7 @@
+ 
+ // This evaluates the error term and additionally computes
+ // the Jacobians in the minimal internal representation.
+-bool RelativePoseError::EvaluateWithMinimalJacobians(
++bool RelativePoseError::EvaluateWithMinimalJacobiansPortImpl(
+     double const* const * parameters, double* residuals, double** jacobians,
+     double** jacobiansMinimal) const {
+ 
+@@ -166,6 +168,26 @@
+   return true;
+ }
+ 
++
++// ---- okvis_port instrumentation wrapper (dump, then return the unmodified implementation's result) ----
++bool RelativePoseError::EvaluateWithMinimalJacobians(
++    double const* const * parameters, double* residuals, double** jacobians,
++    double** jacobiansMinimal) const {
++  using namespace okvis_porte;
++  if (!Dump::get().on(E_RELPOSE))
++    return EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  static const int sz[2] = {7,7};
++  static const int msz[2] = {6,6};
++  Buf b;
++  b.f64n(T_AB_.coeffs().data(), 7);
++  okvis_porte::rowmajor(b, squareRootInformation_);
++  evalIn(b, 2, sz, parameters, jacobians, jacobiansMinimal);
++  const bool r = EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  evalOut(b, 2, 6, sz, msz, r, residuals, jacobians, jacobiansMinimal, false);
++  Dump::get().write(E_RELPOSE, b);
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis
+ 
+diff -ruN a/okvis_ceres/src/SpeedAndBiasError.cpp b/okvis_ceres/src/SpeedAndBiasError.cpp
+--- a/okvis_ceres/src/SpeedAndBiasError.cpp
++++ b/okvis_ceres/src/SpeedAndBiasError.cpp	2026-10-03 00:25:51.834163180 +0200
+@@ -37,6 +37,7 @@
+  */
+ 
+ #include <okvis/ceres/SpeedAndBiasError.hpp>
++#include <okvis/ceres/OkvisPortErrDump.hpp>  // okvis_port instrumentation
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -76,6 +77,7 @@
+   // perform the Cholesky decomposition on order to obtain the correct error weighting
+   Eigen::LLT<information_t> lltOfInformation(information_);
+   squareRootInformation_ = lltOfInformation.matrixL().transpose();
++  okvis_porte::lltRecord(information_, squareRootInformation_);
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+@@ -86,7 +88,7 @@
+ 
+ // This evaluates the error term and additionally computes
+ // the Jacobians in the minimal internal representation.
+-bool SpeedAndBiasError::EvaluateWithMinimalJacobians(
++bool SpeedAndBiasError::EvaluateWithMinimalJacobiansPortImpl(
+     double const* const * parameters, double* residuals, double** jacobians,
+     double** jacobiansMinimal) const {
+ 
+@@ -117,5 +119,25 @@
+   return true;
+ }
+ 
++
++// ---- okvis_port instrumentation wrapper (dump, then return the unmodified implementation's result) ----
++bool SpeedAndBiasError::EvaluateWithMinimalJacobians(
++    double const* const * parameters, double* residuals, double** jacobians,
++    double** jacobiansMinimal) const {
++  using namespace okvis_porte;
++  if (!Dump::get().on(E_SAB))
++    return EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  static const int sz[1] = {9};
++  static const int msz[1] = {9};
++  Buf b;
++  b.f64n(measurement_.data(), 9);
++  okvis_porte::rowmajor(b, squareRootInformation_);
++  evalIn(b, 1, sz, parameters, jacobians, jacobiansMinimal);
++  const bool r = EvaluateWithMinimalJacobiansPortImpl(parameters, residuals, jacobians, jacobiansMinimal);
++  evalOut(b, 1, 9, sz, msz, r, residuals, jacobians, jacobiansMinimal, true);
++  Dump::get().write(E_SAB, b);
++  return r;
++}
++
+ }  // namespace ceres
+ }  // namespace okvis

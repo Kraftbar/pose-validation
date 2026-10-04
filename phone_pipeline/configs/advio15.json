@@ -1,0 +1,55 @@
+{
+ "name": "advio15",
+ "dataset": "ADVIO (CC BY-NC 4.0)",
+ "data_dir": "external/gnss/rob/advio15",
+ "rgb_dir": "external/gnss/rob/advio15/tum",
+ "imu": "external/gnss/rob/advio15/imu0/data.csv",
+ "size": "720x1280",
+ "camera": "1082.4,1084.4,364.6778,643.308,0.0366,0.0803,0.000783,-0.000215,0.0",
+ "camera_note": "fx,fy,cx,cy,k1,k2,p1,p2,k3 from tools/gnss_harness/robust_cfg/advio15/port_camera.txt (dataset calibration)",
+ "imu_ext": [
+  0.99995399,
+  0.00603314,
+  0.007457863,
+  0.006055044,
+  -0.999977411,
+  -0.002918009,
+  0.00744009,
+  0.002963032,
+  -0.999967932,
+  0.00925398,
+  0.07551991,
+  -0.00577099
+ ],
+ "imu_ext_note": "R_BC (9, row-major) + t (3): runs/stella_vio/imu/ext_advio15_stella_fit.txt, rotation fitted from a visual trajectory + gyro of the SAME sequence (stella_vio/tools/ext_fit.py); the dataset-calibration variant is ext_advio15_stella_cal.txt / ext_advio15.txt",
+ "imu_toff": -0.31,
+ "imu_toff_note": "camera->IMU clock offset [s] from the same fit (ext_fit.py)",
+ "imu_bg": [
+  -0.00035,
+  0.00668,
+  -0.0078
+ ],
+ "imu_bg_note": "gyro bias from the first <=60 s visual fit (runs/stella_vio/imu/gyro_pred.md); only used by gyro=1",
+ "fixes": null,
+ "fixes_note": "indoor fixes are unusable (sigma 20-67 m): the run is GNSS-free",
+ "gait": {
+  "mode": "generic",
+  "c": null,
+  "note": "generic population constant 0.389 (another person/phone than Mobile-GVIO, no held-out calibration sequence of the same user)"
+ },
+ "imu_ext_cal": [
+  0.99997634,
+  -0.00406639,
+  -0.0055487,
+  -0.00407921,
+  -0.99998903,
+  -0.00230086,
+  -0.00553929,
+  0.00232344,
+  -0.99998196,
+  0.00925398,
+  0.07551991,
+  -0.00577099
+ ],
+ "imu_ext_cal_note": "dataset-calibration extrinsic (runs/stella_vio/imu/ext_advio15.txt), no fit to the sequence; used by the sensitivity variant fullcal"
+}

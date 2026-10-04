@@ -1,0 +1,81 @@
+--- a/src/harris-score-calculator.cc
++++ b/src/harris-score-calculator.cc
+@@ -65,6 +65,7 @@
+ 
+ void HarrisScoreCalculator::InitializeScores() {
+   HarrisScoresSSE(_img, _scores);
++  ok_trace("scores", _scores.data, _scores.total()*4);
+ }
+ 
+ void HarrisScoreCalculator::Get2dMaxima(std::vector<PointWithScore>& points,  // NOLINT
+--- a/include/brisk/internal/scale-space-layer-inl.h
++++ b/include/brisk/internal/scale-space-layer-inl.h
+@@ -222,6 +222,7 @@
+     /*brisk::timing::DebugTimer timerNonMaxSuppression2d(
+         "0.2 BRISK Detection: 2d nonmax suppression (per layer)");*/
+     _scoreCalculator.Get2dMaxima(points, _absoluteThreshold);
++    ok_trace("maxima", points.data(), points.size()*sizeof(points[0]));
+     //timerNonMaxSuppression2d.Stop();
+   }
+   // Next check above and below. The code looks a bit stupid, but that's
+--- a/include/brisk/internal/uniformity-enforcement-inl.h
++++ b/include/brisk/internal/uniformity-enforcement-inl.h
+@@ -65,6 +65,7 @@
+ 
+   // Sort.
+   std::sort(points.begin(), points.end());
++  ok_trace("sorted", points.data(), points.size()*sizeof(points[0]));
+   const float maxScore = points.front().score;
+   //timer_sort_keypoints.Stop();
+ 
+@@ -202,6 +203,7 @@
+     }  // Limit the max number if necessary.
+   }
+   points.assign(pt_tmp.begin(), pt_tmp.end());
++  ok_trace("selected", points.data(), points.size()*sizeof(points[0]));
+ 
+   //timer_uniformity_enforcement.Stop();
+ }
+--- a/src/brisk-descriptor-extractor.cc
++++ b/src/brisk-descriptor-extractor.cc
+@@ -625,6 +625,7 @@
+     keypoints.swap(valid_kp);
+     kscales.swap(valid_scales);
+     ksize = keypoints.size();
++    ok_trace("filtered", keypoints.data(),keypoints.size()*sizeof(cv::KeyPoint));
+     AllocateDescriptors(keypoints.size(), descriptors);
+ 
+     // First, calculate the integral image over the whole image:
+@@ -636,6 +637,7 @@
+       IntegralImage16(imageScaled, &_integral);
+     } else if (image.type() == CV_8UC1) {
+       IntegralImage8(image, &_integral);
++      ok_trace("integral",_integral.data,_integral.total()*4);
+     } else {
+       throw std::runtime_error("Unsupported image format. Must be CV_16UC1 or CV_8UC1.");
+     }
+@@ -724,6 +726,8 @@
+         }
+       }
+ 
++      float tracewarp[6] = {warpptr ? warpptr[0] : 0,warpptr ? warpptr[1] : 0,warpptr ? warpptr[2] : 0,warpptr ? warpptr[3] : 0,sigmaScale,float(directional)};
++      ok_trace("warp",tracewarp,sizeof(tracewarp));
+       // compute angle
+       //if(!directional) {
+       //  kp.angle = -1; // not directional...
+@@ -746,6 +750,7 @@
+                                                     scale, 0, i));
+             }
+           }
++          ok_trace("orientation_values",_values,points_*4);
+           int direction0 = 0;
+           int direction1 = 0;
+           // Now iterate through the long pairings.
+@@ -801,6 +806,7 @@
+         }
+       }
+ 
++      ok_trace("values",_values,points_*4);
+       setDescriptorBits(k, _values, &descriptors);
+     }
+     delete[] _values;

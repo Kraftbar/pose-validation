@@ -1,0 +1,29 @@
+Patch 0014 -- opt-in fixed-seed value (fr2_xyz gap investigation, 2026-10-02)
+
+util::create_random_engine(use_fixed_seed=true) returns std::mt19937() (seed 5489). With env
+STELLA_PORT_SEED=<uint> set it returns std::mt19937(<uint>) instead (still deterministic).
+Unset -> byte-identical behaviour. Every RANSAC engine (initializer F/H/E, tracker robust matcher,
+relocalizer PnP, loop detector) goes through this one function.
+
+--- a/src/stella_vslam/util/random_array.cc	2026-10-02 17:26:04.321542901 +0200
++++ b/src/stella_vslam/util/random_array.cc	2026-10-02 17:26:04.322542889 +0200
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <functional>
+ #include <cassert>
++#include <cstdlib>
+ 
+ namespace stella_vslam {
+ namespace util {
+@@ -18,6 +19,11 @@
+     g_random_engines_created.fetch_add(1, std::memory_order_relaxed); // [reference-port]
+     std::mt19937 random_engine;
+     if (use_fixed_seed) {
++        // [reference-port 0014] opt-in: STELLA_PORT_SEED=<uint> selects a different (still fixed) seed;
++        // unset -> default-constructed engine (seed 5489) exactly as before.
++        if (const char* env_seed = std::getenv("STELLA_PORT_SEED")) {
++            return std::mt19937(static_cast<std::uint_fast32_t>(std::strtoul(env_seed, nullptr, 10)));
++        }
+         return std::mt19937();
+     }
+     else {

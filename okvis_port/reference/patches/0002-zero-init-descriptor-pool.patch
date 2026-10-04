@@ -1,0 +1,19 @@
+0002: zero-initialise the matcher's descriptor pool in Frontend::matchToMap. Upstream allocates
+ `cv::Mat(3*numLandmarks, 48, CV_8UC1)` uninitialised; a landmark whose observations are all filtered out (viewpoint /
+ scale gates) still keeps row 0 (`descriptors(Rect(0,0,48,o+1))` with o = 0), so the matcher compares keypoints
+ against heap garbage. Found by bisecting run-to-run divergence (patch 0004 traces): the landmark-set hash offered
+ to the matcher differed between runs while keypoints/descriptors of the frame were identical.
+diff -ruN a/okvis_frontend/src/Frontend.cpp B/okvis_frontend/src/Frontend.cpp
+--- a/okvis_frontend/src/Frontend.cpp	2026-10-01 22:14:44.462106635 +0200
++++ b/okvis_frontend/src/Frontend.cpp	2026-10-01 22:14:44.563106812 +0200
+@@ -1314,6 +1314,10 @@
+     const size_t numDescriptorsToKeep = 3; // use only best 3
+     descriptorPool[im] = cv::Mat(
+         int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
++    // DETERMINISTIC REFERENCE: upstream leaves this pool uninitialised, yet a landmark whose observations are all
++    // filtered out still keeps descriptor row 0 (rows = o + 1 with o = 0), which the matcher then compares against
++    // the keypoint descriptors: heap garbage => run-to-run nondeterministic matches.
++    descriptorPool[im].setTo(cv::Scalar(0));
+     uchar* dataPtr = descriptorPool[im].data;
+     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
+       if(loopClosureLandmarksToUseExclusively) {

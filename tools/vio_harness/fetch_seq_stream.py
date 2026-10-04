@@ -39,7 +39,7 @@ def main():
     seq = sys.argv[1]
     want = (sys.argv[2] if len(sys.argv) > 2 else 'cam0,imu0').split(',')
     grp = {'MH': 'machine_hall', 'V1': 'vicon_room1', 'V2': 'vicon_room2'}[seq[:2]]
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "external", "vio", "data", seq)
+    root = os.path.join(os.environ.get("VIO_DATA_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "external", "vio", "data"), seq)
     z = zipfile.ZipFile(io.BufferedReader(HTTPFile(OUT[grp]), buffer_size=1 << 22))
     s = Stream(z.open(f'{grp}/{seq}/{seq}.zip'))
     nfiles = 0

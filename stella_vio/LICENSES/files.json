@@ -1,0 +1,616 @@
+{
+  "date": "2026-10-01",
+  "scope": "c/* and production Eigen PnP helper",
+  "files": [
+    {
+      "file": "c/check_sv_bow.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_bow_db.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_eigen_svd.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_essential_5pt.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_extract.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_frame.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_g2o_ba.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_g2o_pose.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_init.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_landmark_descriptor.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_loop.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_map_init.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_mapping.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_match_bow.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_pnp.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_reloc.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_rng.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_system.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_track.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/check_sv_track_bow.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/orb_point_pairs.h",
+      "spdx": "BSD-3-Clause",
+      "provenance": "OpenCV ORB point-pair table, retained Willow Garage 2009 notice, through stella"
+    },
+    {
+      "file": "c/selfcheck_sv_g2o_pose_optimizer.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/sv_bow.c",
+      "spdx": "MIT",
+      "provenance": "FBoW Vocabulary/BoWVector; LICENSES/fbow-MIT.txt"
+    },
+    {
+      "file": "c/sv_bow.h",
+      "spdx": "MIT",
+      "provenance": "FBoW Vocabulary/BoWVector; LICENSES/fbow-MIT.txt"
+    },
+    {
+      "file": "c/sv_bow_db.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_bow_db.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_bundle_adjuster.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_bundle_adjuster.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_eigen_amd.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_amd.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_eigensolver.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_eigensolver.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_fullpivlu.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_fullpivlu.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_llt.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_llt.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_lu3.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_lu3.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_mat4.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_mat4.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_qr.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_qr.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_quaternion.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_quaternion.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_svd.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_eigen_svd.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_extract.c",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella feature/orb_extractor.cc and feature/orb_impl.cc; legacy OpenCV ORB"
+    },
+    {
+      "file": "c/sv_extract.h",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella feature/orb_extractor.cc and feature/orb_impl.cc; legacy OpenCV ORB"
+    },
+    {
+      "file": "c/sv_fast.c",
+      "spdx": "BSD-3-Clause",
+      "provenance": "OpenCV4.6 features2d/src/{fast.cpp,fast_score.cpp}; Edward Rosten BSD-3 notices"
+    },
+    {
+      "file": "c/sv_fast.h",
+      "spdx": "BSD-3-Clause",
+      "provenance": "OpenCV4.6 features2d/src/{fast.cpp,fast_score.cpp}; Edward Rosten BSD-3 notices"
+    },
+    {
+      "file": "c/sv_frame.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_frame.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_frame_tracker.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_g2o_ba.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_ba.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_edge.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_edge.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_pose_optimizer.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_pose_optimizer.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_se3.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_se3.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_sim3.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_g2o_sim3.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_image.c",
+      "spdx": "Apache-2.0 AND BSD-3-Clause",
+      "provenance": "OpenCV4.6 resize.cpp, smooth.dispatch.cpp/smooth.simd.hpp (BSD-3); mathfuncs_core.simd.hpp (Apache-2.0)"
+    },
+    {
+      "file": "c/sv_image.h",
+      "spdx": "Apache-2.0 AND BSD-3-Clause",
+      "provenance": "OpenCV4.6 resize.cpp, smooth.dispatch.cpp/smooth.simd.hpp (BSD-3); mathfuncs_core.simd.hpp (Apache-2.0)"
+    },
+    {
+      "file": "c/sv_init.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_init.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_kf_insert.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_landmark_descriptor.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_landmark_descriptor.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_linalg.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_linalg.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_local_map.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_loop.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_loop.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_map.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_map.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_map_match.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_mapping.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_mapping.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_match_area.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_match_area.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_match_bow.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_match_bow.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_match_robust.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_pnp.c",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella solve/pnp_solver.cc; OpenGV attribution in upstream README"
+    },
+    {
+      "file": "c/sv_pnp.h",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella solve/pnp_solver.cc; OpenGV attribution in upstream README"
+    },
+    {
+      "file": "c/sv_rbtree.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_rbtree.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_relocalizer.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_relocalizer.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_rng.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_rng.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_run.c",
+      "spdx": "BSD-2-Clause AND MIT",
+      "provenance": "Project CLI and reference formatting; stella examples TUM association behavior (reference/driver/LICENSE.tum_rgbd_util)"
+    },
+    {
+      "file": "c/sv_sim3.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_sim3.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments; g2o core/types BSD-2 notices (not GPL/LGPL modules)"
+    },
+    {
+      "file": "c/sv_solve_common.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_common.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_essential.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_essential.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_essential_5pt.c",
+      "spdx": "BSD-2-Clause AND MIT",
+      "provenance": "stella essential_solver adapter and libmv polynomial solver"
+    },
+    {
+      "file": "c/sv_solve_essential_5pt.h",
+      "spdx": "BSD-2-Clause AND MIT",
+      "provenance": "stella essential_solver adapter and libmv polynomial solver"
+    },
+    {
+      "file": "c/sv_solve_essential_ransac.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_essential_ransac.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_fundamental.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_fundamental.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_homography.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_solve_homography.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_system.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_system.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_track.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_track_frame.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_tracking.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_triangulate.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_triangulate.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "stella_vslam e445b545; upstream paths in file comments"
+    },
+    {
+      "file": "c/sv_types.h",
+      "spdx": "MIT",
+      "provenance": "Project-authored fixture reader/comparator, self-check or plain C data records"
+    },
+    {
+      "file": "c/sv_umap_order.c",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_umap_order.h",
+      "spdx": "BSD-2-Clause",
+      "provenance": "Existing BSD-2 declaration for behavior model; libstdc++ provenance qualification in NOTICE"
+    },
+    {
+      "file": "c/sv_undistort.c",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella camera/perspective.cc wrapper; OpenCV4.6 undistort.dispatch.cpp"
+    },
+    {
+      "file": "c/sv_undistort.h",
+      "spdx": "BSD-2-Clause AND BSD-3-Clause",
+      "provenance": "stella camera/perspective.cc wrapper; OpenCV4.6 undistort.dispatch.cpp"
+    },
+    {
+      "file": "reference_reloc/c/sv_eigen_pnp.c",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "reference_reloc/c/sv_eigen_pnp.h",
+      "spdx": "MPL-2.0",
+      "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    }
+  ]
+}
