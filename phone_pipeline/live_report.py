@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT (own code)
-"""Section 15 tables from runs/phone_pipeline/<seq>/live_full/scores.json (live_eval.py) and pp.timing. usage: live_report.py > runs/phone_pipeline/live_tables.md"""
-import json, re
+"""Section 15 tables from runs/phone_pipeline/<seq>/live_{V}/scores.json (live_eval.py) and pp.timing. usage: live_report.py [variant] > runs/phone_pipeline/live_tables.md"""
+import json, re, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
+V = sys.argv[1] if len(sys.argv) > 1 else 'full'      # live_<V>/ : `servo` = section 16 (GNSS-free sequences only)
 SEQS = [('indoor1', 'Indoor-1'), ('indoor2', 'Indoor-2'), ('outdoor1', 'Outdoor-1'), ('outdoor2', 'Outdoor-2'), ('advio15', 'ADVIO-15'), ('advio20', 'ADVIO-20')]
 f = lambda x: '-' if x is None else f'{x:.2f}'
-S = {k: json.loads((ROOT / f'runs/phone_pipeline/{k}/live_full/scores.json').read_text()) for k, _ in SEQS if (ROOT / f'runs/phone_pipeline/{k}/live_full/scores.json').exists()}
+S = {k: json.loads((ROOT / f'runs/phone_pipeline/{k}/live_{V}/scores.json').read_text()) for k, _ in SEQS if (ROOT / f'runs/phone_pipeline/{k}/live_{V}/scores.json').exists()}
 print('### Live vs final trajectory (ATE SE3 [m]; batch = whole-graph smoother, causal = sliding-window live output)\n')
 print('| sequence | GNSS alone | final traj: batch / causal | live odometry, replay: batch / causal | live, streamed pp_live: smoother / georef / AUTO (causal) | live vs final batch | live vs final causal |')
 print('|---|---|---|---|---|---|---|')
@@ -22,7 +23,7 @@ print('\n### CPU per stage (pp_live, one process, thread CPU time; shared machin
 print('| sequence | frames | stella_vio ms/frame (mean / p99) | gait us/frame | fusion us/frame (mean / p99 / max) | smoother A | stream smoother B | georef + switch | fix handling |')
 print('|---|---|---|---|---|---|---|---|---|')
 for k, nm in SEQS:
-    p = ROOT / f'runs/phone_pipeline/{k}/live_full/pp.timing'
+    p = ROOT / f'runs/phone_pipeline/{k}/live_{V}/pp.timing'
     if not p.exists(): continue
     L = p.read_text().splitlines()
     n = int(re.search(r'frames (\d+)', L[0]).group(1))

@@ -195,7 +195,7 @@ static int associate(const char* seq_dir, double** frame_ts, unsigned int* n_fra
 /* ------------------------------------------------------------------ */
 /* Optional per-frame hook (default NULL: nothing changes). A host that includes this file with SV_RUN_NO_MAIN (phone_pipeline/c/pp_live.c) sets it to receive every
  * frame's LIVE report right after sv_system_feed(): the pose as tracked at that moment, before any later BA / loop correction. */
-void (*sv_run_frame_hook)(void* user, unsigned int frame, double ts, const sv_frame_result* r, const sv_system* sys) = NULL;
+void (*sv_run_frame_hook)(void* user, unsigned int frame, double ts, const sv_frame_result* r, sv_system* sys) = NULL;
 void* sv_run_frame_hook_user = NULL;
 
 typedef struct sv_run_opts {
@@ -213,6 +213,7 @@ typedef struct sv_run_opts {
     const char* set[32]; /* --set key=value (stella_vio parameters, see apply_set) */
     int width, height; /* --size WxH; 0 = take the size from the first fixture image */
     int has_camera;
+    const char* servo_log; /* --servo-log F: trace of the gait scale servo decisions */
     const char* live_out; /* --live-out F: per-frame LIVE poses (opt-in, off by default): "t x y z qx qy qz qw map rframe seg loop_accepted scale_cal up_n ux uy uz", valid frames only */
     const char* imu_path; /* --imu imu.csv (t_ns,gx,gy,gz,ax,ay,az) */
     const char* imu_ext;  /* --imu-ext ext.txt: 12 numbers, R_BC row-major then p_BC */
@@ -362,6 +363,39 @@ static int apply_set(sv_system_params* p, const char* kv) {
     }
     else if (!strcmp(key, "rf_calib")) {
         p->rframe_calib_sec = v;
+    }
+    else if (!strcmp(key, "servo")) {
+        p->servo_gain = v;
+    }
+    else if (!strcmp(key, "servo_win")) {
+        p->servo_win = v;
+    }
+    else if (!strcmp(key, "servo_dmin")) {
+        p->servo_dmin = v;
+    }
+    else if (!strcmp(key, "servo_clip")) {
+        p->servo_clip = v;
+    }
+    else if (!strcmp(key, "loop_cont")) {
+        p->loop_cont = (unsigned int)v;
+    }
+    else if (!strcmp(key, "loop_matches")) {
+        p->loop_matches = (unsigned int)v;
+    }
+    else if (!strcmp(key, "servo_k")) {
+        p->servo_k = (unsigned int)v;
+    }
+    else if (!strcmp(key, "servo_dead")) {
+        p->servo_dead = v;
+    }
+    else if (!strcmp(key, "servo_gate")) {
+        p->servo_gate = v;
+    }
+    else if (!strcmp(key, "servo_href")) {
+        p->servo_href = v;
+    }
+    else if (!strcmp(key, "servo_mode")) {
+        p->servo_mode = (int)v;
     }
     else if (!strcmp(key, "rf_gyro_max")) {
         p->rframe_gyro_max = (unsigned int)v;
@@ -765,6 +799,23 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
         fprintf(stderr, "sv_run: %ld frames, %u keyframes inserted, %u global steps, %u loops accepted, %u lost frames, %u resets, %u erased / %u destroyed keyframes\n",
                 processed, st.keyframes_inserted, st.global_steps, st.loops_accepted, st.lost_frames, st.resets, st.erased_keyframes, st.destroyed_keyframes);
     }
+    if (o->verbose && p.servo_gain > 0.0) {
+        sv_system_stats st;
+        sv_system_get_stats(sys, &st);
+        fprintf(stderr, "sv_run: servo_steps=%u\n", st.servo_steps);
+    }
+    if (o->servo_log && p.servo_gain > 0.0) {
+        FILE* fl = fopen(o->servo_log, "w");
+        const double(*rows)[7] = NULL;
+        unsigned int n = sv_system_servo_log(sys, &rows), q;
+        if (fl) {
+            fprintf(fl, "# t label walked_m map_units ratio ref ln_f\n");
+            for (q = 0; q < n; ++q) {
+                fprintf(fl, "%.6f %.0f %.4f %.5f %.4f %.4f %.5f\n", rows[q][0], rows[q][1], rows[q][2], rows[q][3], rows[q][4], rows[q][5], rows[q][6]);
+            }
+            fclose(fl);
+        }
+    }
     if (o->verbose && p.imu) {
         const sv_tracker* tk = sv_system_tracker(sys);
         fprintf(stderr, "sv_run: gyro_tracked=%u dead_reckon_tries=%u dead_reckon_ok=%u\n", tk->n_gyro_track, tk->n_dr_try, tk->n_dr_ok);
@@ -827,6 +878,9 @@ int sv_run_main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--live-out") && i + 1 < argc) {
             o.live_out = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--servo-log") && i + 1 < argc) {
+            o.servo_log = argv[++i];
         }
         else if (!strcmp(argv[i], "--imu") && i + 1 < argc) {
             o.imu_path = argv[++i];

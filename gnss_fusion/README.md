@@ -110,6 +110,9 @@ gnss_fusion/c/gf_auto_run --odom odom.txt --fix fixes.txt [--speed speed.txt] --
 ```
 `policy=0` reproduces `gf_run` causal live, `policy=1` the two-stage `gf_run` + `gf_georef_run` live output (checked by `tools/test_auto.py`); `tools/gf_auto_table.py` scores the earlier case list, `tools/gf_auto_rule.py` simulates rule variants on saved streams (leave-one-case-out). Results and failures: `docs/gnss_vio_benchmark_20261001.md` section 15.
 
+## Live fusion on a drifting monocular map (section 16 of the study; no code change here)
+Sweeping the fusion's own scale handling on the saved live odometry of the indoor sequences (`speed_scale_rw` 0.01-0.2, `speed_sigma_scale` 0.25-0.5, `window_s` 15-20; `phone_pipeline/auto_eval.py` replays them through `gf_auto_run`, now also for GNSS-free sequences) is flat within +-0.1 m: the loss of the live pipeline indoors is the drifting map scale (2.4x in 90 s on Indoor-2), which the smoother can only follow with a lag. The fix went into the mapping instead (stella_vio gait scale servo, `stella_vio/RESULTS.md`): Indoor-1 / Indoor-2 live 1.21 / 1.10 -> 0.64 / 0.67 m (final 1.02 / 0.31). `gnss_fusion` itself is unchanged (`tools/test_auto.py` 6 of 6 PASS, baseline tables 0 differ).
+
 ## API (see `c/gf_fusion.h`)
 
 ```c

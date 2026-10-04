@@ -49,6 +49,17 @@ $PY phone_pipeline/auto_eval.py --src both                 # replay of final / l
 ```
 Each frame's pose is emitted when it is computed (`sv_run --live-out`, opt-in) and streamed through gait, the two smoothers, the georef and the switch; `pp.auto` is what a live consumer sees. Results (live vs final, switch table, CPU per stage): `docs/gnss_vio_benchmark_20261001.md` section 15, `runs/phone_pipeline/live_tables.md`. Short: live costs -7..+4 % on the outdoor sequences and 3.5x on Indoor-2 (0.31 -> 1.10 m); AUTO = georef on all three outdoor sequences (4.31 / 11.33 / 11.82 live), smoother elsewhere.
 
+## Gait scale servo and the live-vs-final study (section 16)
+```bash
+$PY phone_pipeline/run.py live indoor2 --variants servo --stream <fetch_dir>/indoor2         # live_servo/: full + stella_vio gait scale servo (GNSS-free sequences only; with fixes it hurt Outdoor-1)
+$PY phone_pipeline/live_eval.py indoor2 --variant servo && $PY phone_pipeline/live_report.py servo
+$PY phone_pipeline/run.py live outdoor1 --variants none --stream <dir> --keep-jpeg --skips 0,30,60 --cfg "base||" --cfg "sv05|servo=0.5 servo_clip=0.2 servo_win=6 servo_dmin=2|"   # extra configurations in one lock-step pass -> <seq>/study16/<tag>_s<skip>/
+$PY phone_pipeline/live_study.py indoor2 --stream <dir> --cfg "base||" --cfg "sv05|servo=0.5 ...|" --skips 0,10,20,30,40,50 --workers 5   # paired start-frame perturbation study on pre-made fixtures (1.4 GB, deleted afterwards)
+$PY phone_pipeline/study_report.py > runs/phone_pipeline/study16_tables.md                    # live/final table
+$PY phone_pipeline/auto_eval.py --seqs indoor1,indoor2,advio15 --src both                      # replay incl. GNSS-free sequences (reproduces the streamed numbers)
+```
+The servo needs the speeds that `pp_live` pushes into the mapping (`--pp-servo-noise S` adds log-normal noise on what it sees, robustness test). Result: Indoor-1 live 1.21 -> 0.64 (final 1.02), Indoor-2 1.10 -> 0.67 (final 0.31), ADVIO-15 0.85 -> 0.85; outdoor rows unchanged (servo off). `docs/gnss_vio_benchmark_20261001.md` section 16.
+
 ## Configs (`configs/<seq>.json`, one per dataset)
 Camera intrinsics (dataset calibration, `tools/gnss_harness/robust_cfg/<seq>/port_camera.txt`), IMU csv, camera-IMU extrinsic (`imu_ext`: sequence-fitted rotation from `stella_vio/tools/ext_fit.py`; `imu_ext_cal`: dataset calibration),
 camera-IMU time offset `imu_toff` (same fit; ADVIO -0.31 / -0.32 s: its video clock lags the IMU clock), gyro bias `imu_bg` (first <= 60 s visual fit, `runs/stella_vio/imu/gyro_pred.md`, only used by `gyro=1`), fixes file,

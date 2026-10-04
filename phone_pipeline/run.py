@@ -37,6 +37,7 @@ SV_VARIANTS = {
     'rm':      ['gravity=1', 'rframe=1', 'merge=1'],           # + R-frames through tracking failures and map merge
     'full':    ['gravity=1', 'rframe=1', 'merge=1', 'gyro=1'], # + gyro rotation prior for tracking and R-frame prediction
     'fullcal': ['gravity=1', 'rframe=1', 'merge=1', 'gyro=1'], # = full with the dataset-calibration extrinsic instead of the sequence-fitted one (calibration honesty)
+    'servo':   ['gravity=1', 'rframe=1', 'merge=1', 'gyro=1', 'servo=0.5', 'servo_clip=0.2', 'servo_win=6', 'servo_dmin=2'],   # section 16: full + gait scale servo in the mapping (only meaningful with run.py live: it needs the speeds pp_live pushes)
 }
 GF_BASE = ['preset=robust', 'metric=0', 'rsa=0,0,0']
 GAIT_CFG = ['speed=1', 'speed_align=1', 'speed_scale_rw_rel=1', 'speed_align_metric=1']        # gnss_fusion section 12 settings
@@ -113,7 +114,7 @@ class Feeder(threading.Thread):
 PP_LIVE = ROOT / 'phone_pipeline/c/pp_live'
 
 
-def run_sv(seq, variants, stream=None, ahead=1000, live=False, pp_extra=(), keep_jpeg=False):
+def run_sv(seq, variants, stream=None, ahead=1000, live=False, pp_extra=(), keep_jpeg=False, vdir=None, vpp=None):
     """live=True: the same command line through pp_live (one process: stella_vio + gait + fusion, section 15) into live_<variant>/ (its sv outputs are the same files as sv_<variant>/)"""
     c = cfg_of(seq); out = OUT / seq; fx = out / '_fx' / seq; fx.mkdir(parents=True, exist_ok=True)
     cmds, logs, procs, outs = {}, {}, {}, {}
@@ -123,16 +124,16 @@ def run_sv(seq, variants, stream=None, ahead=1000, live=False, pp_extra=(), keep
         pl, ll = [], []
         feeder = Feeder(stream, fx, ll, pl, ahead=ahead, keep_jpeg=keep_jpeg); feeder.start(); feeder.ready0.wait()
     for v in variants:
-        d = out / (f'live_{v}' if live else f'sv_{v}'); d.mkdir(parents=True, exist_ok=True); outs[v] = d
+        d = (vdir or {}).get(v) or out / (f'live_{v}' if live else f'sv_{v}'); d.mkdir(parents=True, exist_ok=True); outs[v] = d
         cmd = [str(PP_LIVE if live else SV_RUN), str(VOCAB), rp(c['rgb_dir']), str(fx), str(d), '--no-snap', '--lean', '--wait-fixtures', '--size', c['size'], '--camera', c['camera'],
                '--imu', rp(c['imu']), '--imu-ext', str(d / 'ext.txt'), '--imu-toff', str(c['imu_toff']), '--imu-bg', ','.join(str(x) for x in c['imu_bg'])]
         (d / 'ext.txt').write_text(' '.join(repr(float(x)) for x in c['imu_ext_cal' if v == 'fullcal' else 'imu_ext']) + '\n')
         for s in SV_VARIANTS[v]: cmd += ['--set', s]
         if live:
-            cmd += ['--live-out', str(d / 'live.tum'), '--pp-out', str(d / 'pp'), '--pp-speed-out', str(d / 'pp.speed')]
+            cmd += ['--live-out', str(d / 'live.tum'), '--servo-log', str(d / 'servo.log'), '--pp-out', str(d / 'pp'), '--pp-speed-out', str(d / 'pp.speed')]
             if c['fixes']: cmd += ['--pp-fix', rp(c['fixes'])]
             if c['gait']['mode'] == 'user': cmd += ['--pp-gait-c', repr(c['gait']['c'])]
-            cmd += list(pp_extra)
+            cmd += list(pp_extra) + list((vpp or {}).get(v, []))
         cmds[v] = cmd; logs[v] = d / 'log.txt'
     t0 = time.time()
     for v in variants:
@@ -267,10 +268,20 @@ def main():
     ap.add_argument('stage', choices=['stages', 'sv', 'fuse', 'gait', 'georef', 'live'])
     ap.add_argument('seq'); ap.add_argument('--variants', default='default,rm,full,fullcal'); ap.add_argument('--fuse', default='gait,gnss,both')
     ap.add_argument('--stream'); ap.add_argument('--ahead', type=int, default=1000); ap.add_argument('--keep-jpeg', action='store_true'); ap.add_argument('--pp', default='', help='extra pp_live options (live stage), e.g. "--pp-set policy=1"')
+    ap.add_argument('--skips', default='0', help='with --cfg: start frames, e.g. 0,20,40')
+    ap.add_argument('--cfg', action='append', default=[], help='live stage, section 16: "tag|sv_set1 sv_set2|pp_opt ..." = an extra sv_run configuration on top of `full`, run in the same lock-step pass, output runs/phone_pipeline/<seq>/study16/<tag>_s0/ (the canonical live_full/ is untouched); with --variants none only these')
     a = ap.parse_args()
     vs = a.variants.split(','); fm = a.fuse.split(',')
     if a.stage in ('stages', 'sv'): run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead)
-    if a.stage == 'live': run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead, live=True, pp_extra=a.pp.split(), keep_jpeg=a.keep_jpeg)
+    if a.stage == 'live':
+        vdir, vpp = {}, {}
+        if a.variants == 'none': vs = []
+        for cf in a.cfg:
+            t, sv, pp = (cf.split('|') + ['', ''])[:3]
+            for k in a.skips.split(','):      # --skips: start-frame perturbations of the initialisation (sv_run --skip), one process each, same lock-step pass
+                tk = f'{t}_s{k}'
+                SV_VARIANTS[tk] = SV_VARIANTS['full'] + sv.split(); vdir[tk] = OUT / a.seq / 'study16' / tk; vpp[tk] = pp.split() + (['--skip', k] if int(k) else []); vs.append(tk)
+        run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead, live=True, pp_extra=a.pp.split(), keep_jpeg=a.keep_jpeg, vdir=vdir, vpp=vpp)
     if a.stage in ('stages', 'gait', 'fuse'):
         g = run_gait(a.seq, OUT / a.seq); (OUT / a.seq / 'gait.json').write_text(json.dumps(g))
     if a.stage == 'georef':

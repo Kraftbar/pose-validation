@@ -15,7 +15,7 @@ import run as R, score as S  # noqa: E402
 from gf_cases import phone_case  # noqa: E402
 
 AUTO = R.ROOT / 'gnss_fusion/c/gf_auto_run'
-BASE = ['preset=robust', 'metric=0', 'rsa=0,0,0', 'speed=1', 'speed_align=1', 'speed_scale_rw_rel=1', 'speed_align_metric=1', 'loose_k=5', 'stream=1', 'g.scale_sigma=0.15']
+BASE = ['preset=robust', 'metric=0', 'rsa=0,0,0', 'speed=1', 'speed_align=1', 'speed_scale_rw_rel=1', 'speed_align_metric=1', 'loose_k=5', 'stream=1', 'g.scale_sigma=0.15', 'policy=2']
 _cache = {}
 
 
@@ -35,27 +35,31 @@ def load(path, aligned=True):
 
 def inputs(seq, src):
     b = R.OUT / seq
-    if src == 'final': return b / 'fuse_full_both/odom.txt', b / 'fuse_full_both/fix.txt', b / 'speed.txt'
+    if src == 'final':
+        o = b / 'fuse_full_both/odom.txt'
+        if not o.exists(): o = b / 'fuse_full_gait/odom.txt'      # GNSS-free sequences
+        return o, (b / 'fuse_full_both/fix.txt' if (b / 'fuse_full_both/fix.txt').exists() else None), b / 'speed.txt'
     d = b / 'live_full'
     fx = b / 'fuse_full_both/fix.txt'
-    return d / 'pp.odom', fx, d / 'pp.speed'
+    return d / 'pp.odom', (fx if fx.exists() else None), d / 'pp.speed'
 
 
 def run(seq, src='final', cfg=(), keep=None):
     case, ft = case_of(seq)
     odom, fix, sp = inputs(seq, src)
+    nofix = fix is None or fix.stat().st_size == 0     # GNSS-free sequence: empty fix file (pp_live: no fixes -> sm.init_wait_s = 12)
+    if fix is None: fix = odom.with_name('empty.fix'); fix.write_text('')
     d = Path(keep) if keep else Path(tempfile.mkdtemp(dir=os.environ.get('GF_SCRATCH')))
     d.mkdir(parents=True, exist_ok=True)
     try:
         b = d / f'{seq}_{src}'
-        r = subprocess.run([str(AUTO), '--odom', str(odom), '--fix', str(fix), '--speed', str(sp), '--out', f'{b}.auto', '--out-sm', f'{b}.sm', '--out-geo', f'{b}.geo', '--sig', f'{b}.sig', '--timing'] + BASE + list(cfg),
+        r = subprocess.run([str(AUTO), '--odom', str(odom)] + ['--fix', str(fix)] + ['--speed', str(sp), '--out', f'{b}.auto', '--out-sm', f'{b}.sm', '--out-geo', f'{b}.geo', '--sig', f'{b}.sig', '--timing'] + BASE + (['a.init_wait_s=12'] if nofix else []) + list(cfg),
                            capture_output=True, text=True)
         if r.returncode: raise RuntimeError(r.stderr + r.stdout)
         res = dict(stdout=r.stdout.strip())
-        fixes = R.rp(R.cfg_of(seq)['fixes'])
         for k in ('sm', 'geo', 'auto'):
             a = load(f'{b}.{k}', aligned=(k != 'geo'))
-            res[k] = S.metrics(case, a, ft, tmin=ft[0] + 30.0) if a is not None else dict(coverage=0.0)
+            res[k] = S.metrics(case, a, ft, tmin=ft[0] + (R.INIT_WAIT_NOFIX if nofix else 30.0)) if a is not None else dict(coverage=0.0)
         return res
     finally:
         if not keep: shutil.rmtree(d, ignore_errors=True)
@@ -68,7 +72,7 @@ if __name__ == '__main__':
     out = {}
     f = lambda x: '-' if x is None else f'{x:.2f}'
     for s in a.seqs.split(','):
-        gal = json.loads((R.OUT / s / 'scores.json').read_text())['gnss_alone']['se3']
+        gal = json.loads((R.OUT / s / 'scores.json').read_text()).get('gnss_alone', {}).get('se3')
         for src in (['final', 'live'] if a.src == 'both' else [a.src]):
             if src == 'live' and not (R.OUT / s / 'live_full/pp.odom').exists(): continue
             r = run(s, src, a.cfg.split(), a.keep); out[f'{s}|{src}'] = r

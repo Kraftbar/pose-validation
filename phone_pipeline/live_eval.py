@@ -27,14 +27,15 @@ def load(path, aligned=True):
 
 def evaluate(seq, variant='full', replay=True):
     c = R.cfg_of(seq); base = R.OUT / seq; d = base / f'live_{variant}'
+    fv = variant if (base / f'sv_{variant}').exists() else 'full'      # variants without a final-trajectory run (section 16 `servo`) are compared with `full`
     ft = S.frame_times(seq)
-    case = phone_case(seq, str((base / f'sv_{variant}' / 'trajectory_maps.tum').resolve()), cam_only=False, label=seq)
+    case = phone_case(seq, str((base / f'sv_{fv}' / 'trajectory_maps.tum').resolve()), cam_only=False, label=seq)
     fixes = R.rp(c['fixes']) if c['fixes'] else None
     iw = 30.0 if fixes else R.INIT_WAIT_NOFIX
     res = dict(seq=seq, variant=variant, n_frames=int(len(ft)))
     if fixes: res['gnss_alone'] = json.loads((base / 'scores.json').read_text())['gnss_alone']
     old = json.loads((base / 'scores.json').read_text())
-    res['final'] = {m: old[f'{variant}|{m}'] for m in ('both', 'gait', 'georef') if f'{variant}|{m}' in old}
+    res['final'] = {m: old[f'{fv}|{m}'] for m in ('both', 'gait', 'georef') if f'{fv}|{m}' in old}
     if replay:
         for m in ('both', 'gait'):
             if m == 'both' and not fixes: continue

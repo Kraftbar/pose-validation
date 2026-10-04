@@ -25,6 +25,7 @@
  *   --pp-lazy               process IMU / fixes only at tracked frames (reproduces the order of the offline file pipeline)
  *   --pp-up-freeze N        a map's gravity rotation is frozen once N frames have contributed (default 150; 0 = follow the running estimate)
  *   --pp-up-min N           no odometry sample before N frames contributed to the map's up vector (default 5)
+ *   --pp-servo-noise S      log-normal noise (sigma S) on the speeds that the stella_vio gait scale servo sees (robustness test; the fusion keeps the clean speeds)
  *   --pp-jump 0|1           flag frames of an accepted loop closure / scale calibration as GF_ODOM_GAP (position jump of the map), default 0: it cost 0.1-0.7 m on the indoor sequences (section 15)
  */
 #define SV_RUN_NO_MAIN 1
@@ -38,12 +39,13 @@ typedef struct { double t, w[3], a[3]; } imus;
 typedef struct { double t, v, sg, w; unsigned fl; } spd;
 
 typedef struct {
-    gf_auto *au; gf_gait *gait;
+    gf_auto *au; gf_gait *gait; sv_system *sys;
     imus *imu; size_t n_imu, k_imu;
     gf_fix *fx; int nf, fi;
     double g_t0, g_nxt;
     spd *sp; int nsp, spcap;
     int lazy, up_freeze, up_min, jump;
+    double servo_noise; unsigned long long rng;     /* --pp-servo-noise S: log-normal noise of sigma S on the speeds the servo sees (robustness test; the fusion keeps the clean speeds) */
     int have_prev, prev_map, prev_seg; double last_t;
     unsigned char *frozen; double (*Rg)[9]; int fcap;     /* per map id */
     FILE *fa, *fsm, *fgeo, *fodom, *fspd, *fsig;
@@ -105,14 +107,26 @@ static void push_speed(pp_t *P, double t, double v, double sg, double w, unsigne
     if (P->nsp == P->spcap) { P->spcap = P->spcap ? P->spcap * 2 : 256; P->sp = (spd *)realloc(P->sp, sizeof(spd) * (size_t)P->spcap); }
     P->sp[P->nsp].t = t; P->sp[P->nsp].v = v; P->sp[P->nsp].sg = sg; P->sp[P->nsp].w = w; P->sp[P->nsp].fl = fl; ++P->nsp;
     if (P->fspd) fprintf(P->fspd, "%.9f %.6f %.6f %.3f %u\n", t, v, sg, w, fl);
+    if (P->sys) {      /* stella_vio gait scale servo (--set servo=G; ignored while off) */
+        double vs = v;
+        if (P->servo_noise > 0.0) {      /* Box-Muller from an LCG: deterministic */
+            double u1, u2, z;
+            P->rng = P->rng * 6364136223846793005ULL + 1442695040888963407ULL; u1 = ((double)(P->rng >> 11) + 1.0) / 9007199254740993.0;
+            P->rng = P->rng * 6364136223846793005ULL + 1442695040888963407ULL; u2 = (double)(P->rng >> 11) / 9007199254740992.0;
+            z = sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+            vs = v * exp(P->servo_noise * z);
+        }
+        sv_system_push_speed(P->sys, t, vs);
+    }
 }
 
-static void frame_hook(void *user, unsigned int frame, double ts, const sv_frame_result *r, const sv_system *sys)
+static void frame_hook(void *user, unsigned int frame, double ts, const sv_frame_result *r, sv_system *sys)
 {
     pp_t *P = (pp_t *)user;
     const double t_in = cpu_now();
     double t1, t2;
-    (void)frame; (void)sys;
+    (void)frame;
+    P->sys = sys;
     if (P->n_hook) {
         P->cpu_sv += t_in - P->last_exit;
         if (P->n_hook < P->cap_t) P->t_sv[P->n_hook] = t_in - P->last_exit;
@@ -218,6 +232,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--pp-up-freeze") && i + 1 < argc) PP.up_freeze = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pp-up-min") && i + 1 < argc) PP.up_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pp-jump") && i + 1 < argc) PP.jump = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pp-servo-noise") && i + 1 < argc) { PP.servo_noise = atof(argv[++i]); PP.rng = 88172645463325252ULL; }
         else {
             if (!strcmp(argv[i], "--imu") && i + 1 < argc) imup = argv[i + 1];
             av[nav++] = argv[i];

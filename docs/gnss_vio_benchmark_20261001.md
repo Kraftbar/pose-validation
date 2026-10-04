@@ -1064,3 +1064,88 @@ The fusion (both smoothers, gait, georef, switch) costs 0.1-0.2 % of the front e
 * Free-scale monocular streams never use the georef in AUTO; the python simulation and the C switch differ on one live item.
 * Tracking-loss stretches: pp_live emits GNSS-only nodes through `pp.auto` only when fixes arrive during a tracking loss; no output is produced for the frames in between.
 * Timing was measured on a machine shared with other jobs (thread CPU time, cache contention).
+
+## 16. Closing the live-vs-final gap indoors: gait scale servo inside the stella_vio mapping (2026-10-04)
+
+Question (open issue 15.7): the live phone pipeline loses 3.5x on Indoor-2 (0.31 -> 1.10 m), 19 % on Indoor-1 and 30 % on ADVIO-15 against the final trajectory; the live map scale drifts until a loop closes. Can the gait speed be fed back into the mapping so that the live map stays metric-consistent, without hurting the outdoor sequences and the exact-port baselines? Own code and own understanding (no GPL code read). Four ideas were tried; one is accepted, scoped to the GNSS-free (indoor) pipeline.
+
+### 16.1 Diagnosis (Indoor-2, section 15 live run; GT used for diagnosis only)
+
+* The gait speed is not the problem: 3 s epochs are within about 10 % of the GT speed (27 epochs, mean ratio 1.13 incl. one start-up outlier).
+* The live MAP is: walked metres per map unit (GT length / live-odometry length over 6 s windows) falls from 8.8 (12-18 s) to 3.7 (90-96 s), i.e. the map unit grows 2.4x while the person walks at a constant 1.1 m/s; the final trajectory does not have this (its scale is the one of the start, 9.11, a loop at 92 s and BA remove it). The fusion applies a scale that lags the drift (applied 7.0 / 6.2 / 5.3 vs true 5.3 / 4.8 / 3.7 over 78-96 s) and its error is 1.3-2.9 m in the last 20 s and about 2.2 m at 10-20 s (start-up scale from the first speed epochs, +20 %); between 30 and 80 s the live fusion is as good as the final one (0.2-0.4 m).
+* Fusion-side remedies cannot fix that (16.5): the scale random walk, the speed sigma and the window were swept on the saved live odometry, flat within +-0.1 m.
+
+### 16.2 What was built (all opt-in; with every switch off the trajectories are byte-identical)
+
+`stella_vio` (`sv_system.c servo_step`, switches `--set servo=G servo_win=S servo_dmin=M servo_clip=C` + the explored variants `servo_mode servo_gate servo_href servo_dead servo_k`; host API `sv_system_push_speed(sys, t, v)`, trace `--servo-log F`):
+the host (pp_live) pushes every gait epoch (3 s, mean speed of the trailing 6 s) to the mapping. After every new keyframe, once the mapper has finished, the mapping compares the metres walked over the last `servo_win` seconds (sum of v x 3 s over the last epochs) with the length of the map's keyframe chain over the same time interval. The ratio (metres per map unit) is held at the value of the first window with >= `servo_dmin` metres of the map (it is only a RELATIVE scale: the absolute gait calibration does not matter). The newest keyframe and the landmarks its mapping step created are scaled about the previous keyframe by `exp(clip(G ln(ratio / reference), +-C))` with the same routine that the existing bridged-part scale calibration uses (`scale_section`: keyframes, landmarks, the tracker's motion state and the frames referenced to the part). It is a proportional controller on a 6 s average, not a hard constraint: a gait outlier moves the map by at most C per keyframe and the visual BA of the next keyframes keeps the map self-consistent. The reference is dropped at a loop correction and at a map reset. Defaults of the switches: off (`servo_gain` 0), `servo_win` 12, `servo_dmin` 5, `servo_clip` 0.05; **the tested setting (`servo` variant of `run.py`) is `servo=0.5 servo_clip=0.2 servo_win=6 servo_dmin=2`**.
+`phone_pipeline`: `pp_live` pushes its speed epochs to the mapping (`--pp-servo-noise S` = log-normal noise on what the servo sees, robustness test), `run.py live --variants servo` (= `full` + the setting above; output `live_servo/`), `run.py live --cfg "tag|sv sets|pp opts" --skips 0,30,60` (extra configurations in the same lock-step pass, output `<seq>/study16/<tag>_s<skip>/`, the canonical `live_full/` is never touched), `live_study.py` (paired perturbation study on pre-made fixtures), `study_report.py`, `live_report.py [variant]`, `auto_eval.py` (now also GNSS-free sequences, reproduces the section-15 streamed numbers exactly).
+
+### 16.3 How the result was judged (noise)
+
+A single run of the mono front end is chaotic, so every configuration is run from several start frames (`sv_run --skip N`, the same perturbation of the initialisation that `stella_vio/tools/init_study.py` uses for its window counts; `init_study.py` scores camera-only windows, whereas here the fused live output is needed, hence `live_study.py`): Indoor-1 / Indoor-2 / ADVIO-15 skips 0,10,20,30,40,50 (0-3 s), ADVIO-20 0,20,40,60, Outdoor-1 ten starts (0..90 and 300, 600, 900 frames), Outdoor-2 0,30,60. Comparisons are paired by start (better / worse by more than 0.02 m) and give the spread of the servo-off runs as the noise floor: servo off spans Indoor-1 1.07-1.33, Indoor-2 1.00-1.11, ADVIO-15 0.79-1.03, ADVIO-20 11.77-11.85, Outdoor-1 3.67-8.11 (!), Outdoor-2 11.33-11.40 [m]. The pipeline is deterministic, so each number is reproducible. **All settings were tuned on Indoor-1 / Indoor-2 / ADVIO-15 (test data of this study, no held-out set exists); the outdoor sequences were only used to check for harm (and they showed some).** Scored as in section 15: causal AUTO output (`gf_auto`) against GT, from +12 s (GNSS-free) / +30 s (fixes) after the first frame of the run.
+
+### 16.4 Results
+
+Tuning on the indoor sequences (causal ATE SE3 [m], mean over starts; servo off in brackets; `d` = `servo_dmin`):
+
+| setting | Indoor-2 | Indoor-1 | ADVIO-15 |
+|---|---|---|---|
+| gain 0.2, clip 0.05, win 12, d5 (first guess) | 1.02 (1.07) | - | 0 steps (speed 0.43 m/s never reaches 5 m) |
+| gain 1, clip 0.2, win 6, d5 | 0.61 (1.07) | 0.76 (1.21) | - |
+| gain 1, clip 0.3, win 6, d5 | 0.69 | - | - |
+| gain 2, clip 0.3, win 6, d5 | 0.62 | - | - |
+| gain 1, clip 0.2, win 9, d5 | 0.72 | - | - |
+| gain 0.5, clip 0.2, win 6, d5 | 0.59 | 0.83 | - |
+| gain 0.5, clip 0.2, win 6, **d2** (**chosen**, `servo` variant) | **0.61 (1.06)**, 6 of 6 starts better | **0.79 (1.20)**, 6 of 6 | **0.84 (0.89)**, 2 better, 4 equal |
+| gain 1, clip 0.2, win 6, d2 | - | 0.75 | 0.88 (0.83), 3 of 4 worse |
+| gain 0.5, clip 0.1, win 6, d2 | - | 0.78 | - |
+
+All servo settings with a sensible gain help every indoor start (24 of 24 paired comparisons); differences between gains / clips / windows are inside the start-to-start noise (+-0.1 m), so the choice between them is not significant. Gain 1 hurts ADVIO-15 slightly (3 of 4 starts), gain 0.5 does not.
+
+**Live vs final per sequence** (causal AUTO ATE SE3 [m]; final = AUTO on the final trajectory's odometry, section 15.4; live s15 = the section-15 run; "off" / "servo" = this section's perturbation study, mean [min..max] over n starts; "pipeline" = the one official run `run.py live --variants servo` -> `live_servo/`, GNSS-free sequences only):
+
+| sequence | final | live s15 | live, servo off (n) | live, servo (n) | **live/final off -> servo** | official run with servo | raw live map Sim3 ATE off / servo | servo policy |
+|---|---|---|---|---|---|---|---|---|
+| Indoor-1 | 1.02 | 1.21 | 1.20 [1.07..1.33] (6) | 0.79 [0.64..1.09] (6) | 1.18x -> **0.78x** | 0.64 (batch on live odometry 0.60 vs 0.79) | 2.99 / 0.81 | on |
+| Indoor-2 | 0.31 | 1.10 | 1.06 [1.00..1.11] (6) | 0.61 [0.47..0.79] (6) | 3.42x -> **1.96x** | 0.67 (batch 0.66 vs 1.06) | 1.20 / 0.58 | on |
+| ADVIO-15 | 0.66 | 0.85 | 0.89 [0.79..1.03] (6) | 0.84 [0.79..0.94] (6) | 1.36x -> 1.29x | 0.85 | 0.74 / 0.72 | on (neutral) |
+| Outdoor-1 | 4.78 | 4.31 | 4.63 [3.67..8.11] (10) | 6.28 [4.21..11.89] (10) | 0.97x -> 1.32x | not run (off) | 14.8 / 20.4 | **off** |
+| Outdoor-2 | 11.25 | 11.33 | 11.37 [11.33..11.40] (3) | 11.38 [11.21..11.54] (3) | 1.01x -> 1.01x | not run (off) | 6.6 / 8.3 | off (neutral) |
+| ADVIO-20 | 11.76 | 11.82 | 11.81 [11.77..11.85] (4) | 11.63 [11.60..11.66] (4) | 1.00x -> 0.99x | not run (off) | 9.2 / 3.8 | off (4 of 4 better, 1.5 %) |
+
+(`runs/phone_pipeline/study16_tables.md`, `<seq>/study16/results.json`, `<seq>/live_servo/scores.json`.) Reading: **the indoor gap is closed by 40-55 %** of the excess: Indoor-1 live now beats the final trajectory (0.64-0.79 vs 1.02; the final 1.02 is itself the chaotic gyro-prior result of section 13), Indoor-2 1.10 -> 0.61-0.67 (final 0.31: the remaining excess is the 2 m start-up error at 10-20 s of the fusion's first speed alignment and the last 20 s before the loop; excluding the first 40 s the servo run is 0.73 vs final 0.32 vs servo-off 1.23), ADVIO-15 is unchanged (its map is already consistent: raw map Sim3 0.72; the 30 % gap there is the rotation-only / bridged stretch and the start-up). The servo halves-to-quarters the live map's own error (raw live map Sim3 ATE: Indoor-1 2.99 -> 0.81, Indoor-2 1.20 -> 0.58, ADVIO-20 9.15 -> 3.82). Cost: +2 % CPU (ADVIO-20 484 -> 493 s, Outdoor-1 420 -> 429 s per run; one chain walk per keyframe).
+Robustness to a bad gait signal (Indoor-2, 6 starts, log-normal noise on every speed epoch that the SERVO sees, the fusion keeps the clean speed): sigma 0.2 / 0.4 / 0.8 -> 0.77 / 0.79 / 0.73 m against 0.61 clean and 1.06 off: the benefit degrades gracefully but does not vanish even with 80 % speed noise (the window average and the clip bound the damage).
+
+**Outdoor-1 is hurt (mean 4.63 -> 6.28, +36 % over 10 starts; worse in 9 of 10, +48 % over the seven starts of 0-90 frames (starts 75 and 90 give the same run), +5 % over the starts of 300 / 600 / 900 frames), Outdoor-2 neutral, ADVIO-20 marginally better.** The servo trace (`servo.log`) shows why: the gait detector reports 'walking' at 0.8-1.3 m/s during the first 12-15 s of Outdoor-1 while the GT 6 s chord speed is 0.03-0.45 m/s (the user is still, then starts), and the reference ratio of the first window comes from exactly those epochs: it is 8 % off the steady-walking ratio (0.92), so the controller fights every keyframe by 3-4 % (ln f -0.04) against a map that re-inflates, and around t = 830 s of the run a scale blow-up (metres per map unit falls 5-16x within seconds with the servo, 2.5x without) is not repaired by the per-keyframe correction. Variants that make the reference robust, all rejected (Indoor-2 / Indoor-1 6-start means for servo off 1.06 / 1.20, chosen setting 0.61 / 0.79; Outdoor-1: mean over the listed starts, servo off in the right-hand column):
+
+| variant | Indoor-2 | Indoor-1 | Outdoor-1 |
+|---|---|---|---|
+| mode 1: reference = ratio over the whole history before the window (>= 10 m), gate 0.5, clip 0.2 (A) | 0.88 | 0.89 | 4.98 vs 4.39 (starts 0, 30, 60), +13 % |
+| same, clip 0.05 (B) | 0.90 | 0.97 | 4.67 vs 4.39, +6 % |
+| mode 0, gate 0.5 (no correction when ratio / reference is off by > 1.65x), clip 0.05 (C) | 0.79 | 0.91 | 5.11 vs 4.39, +16 % |
+| mode 1, history >= 6 / 15 m, no gate (D / F) | 0.94 / 0.84 | 0.94 / 0.92 | - |
+| mode 1, gate 1.0 (E) | 0.88 | 0.89 | - |
+| dead band 0.1 / 0.2 on ln ratio (G / H) | 0.77 / 0.89 | 0.83 / 1.02 | 6.48 / 7.01 vs 5.40 (starts 0, 45, 75), +20 / +30 % |
+| mode 1 + dead band 0.1 (I) | 1.14 | 0.97 | - |
+| mode 2: reference = median of the first k non-overlapping windows, k = 2 / 3 / 5 | 0.64 / 0.83 / 0.90 | 0.79 / 0.94 / 1.00 | k = 3: 5.63 vs 5.00 (starts 0, 45, 75, 90), +13 % (maps better, fused worse) |
+
+Every variant that protects the outdoor start loses part (mode 0 -> 1, gates, dead bands) or all (k >= 3) of the indoor benefit and still does not make Outdoor-1 neutral; the indoor sequences need the servo from the first seconds, because their drift is large and early. Policy: **servo on only where the pipeline has no fixes** (GNSS-free = indoor: `run.py live --variants servo`), off with fixes (the georef / smoother already fix the scale from the fixes and the section-15 AUTO output is not changed). The outdoor sequences with servo off are the section-15 numbers (bit-identical front end).
+
+### 16.5 The other ideas
+
+* **Faster loop closure** (idea 2), rejected: `loop_cont` (consecutive keyframes that must agree, stella 3) = 1 or 2 and `loop_matches` (Sim3 validation matches, stella 20) = 12 or 15 accept the same loop at the same frame on Indoor-1 (frame 1737 of 1779; the revisit begins at 1605 by GT, Indoor-2 1335 -> accepted 1382): the detection delay is the BoW candidate retrieval (the camera sees the old place from another viewpoint), not the thresholds. ATE with `loop_cont` 1 / 2 on Indoor-1: 1.30 vs 1.22 (3 starts), `loop_matches` identical. No false loop was produced (nor any new loop). Switches kept (`--set loop_cont=N loop_matches=N`, default 0 = stella's values).
+* **Fusion-side scale handling** (idea 3a), rejected: on the saved live odometry `speed_scale_rw` 0.01 / 0.02 / 0.05 (default) / 0.1 / 0.2 gives Indoor-1 / Indoor-2 / ADVIO-15 1.76 / 1.55 / 0.87, 1.28 / 1.34 / 0.86, **1.21 / 1.10 / 0.85**, 1.27 / 1.04 / 0.86, 1.41 / 1.03 / 0.91; `speed_sigma_scale` 0.5 / 0.25: 1.23 / 1.03 / 0.83 and 1.25 / 1.01 / 0.80; `window_s` 20 / 15: 1.20 / 1.11 / 0.85 and 1.20 / 1.11 / 0.90; on the servo runs the same sweep is flat again (rw 0.1: Indoor-1 0.65 vs 0.64, Indoor-2 0.59 vs 0.67; rw 0.02: worse on Indoor-2, 0.81 vs 0.67). A tighter random walk helps one sequence and hurts the other: the live map's drift is what matters, not the filter.
+* **Keyframe-corrected poses for past samples** (idea 3b), not implemented: the 30-80 s part of the live Indoor-2 run is already as good as the final one (0.2-0.4 m); the live loss is the start-up scale of the fusion (+20 % for 10 s, 1-2 m) and the drift before the loop, and a fixed-lag output would give up the live property. The servo attacks the cause instead.
+* **Gravity-aligned map and gyro prior in live mode** (idea 4): already on in the live pipeline (`full` = `gravity=1 rframe=1 merge=1 gyro=1`, the `servo` variant adds only the servo); nothing to change.
+
+### 16.6 Baseline checks
+
+With the servo off: `trajectory.tum` of the new binaries (pp_live and sv_run) is `cmp`-identical to the section-13 `sv_full` runs on all six sequences (Indoor-1/2, ADVIO-15/20, Outdoor-1/2); stella_vio fr1_xyz exact-port check CMP-IDENTICAL to stella_port (787 poses); `gf_table.py` 893 numbers, `gf_gait_study.py fusion` 1578 numbers and `gf_georef_table.py` 140 numbers 0 differ; `compare_py.py` 8 cases, `test_geo.py`, `test_georef.py` pass (`phone_pipeline/check_baselines.sh`); `gnss_fusion/tools/test_auto.py` 6 of 6 PASS. ASan + UBSan build of `pp_live` on a servo run (Indoor-2, mode 1 + gate): no report.
+
+### 16.7 Open issues
+
+* Outdoor / long-walk use of the servo is not solved: the gait detector's 'walking' false positives during the start of Outdoor-1 poison the reference, and mono scale blow-ups (x8 within seconds) are not repaired by a per-keyframe correction. A reference that is validated against the map (e.g. agreement of three disjoint windows) or a one-shot section rescale on a detected blow-up are the next steps; none was tried.
+* Indoor-2 still has twice the final error: the fusion's start-up scale (first alignment from 2-3 speed epochs at 12 s, +15-20 % for 10 s) and the last 20 s before the loop closes.
+* Settings were tuned on the three indoor sequences themselves; there is no held-out indoor set (the outdoor runs are a harm check, not a validation).
+* Disk: images re-fetched with the section-9.2 scripts (peak about 5 GB of JPEG + 1.4 GB fixtures, deleted afterwards); results of this section ~100 MB in `runs/phone_pipeline/*/study16/` (logs, servo traces, `results.json`).

@@ -75,6 +75,17 @@ typedef struct sv_system_params {
                                         * gap (default 4 s; 0 = keep the initial scale prior) */
     int merge_maps;                    /* 1: keep the old map when a new one is started (reinit) and merge the maps again when place recognition
                                         * finds the old map (default 0: the old map is dropped, see RESULTS.md) */
+    /* gait scale servo (section 16 of docs/gnss_vio_benchmark_20261001.md; opt-in, needs sv_system_push_speed() from the host): after every new keyframe
+     * the metric distance walked over the last servo_win seconds (walking-speed epochs pushed by the host) is compared with the map's path length over
+     * the same time; the ratio is held at the value of the first window (servo_dmin metres) of the map: the newest keyframe and its new landmarks are
+     * scaled about the previous keyframe by exp(clip(servo_gain * ln(ratio / reference), +-servo_clip)). servo_gain 0 = off (default, exact path). */
+    double servo_gain, servo_win, servo_dmin, servo_clip;
+    unsigned int loop_cont;            /* loop detector: consecutive keyframes that must agree on a candidate set (0 = stella's 3); opt-in, section 16 */
+    unsigned int loop_matches;         /* loop validation: matches needed (0 = stella's 20); opt-in, section 16 */
+    unsigned int servo_k;              /* servo_mode 2: number of non-overlapping windows whose median ratio is the reference (default 3) */
+    double servo_dead;                 /* dead band on ln(ratio / reference): only the excess is corrected (default 0) */
+    double servo_gate, servo_href;     /* servo_gate > 0: no correction when |ln(ratio / reference)| > gate (default 0 = off); servo_href: metres of history needed (mode 1) */
+    int servo_mode;                    /* reference of the servo: 0 = ratio of the first window, 1 = ratio over the history of the map before the window (see sv_system.c) */
 } sv_system_params;
 
 /* Fills stella's reference TUM config (stella_port/reference/configs/TUM_RGBD_mono_1_deterministic.yaml). */
@@ -137,6 +148,11 @@ const sv_tracker* sv_system_tracker(const sv_system* s);
 const int* sv_system_curr_landmarks(const sv_system* s, unsigned int* n);
 /* gravity up direction of a map in that map's world axes (unit vector), from n accumulated frames; returns n (0 = unknown, up untouched) */
 unsigned int sv_system_map_up(const sv_system* s, int map_id, double up[3]);
+/* one walking-speed epoch from the host (end time t on the frame clock, mean speed over the trailing epoch [m/s]); ignored while servo_gain == 0.
+ * Epochs must come in time order, about 3 s apart; a stationary epoch is v = 0. A missing epoch (no valid speed) is a gap: no servo step over it. */
+void sv_system_push_speed(sv_system* s, double t, double v);
+/* trace of the servo decisions (t, map label, walked metres, map units, ratio, reference ratio (0 = not set yet), ln f applied); rows valid until the system is destroyed */
+unsigned int sv_system_servo_log(const sv_system* s, const double (**rows)[7]);
 /* map counters */
 unsigned int sv_system_num_landmarks(const sv_system* s);
 /* run statistics */
@@ -145,6 +161,7 @@ typedef struct sv_system_stats {
     unsigned int lost_frames;
     unsigned int reinits;          /* stella_vio: re-initializations into a new map after a failed relocalization */
     unsigned int merges;           /* stella_vio merge_maps: map merges */
+    unsigned int servo_steps;      /* stella_vio gait scale servo: corrections applied */
     unsigned int rframes, rframes_gyro, rbridges, rfail; /* stella_vio R-frames: frames, of them gyro only, bridged initializations, chains that died */
     unsigned int erased_keyframes, destroyed_keyframes;
 } sv_system_stats;

@@ -193,6 +193,18 @@ struct sv_system {
     double (*up_sum)[3];
     unsigned int* up_n;
     unsigned int up_cap;
+
+    /* stella_vio gait scale servo (opt-in, servo_gain > 0) */
+    double sv_t[64], sv_v[64];     /* speed epochs from the host (end time, speed), newest last */
+    unsigned int sv_n;
+    int sv_ref_valid, sv_ref_label;
+    double sv_ref;                 /* reference ratio metres / map unit of the current map */
+    double sv_k_r[8], sv_k_t;      /* servo_mode 2: ratios of the first non-overlapping windows (their median is the reference) */
+    unsigned int sv_k_n;
+    double sv_h_dg, sv_h_dm, sv_h_t; /* servo_mode 1: walked metres / map units of the epochs already older than the window (history), end time of the last one */
+    unsigned int sv_steps;         /* servo corrections applied */
+    double (*sv_log)[7];           /* trace of every servo decision: t, label, dg, dm, ratio, ref, ln f */
+    unsigned int sv_nlog, sv_caplog;
 };
 
 /* ------------------------------------------------------------------ */
@@ -299,6 +311,17 @@ void sv_system_params_default(sv_system_params* p, const sv_bow_vocab* vocab) {
     p->rframe_gyro_max = 40;
     p->rframe_calib_sec = 4.0;
     p->merge_maps = 0;
+    p->servo_gain = 0.0;
+    p->servo_win = 12.0;
+    p->servo_dmin = 5.0;
+    p->servo_clip = 0.05;
+    p->servo_mode = 0;
+    p->servo_gate = 0.0;
+    p->servo_dead = 0.0;
+    p->servo_k = 3;
+    p->servo_href = 10.0;
+    p->loop_cont = 0;
+    p->loop_matches = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -721,6 +744,12 @@ sv_system* sv_system_create(const sv_system_params* p) {
     ensure_lm_capacity(s, 4096);
     sv_mapping_init(&s->mp, &s->cfg, &s->map);
     sv_loop_init(&s->lp, &s->cfg, &s->mp);
+    if (s->p.loop_cont) {
+        s->lp.min_continuity = s->p.loop_cont;
+    }
+    if (s->p.loop_matches) {
+        s->lp.num_matches_thr = s->p.loop_matches;
+    }
     sv_tracker_init(&s->trk, &s->cfg);
     s->trk.imu = p->imu;
     s->trk.gyro_mode = p->gyro_mode;
@@ -748,6 +777,7 @@ void sv_system_destroy(sv_system* s) {
     if (!s) {
         return;
     }
+    free(s->sv_log);
     sv_tracker_free(&s->trk);
     sv_loop_free(&s->lp);
     sv_mapping_free(&s->mp);
@@ -867,6 +897,16 @@ static void refresh_last_inserted(sv_system* s) {
     m->last_inserted_trans_wc[2] = k->trans_wc[2];
 }
 
+/* gait scale servo: forget the reference (new map, loop correction): the first window / the history start again */
+static void servo_reset_ref(sv_system* s) {
+    s->sv_ref_valid = 0;
+    s->sv_h_dg = 0.0;
+    s->sv_h_dm = 0.0;
+    s->sv_h_t = -1e300;
+    s->sv_k_n = 0;
+    s->sv_k_t = -1e300;
+}
+
 /* mapping_module::run_step for one queued keyframe: mapping_with_new_keyframe, then hand it to the global
  * optimization module unless it is a spanning root */
 static int mapping_pass(sv_system* s, unsigned int kf_id) {
@@ -908,6 +948,7 @@ static void global_step(sv_system* s, unsigned int cur_id) {
     if (validated) {
         if (sv_loop_correct(L, cur_id) == 0) {
             s->cur_loop_accepted = 1;
+            servo_reset_ref(s); /* servo: the loop correction rewrote the map's scale; the reference is taken again */
             s->cur_loop_cur = (int)cur_id;
             s->cur_loop_cand = L->selected;
             s->stats.loops_accepted++;
@@ -972,6 +1013,12 @@ static void sys_reset(sv_system* s) {
     sv_mapping_init(&s->mp, &s->cfg, &s->map);
     sv_loop_free(&s->lp);
     sv_loop_init(&s->lp, &s->cfg, &s->mp);
+    if (s->p.loop_cont) {
+        s->lp.min_continuity = s->p.loop_cont;
+    }
+    if (s->p.loop_matches) {
+        s->lp.num_matches_thr = s->p.loop_matches;
+    }
     for (i = 0; i < n_keep; ++i) {
         sv_loop_add_prev(&s->lp, keep[i].lead, keep[i].continuity, keep[i].ids, keep[i].n);
         free(keep[i].ids);
@@ -1010,6 +1057,8 @@ static void sys_reset(sv_system* s) {
     s->trk.last_reloc_frm_id = 0;
     s->trk.last_reloc_frm_timestamp = 0.0;
     s->trk.tracking_state = 0;
+    servo_reset_ref(s);
+    s->sv_n = 0;
     s->stats.resets++;
     s->cur_reset = 1;
     wire_hooks(s);
@@ -1044,6 +1093,8 @@ static void sys_soft_reset(sv_system* s) {
     s->last_ins_kf = SV_TR_NONE;
     s->map.last_inserted_kf = SV_TR_NONE;
     s->map.kf_floor = s->map.num_keyframes; /* the next map is young again */
+    servo_reset_ref(s);
+    s->sv_n = 0;
     s->n_soft++;
     s->stats.resets++;
     s->cur_reset = 1;
@@ -1835,12 +1886,11 @@ unsigned int sv_system_map_up(const sv_system* s, int map_id, double up[3]) {
 }
 
 /* The bridged part (keyframes >= cal_k0, landmarks >= cal_lm0) is a self-consistent similarity copy: scale it by f about the bridge point. */
-static void calibrate_scale(sv_system* s, double f) {
+static void scale_section(sv_system* s, unsigned int cal_k0, unsigned int cal_lm0, const double* c0, double f) {
     sv_tracker* t = &s->trk;
     unsigned int id, i;
     int k;
-    const double* c0 = s->cal_c0;
-    for (id = s->cal_k0; id < s->next_keyframe_id && id < s->kf_cap; ++id) {
+    for (id = cal_k0; id < s->next_keyframe_id && id < s->kf_cap; ++id) {
         sv_tr_kf* kf = s->map.kfs[id];
         double pose[16], c[3], Rcw[9];
         int r;
@@ -1861,7 +1911,7 @@ static void calibrate_scale(sv_system* s, double f) {
         pose[14] = -(Rcw[6] * c[0] + Rcw[7] * c[1] + Rcw[8] * c[2]);
         sv_tr_kf_set_pose_cw(kf, pose);
     }
-    for (id = s->cal_lm0; id < s->mp.next_landmark_id && id < s->lm_cap; ++id) {
+    for (id = cal_lm0; id < s->mp.next_landmark_id && id < s->lm_cap; ++id) {
         sv_tr_lm* lm = s->map.lms[id];
         if (!lm || !lm->alive) {
             continue;
@@ -1870,14 +1920,14 @@ static void calibrate_scale(sv_system* s, double f) {
             lm->pos_w[k] = c0[k] + f * (lm->pos_w[k] - c0[k]);
         }
     }
-    for (id = s->cal_lm0; id < s->mp.next_landmark_id && id < s->lm_cap; ++id) {
+    for (id = cal_lm0; id < s->mp.next_landmark_id && id < s->lm_cap; ++id) {
         sv_tr_lm* lm = s->map.lms[id];
         if (lm && lm->alive) {
             sv_tr_lm_update_mean_normal_and_obs_scale_variance(&s->cfg, &s->map, lm);
         }
     }
     for (i = 0; i < s->fs_cap; ++i) { /* frames referenced to the part: relative translation scales */
-        if (s->fs[i].valid && s->fs[i].ref >= (int)s->cal_k0) {
+        if (s->fs[i].valid && s->fs[i].ref >= (int)cal_k0) {
             s->fs[i].rel[12] *= f;
             s->fs[i].rel[13] *= f;
             s->fs[i].rel[14] *= f;
@@ -1892,7 +1942,234 @@ static void calibrate_scale(sv_system* s, double f) {
         s->ema_vel[k] *= f;
     }
     s->ema_speed *= f;
+}
+
+static void calibrate_scale(sv_system* s, double f) {
+    scale_section(s, s->cal_k0, s->cal_lm0, s->cal_c0, f);
     s->cal_on = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* gait scale servo (opt-in)                                          */
+/* ------------------------------------------------------------------ */
+void sv_system_push_speed(sv_system* s, double t, double v) {
+    if (s->p.servo_gain <= 0.0) {
+        return;
+    }
+    if (s->sv_n == 64) {
+        memmove(s->sv_t, s->sv_t + 1, 63 * sizeof(double));
+        memmove(s->sv_v, s->sv_v + 1, 63 * sizeof(double));
+        s->sv_n = 63;
+    }
+    s->sv_t[s->sv_n] = t;
+    s->sv_v[s->sv_n] = v;
+    s->sv_n++;
+}
+
+unsigned int sv_system_servo_log(const sv_system* s, const double (**rows)[7]) {
+    *rows = (const double(*)[7])s->sv_log;
+    return s->sv_nlog;
+}
+
+/* position of the keyframe chain (ids kids[0..n-1], newest first, time ascending reversed) at time tau, linear between neighbours */
+static int servo_pos_at(const sv_system* s, const unsigned int* kids, unsigned int n, double tau, double pos[3]) {
+    unsigned int i;
+    for (i = 0; i + 1 < n; ++i) { /* kids[i] newer than kids[i + 1] */
+        const sv_tr_kf* a = s->map.kfs[kids[i + 1]];
+        const sv_tr_kf* b = s->map.kfs[kids[i]];
+        if (a->timestamp <= tau && tau <= b->timestamp) {
+            const double w = b->timestamp > a->timestamp ? (tau - a->timestamp) / (b->timestamp - a->timestamp) : 0.0;
+            int k;
+            for (k = 0; k < 3; ++k) {
+                pos[k] = (1.0 - w) * a->trans_wc[k] + w * b->trans_wc[k];
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* walked metres and map path length of the epoch interval (ta, tb] along the keyframe chain; 0 when the chain does not cover it */
+static int servo_map_len(const sv_system* s, const unsigned int* kids, unsigned int n, double ta, double tb, double* dm) {
+    double pa[3], pb[3], prev[3], len = 0.0;
+    unsigned int i;
+    int k;
+    if (!servo_pos_at(s, kids, n, ta, pa) || !servo_pos_at(s, kids, n, tb, pb)) {
+        return 0;
+    }
+    memcpy(prev, pa, sizeof(prev));
+    for (i = n; i > 0; --i) {
+        const sv_tr_kf* kf = s->map.kfs[kids[i - 1]];
+        double d2 = 0.0;
+        if (kf->timestamp <= ta) {
+            continue;
+        }
+        if (kf->timestamp >= tb) {
+            for (k = 0; k < 3; ++k) {
+                d2 += (pb[k] - prev[k]) * (pb[k] - prev[k]);
+            }
+            len += sqrt(d2);
+            break;
+        }
+        for (k = 0; k < 3; ++k) {
+            d2 += (kf->trans_wc[k] - prev[k]) * (kf->trans_wc[k] - prev[k]);
+            prev[k] = kf->trans_wc[k];
+        }
+        len += sqrt(d2);
+    }
+    *dm = len;
+    return 1;
+}
+
+/* After keyframe new_id (previous keyframe prev_kf, landmarks >= lm0 created by its mapping step): one servo correction.
+ * Window = the last M speed epochs (servo_win seconds). Reference: servo_mode 0 the ratio walked / map length of the first window with servo_dmin metres;
+ * servo_mode 1 the same ratio over the whole history of the map before the window (needs servo_href metres: robust to a gait glitch at the start).
+ * A window whose ratio differs from the reference by more than exp(servo_gate) is not trusted (gait glitch or tracking failure) and gets no correction. */
+static void servo_step(sv_system* s, unsigned int new_id, int prev_kf, unsigned int lm0) {
+    const double dt_nom = 3.0;
+    unsigned int M = (unsigned int)(s->p.servo_win / dt_nom + 0.5), i, n = 0;
+    double dg = 0.0, dm = 0.0, ta, tb, prev_c[3], lf, f, ratio, ref;
+    unsigned int* kids;
+    int label, id;
+    if (M < 2) {
+        M = 2;
+    }
+    if (s->sv_n < M + 1 || prev_kf < 0 || (unsigned int)prev_kf >= s->kf_cap || !s->map.kfs[prev_kf] || !s->map.kfs[prev_kf]->alive) {
+        return;
+    }
+    label = label_root(s, s->kf_label[new_id]);
+    if (label_root(s, s->kf_label[prev_kf]) != label) {
+        return;
+    }
+    tb = s->sv_t[s->sv_n - 1];
+    ta = s->sv_t[s->sv_n - 1 - M];
+    for (i = s->sv_n - M; i < s->sv_n; ++i) { /* walked distance of the window: every epoch must follow the previous one */
+        const double d = s->sv_t[i] - s->sv_t[i - 1];
+        if (d <= 0.0 || d > 1.3 * dt_nom) {
+            return;
+        }
+        dg += s->sv_v[i] * d;
+    }
+    if (tb > s->map.kfs[new_id]->timestamp) {
+        return;
+    }
+    kids = (unsigned int*)malloc((new_id + 1) * sizeof(unsigned int));
+    for (id = (int)new_id; id >= 0; --id) { /* alive keyframes of this map, newest first, back to the window start (+ one epoch for the history) */
+        const sv_tr_kf* kf = s->map.kfs[id];
+        if (!kf || !kf->alive || label_root(s, s->kf_label[id]) != label) {
+            continue;
+        }
+        kids[n++] = (unsigned int)id;
+        if (kf->timestamp <= ta - 1.3 * dt_nom) {
+            break;
+        }
+    }
+    if (n < 3 || !servo_map_len(s, kids, n, ta, tb, &dm)) {
+        free(kids);
+        return;
+    }
+    if (s->p.servo_mode == 1) { /* epochs that have just become older than the window enter the history */
+        for (i = 1; i < s->sv_n - M; ++i) {
+            const double d = s->sv_t[i] - s->sv_t[i - 1];
+            double dmi;
+            if (s->sv_t[i] <= s->sv_h_t || d <= 0.0 || d > 1.3 * dt_nom) {
+                continue;
+            }
+            if (servo_map_len(s, kids, n, s->sv_t[i - 1], s->sv_t[i], &dmi)) {
+                s->sv_h_dg += s->sv_v[i] * d;
+                s->sv_h_dm += dmi;
+                s->sv_h_t = s->sv_t[i];
+            }
+        }
+    }
+    free(kids);
+    if (dm <= 1e-9) {
+        return;
+    }
+    ratio = dg / dm;
+    if (s->sv_nlog == s->sv_caplog) {
+        s->sv_caplog = s->sv_caplog ? 2 * s->sv_caplog : 256;
+        s->sv_log = (double(*)[7])realloc(s->sv_log, s->sv_caplog * sizeof(*s->sv_log));
+    }
+    s->sv_log[s->sv_nlog][0] = s->map.kfs[new_id]->timestamp;
+    s->sv_log[s->sv_nlog][1] = label;
+    s->sv_log[s->sv_nlog][2] = dg;
+    s->sv_log[s->sv_nlog][3] = dm;
+    s->sv_log[s->sv_nlog][4] = ratio;
+    s->sv_log[s->sv_nlog][5] = 0.0;
+    s->sv_log[s->sv_nlog][6] = 0.0;
+    s->sv_nlog++;
+    if (s->p.servo_mode == 1) {
+        if (s->sv_h_dg < s->p.servo_href || s->sv_h_dm <= 1e-9) {
+            return;
+        }
+        ref = s->sv_h_dg / s->sv_h_dm;
+    }
+    else if (s->p.servo_mode == 2) { /* median of the first servo_k non-overlapping windows: robust to a gait glitch at the start of the run */
+        if (!s->sv_ref_valid || s->sv_ref_label != label) {
+            if (dg >= s->p.servo_dmin && tb >= s->sv_k_t + s->p.servo_win) {
+                unsigned int a, b, nk = s->p.servo_k > 8 ? 8 : (s->p.servo_k ? s->p.servo_k : 1);
+                s->sv_k_r[s->sv_k_n++] = ratio;
+                s->sv_k_t = tb;
+                if (s->sv_k_n >= nk) {
+                    for (a = 1; a < s->sv_k_n; ++a) { /* insertion sort */
+                        const double x = s->sv_k_r[a];
+                        for (b = a; b > 0 && s->sv_k_r[b - 1] > x; --b) {
+                            s->sv_k_r[b] = s->sv_k_r[b - 1];
+                        }
+                        s->sv_k_r[b] = x;
+                    }
+                    s->sv_ref = s->sv_k_r[s->sv_k_n / 2];
+                    s->sv_ref_valid = 1;
+                    s->sv_ref_label = label;
+                }
+            }
+            return;
+        }
+        ref = s->sv_ref;
+    }
+    else {
+        if (!s->sv_ref_valid || s->sv_ref_label != label) {
+            if (dg >= s->p.servo_dmin) {
+                s->sv_ref = ratio;
+                s->sv_ref_valid = 1;
+                s->sv_ref_label = label;
+            }
+            return;
+        }
+        ref = s->sv_ref;
+    }
+    s->sv_log[s->sv_nlog - 1][5] = ref;
+    if (dg < 0.5 * s->p.servo_dmin) {
+        return;
+    }
+    lf = log(ratio / ref);
+    if (s->p.servo_gate > 0.0 && fabs(lf) > s->p.servo_gate) {
+        return;
+    }
+    if (lf > s->p.servo_dead) { /* dead band: a reference that is a few percent off must not be fought at every keyframe */
+        lf -= s->p.servo_dead;
+    }
+    else if (lf < -s->p.servo_dead) {
+        lf += s->p.servo_dead;
+    }
+    else {
+        lf = 0.0;
+    }
+    lf *= s->p.servo_gain;
+    if (lf > s->p.servo_clip) {
+        lf = s->p.servo_clip;
+    }
+    else if (lf < -s->p.servo_clip) {
+        lf = -s->p.servo_clip;
+    }
+    f = exp(lf);
+    s->sv_log[s->sv_nlog - 1][6] = lf;
+    memcpy(prev_c, s->map.kfs[prev_kf]->trans_wc, sizeof(prev_c));
+    scale_section(s, new_id, lm0, prev_c, f);
+    set_last_inserted(s, new_id);
+    s->sv_steps++;
+    s->stats.servo_steps++;
 }
 
 int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame_result* out) {
@@ -2046,10 +2323,15 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
             s->kf_label[new_id] = t->curr_frm.ref_kf >= 0 && (unsigned int)t->curr_frm.ref_kf < s->kf_cap ? s->kf_label[t->curr_frm.ref_kf] : s->map_id;
             fd_keep(s, fd);
             s->kf_fd[new_id] = fd;
+            const int servo_prev = s->map.last_inserted_kf;
+            const unsigned int servo_lm0 = s->mp.next_landmark_id;
             if (sv_tr_create_new_keyframe(&s->cfg, &s->map, &t->curr_frm, new_id, timestamp, kf) == 0 &&
                 mapping_pass(s, new_id) == 0) {
                 inserted = (int)new_id;
                 s->stats.keyframes_inserted++;
+                if (s->p.servo_gain > 0.0) {
+                    servo_step(s, new_id, servo_prev, servo_lm0);
+                }
             }
         }
         res->track_succeeded = succeeded;
