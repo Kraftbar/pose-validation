@@ -1,0 +1,842 @@
+0010: module M5d instrumentation (ViGraph / ViGraphEstimator mutation log), active only with OKVIS_PORT_GRAPH_DUMP_DIR.
+ New header okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp: every OUTERMOST ViGraph / ViGraphEstimator
+ mutation (nested calls such as removeObservation inside convertToPoseGraphMst are not logged) and every direct access
+ of ViSlamBackend to a graph (initial fixation, constant/variable landmarks, observation information, copying states into
+ the full graph, ImuError::syncFrom, landmark classification) is written as a framed record (tag >= 32; layouts in
+ okvis_port/c/ok_vigraph.h) into the same problem.bin stream as the Ceres Problem log of patch 0009, right AFTER the
+ Problem calls it made (one RAII scope per mutation, written on exit). ViGraph::optimise() additionally logs the graph
+ state before the solve (states, the digest of every parameter block incl. landmark quality / classification, the digest
+ of every IMU term) and what the solver changed afterwards (parameter values, IMU re-integration state), so a replay can
+ compare the whole graph at every optimise() and carry the solver output into its own state. ImuError gets a read-only
+ accessor of its redo state. Observational only: no computed value changes, no uninitialised memory is read.
+--- a/okvis_ceres/include/okvis/ViGraph.hpp
++++ b/okvis_ceres/include/okvis/ViGraph.hpp
+@@ -40,6 +40,7 @@
+ #define INCLUDE_OKVIS_VIGRAPH2_HPP_
+ 
+ #include <okvis/ceres/OkvisPortTrace.hpp>
++#include <okvis/ceres/OkvisPortVigraphLog.hpp>  // okvis_port (patch 0010)
+ #include <memory>
+ 
+ #pragma GCC diagnostic push
+@@ -179,6 +180,8 @@
+    * @return True on success.
+    */
+   bool setLandmarkQuality(LandmarkId landmarkId, double quality) {
++    okvis_portv::Scope portScope(okvis_portv::M_SETLMQ, this);  // okvis_port (patch 0010)
++    portScope.a.u64(landmarkId.value()); portScope.a.f64(quality);
+     //OKVIS_CHECK_MAP(landmarks_,landmarkId);
+     landmarks_.at(landmarkId).quality = quality;
+     return true;
+@@ -321,6 +324,12 @@
+     multiFrame.getKeypointSize(keypointId.cameraIndex, keypointId.keypointIndex, size);
+     information *= 64.0 / (size * size);
+ 
++    okvis_portv::Scope portScope(okvis_portv::M_ADDOBS, this);  // okvis_port (patch 0010)
++    if (portScope.top()) {
++      portScope.a.u64(landmarkId.value()); okvis_portv::putKid(portScope.a, keypointId);
++      portScope.a.u32(useCauchy ? 1u : 0u); portScope.a.f64n(measurement.data(), 2); portScope.a.f64(size);
++      multiFrame.template geometryAs<GEOMETRY_TYPE>(keypointId.cameraIndex)->portHeader(portScope.a);
++    }
+     // create error term
+     Observation observation;
+     observation.errorTerm.reset(new ceres::ReprojectionError<GEOMETRY_TYPE>(
+@@ -357,6 +366,12 @@
+   bool addExternalObservation(
+       const std::shared_ptr<const ceres::ReprojectionError2dBase> & reprojectionError,
+        LandmarkId landmarkId, KeypointIdentifier keypointId, bool useCauchy = true) {
++    okvis_portv::Scope portScope(okvis_portv::M_ADDEXTOBS, this);  // okvis_port (patch 0010)
++    if (portScope.top()) {
++      portScope.a.u64(landmarkId.value()); okvis_portv::putKid(portScope.a, keypointId);
++      portScope.a.u32(useCauchy ? 1u : 0u); portScope.a.u64(uint64_t(reinterpret_cast<uintptr_t>(reprojectionError.get())));
++      reprojectionError->portDump(portScope.a);
++    }
+     OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark not added")
+ 
+     // avoid double observations
+--- a/okvis_ceres/src/ViGraph.cpp
++++ b/okvis_ceres/src/ViGraph.cpp
+@@ -65,18 +65,28 @@
+       ::ceres::Ownership::DO_NOT_TAKE_OWNERSHIP;
+   problemOptions.enable_fast_removal = true;
+   problem_.reset(new ::ceres::Problem(problemOptions));
++  { okvis_portv::Scope portScope(okvis_portv::M_NEW, this);  // okvis_port (patch 0010)
++    portScope.a.u64(uint64_t(reinterpret_cast<uintptr_t>(problem_.get()))); }
+   options_.linear_solver_type = ::ceres::SPARSE_NORMAL_CHOLESKY;
+   options_.trust_region_strategy_type = ::ceres::DOGLEG;
+   //options_.dense_linear_algebra_library_type = ::ceres::LAPACK; // somehow slow on Jetson...
+ }
+ 
+ int ViGraph::addCamera(const CameraParameters& cameraParameters) {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDCAM, this);  // okvis_port (patch 0010)
++  portScope.a.u32(cameraParameters.online_calibration.do_extrinsics ? 1u : 0u);
++  portScope.a.f64(cameraParameters.online_calibration.sigma_r); portScope.a.f64(cameraParameters.online_calibration.sigma_alpha);
+   cameraParametersVec_.push_back(cameraParameters);
+   return static_cast<int>(cameraParametersVec_.size()) - 1;
+ }
+ 
+ // Add an IMU to the configuration.
+ int ViGraph::addImu(const ImuParameters& imuParameters) {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDIMU, this);  // okvis_port (patch 0010)
++  { auto& a = portScope.a; a.u32(imuParameters.use ? 1u : 0u); okvis_portv::putT(a, imuParameters.T_BS);
++    a.f64(imuParameters.a_max); a.f64(imuParameters.g_max); a.f64(imuParameters.sigma_g_c); a.f64(imuParameters.sigma_bg);
++    a.f64(imuParameters.sigma_a_c); a.f64(imuParameters.sigma_ba); a.f64(imuParameters.sigma_gw_c); a.f64(imuParameters.sigma_aw_c);
++    a.f64n(imuParameters.g0.data(), 3); a.f64n(imuParameters.a0.data(), 3); a.f64(imuParameters.g); }
+   if (imuParametersVec_.size() > 1) {
+     LOG(ERROR) << "only one IMU currently supported";
+     return -1;
+@@ -89,6 +99,12 @@
+     const Time &timestamp, const ImuMeasurementDeque &imuMeasurements,
+     const cameras::NCameraSystem & nCameraSystem)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_INIT, this);  // okvis_port (patch 0010)
++  if (portScope.top()) {
++    okvis_portv::putTime(portScope.a, timestamp); okvis_portv::putMeas(portScope.a, imuMeasurements);
++    portScope.a.u32(uint32_t(cameraParametersVec_.size()));
++    for (size_t i = 0; i < cameraParametersVec_.size(); ++i) okvis_portv::putT(portScope.a, *nCameraSystem.T_SC(i));
++  }
+   State state;
+   state.timestamp = timestamp;
+   state.isKeyframe = true; // first one must be keyframe.
+@@ -196,12 +212,18 @@
+   anyState.v_Sk = Eigen::Vector3d::Zero();
+   anyState_[id] = anyState; // add, never remove.
+ 
++  if (portScope.top()) { portScope.r.u64(id.value()); portScope.r.f64n(states_.at(id).pose->parameters(), 7); portScope.r.f64n(states_.at(id).speedAndBias->parameters(), 9); }
+   return id;
+ }
+ 
+ StateId ViGraph::addStatesPropagate(const Time &timestamp,
+                                      const ImuMeasurementDeque &imuMeasurements, bool isKeyframe)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_PROP, this);  // okvis_port (patch 0010)
++  if (portScope.top()) {
++    okvis_portv::putTime(portScope.a, timestamp); okvis_portv::putMeas(portScope.a, imuMeasurements);
++    portScope.a.u32(isKeyframe ? 1u : 0u);
++  }
+   // propagate state
+   State state;
+   state.timestamp = timestamp;
+@@ -281,6 +303,7 @@
+   anyState.v_Sk = Eigen::Vector3d::Zero();
+   anyState_[id] = anyState; // add, never remove.
+ 
++  if (portScope.top()) { portScope.r.u64(id.value()); portScope.r.f64n(states_.at(id).pose->parameters(), 7); portScope.r.f64n(states_.at(id).speedAndBias->parameters(), 9); }
+   return id;
+ }
+ 
+@@ -384,6 +407,8 @@
+ bool ViGraph::addLandmark(LandmarkId landmarkId, const Eigen::Vector4d &homogeneousPoint,
+                            bool initialised)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDLM_ID, this);  // okvis_port (patch 0010)
++  portScope.a.u64(landmarkId.value()); portScope.a.f64n(homogeneousPoint.data(), 4); portScope.a.u32(initialised ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarkId.isInitialised(), "landmark ID invalid")
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId) == 0, "landmark already exists")
+   Landmark landmark;
+@@ -399,6 +424,8 @@
+ 
+ LandmarkId ViGraph::addLandmark(const Eigen::Vector4d &homogeneousPoint, bool initialised)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDLM_NEW, this);  // okvis_port (patch 0010)
++  portScope.a.f64n(homogeneousPoint.data(), 4); portScope.a.u32(initialised ? 1u : 0u);
+   const LandmarkId landmarkId = landmarks_.empty() ?
+         LandmarkId(1) : LandmarkId(landmarks_.rbegin()->first+1); // always increase highest ID by 1
+   Landmark landmark;
+@@ -410,11 +437,14 @@
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId) == 0, "Bug: landmark not added")
+   landmarks_[landmarkId] = landmark;
+   okvis_port::traceEvent("L2 id=%llu %a %a %a %a init=%d", (unsigned long long)landmarkId.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3], int(initialised));
++  portScope.r.u64(landmarkId.value());
+   return landmarkId;
+ }
+ 
+ bool ViGraph::removeLandmark(LandmarkId landmarkId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMLM, this);  // okvis_port (patch 0010)
++  portScope.a.u64(landmarkId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark does not exists")
+   Landmark& landmark = landmarks_.at(landmarkId);
+ 
+@@ -438,6 +468,8 @@
+ 
+ bool ViGraph::setLandmarkInitialised(LandmarkId landmarkId, bool initialised)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETLM_INIT, this);  // okvis_port (patch 0010)
++  portScope.a.u64(landmarkId.value()); portScope.a.u32(initialised ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark does not exists")
+   landmarks_.at(landmarkId).hPoint->setInitialized(initialised);
+   return true;
+@@ -490,6 +522,8 @@
+ 
+ bool ViGraph::removeObservation(KeypointIdentifier keypointId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMOBS, this);  // okvis_port (patch 0010)
++  okvis_portv::putKid(portScope.a, keypointId);
+   okvis_port::traceEvent("R fr=%llu cam=%zu kp=%zu", (unsigned long long)keypointId.frameId, (size_t)keypointId.cameraIndex, (size_t)keypointId.keypointIndex);
+   OKVIS_ASSERT_TRUE_DBG(Exception, observations_.count(keypointId), "observation does not exists")
+   Observation observation = observations_.at(keypointId);
+@@ -524,6 +558,7 @@
+ 
+ bool ViGraph::computeCovisibilities()
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_COVIS, this);  // okvis_port (patch 0010)
+   if(covisibilitiesComputed_) {
+     return true; // already done previously
+   }
+@@ -557,6 +592,14 @@
+     }
+   }
+   covisibilitiesComputed_ = true;
++  if (portScope.top()) {  // digest of the cached covisibilities
++    portScope.r.u32(1u); portScope.r.u32(uint32_t(coObservationCounts_.size()));
++    for (const auto& i0 : coObservationCounts_) {
++      portScope.r.u64(i0.first); portScope.r.u32(uint32_t(i0.second.size()));
++      for (const auto& i1 : i0.second) { portScope.r.u64(i1.first); portScope.r.u32(uint32_t(i1.second)); }
++    }
++    portScope.r.u32(uint32_t(visibleFrames_.size())); for (const auto& v : visibleFrames_) portScope.r.u64(v.value());
++  }
+   return coObservationCounts_.size()>0;
+ }
+ 
+@@ -586,6 +629,9 @@
+                                          const kinematics::Transformation &T_S0S1,
+                                          const Eigen::Matrix<double, 6, 6> &information)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDRELPOSE, this);  // okvis_port (patch 0010)
++  portScope.a.u64(poseId0.value()); portScope.a.u64(poseId1.value()); okvis_portv::putT(portScope.a, T_S0S1);
++  portScope.a.f64n(information.data(), 36);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(poseId0), "stateId not found")
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(poseId1), "stateId not found")
+   State & state0 = states_.at(poseId0);
+@@ -610,6 +656,8 @@
+ 
+ bool ViGraph::removeRelativePoseConstraint(StateId poseId0, StateId poseId1)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMRELPOSE, this);  // okvis_port (patch 0010)
++  portScope.a.u64(poseId0.value()); portScope.a.u64(poseId1.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(poseId0),
+                         "stateId " << poseId0.value() << " not found")
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(poseId1),
+@@ -671,6 +719,8 @@
+ 
+ bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint, bool initialised)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETLM_FULL, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); portScope.a.f64n(homogeneousPoint.data(), 4); portScope.a.u32(initialised ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(id), "landmark does not exists")
+   auto& landmark = landmarks_.at(id).hPoint;
+   okvis_port::traceEvent("S1 id=%llu %a %a %a %a init=%d", (unsigned long long)id.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3], int(initialised));
+@@ -680,6 +730,8 @@
+ }
+ bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETLM, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); portScope.a.f64n(homogeneousPoint.data(), 4);
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(id), "landmark does not exists")
+   auto& landmark = landmarks_.at(id).hPoint;
+   okvis_port::traceEvent("S2 id=%llu %a %a %a %a", (unsigned long long)id.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3]);
+@@ -760,6 +812,8 @@
+ 
+ bool ViGraph::setKeyframe(StateId id, bool isKeyframe)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETKF, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); portScope.a.u32(isKeyframe ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(id), "state does not exists")
+   states_.at(id).isKeyframe = isKeyframe;
+   return true;
+@@ -767,6 +821,8 @@
+ 
+ bool ViGraph::setPose(StateId id, const kinematics::TransformationCacheless &pose)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETPOSE, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); okvis_portv::putTC(portScope.a, pose);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(id), "state does not exists")
+   states_.at(id).pose->setEstimate(pose);
+   return true;
+@@ -774,6 +830,8 @@
+ 
+ bool ViGraph::setSpeedAndBias(StateId id, const SpeedAndBias &speedAndBias)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETSB, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); portScope.a.f64n(speedAndBias.data(), 9);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(id), "state does not exists")
+   states_.at(id).speedAndBias->setEstimate(speedAndBias);
+   return true;
+@@ -782,6 +840,8 @@
+ bool ViGraph::setExtrinsics(StateId id, uchar camIdx,
+                             const kinematics::TransformationCacheless &extrinsics) const
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SETEXTR, this);  // okvis_port (patch 0010)
++  portScope.a.u64(id.value()); portScope.a.u32(camIdx); okvis_portv::putTC(portScope.a, extrinsics);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(id), "state does not exists")
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.at(id).extrinsics.at(camIdx), "extrinsics do not exists")
+   states_.at(id).extrinsics.at(camIdx)->setEstimate(extrinsics);
+@@ -790,6 +850,7 @@
+ 
+ bool ViGraph::setExtrinsicsVariable()
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_EXTVAR, this);  // okvis_port (patch 0010)
+   for(size_t i=0; i<cameraParametersVec_.size(); ++i) {
+     problem_->SetParameterBlockVariable(states_.begin()->second.extrinsics.at(i)->parameters());
+   }
+@@ -798,6 +859,8 @@
+ 
+ bool ViGraph::softConstrainExtrinsics(double posStd, double rotStd)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_SOFTEXT, this);  // okvis_port (patch 0010)
++  portScope.a.f64(posStd); portScope.a.f64(rotStd);
+   if(states_.begin()->second.extrinsicsPriors.size() == cameraParametersVec_.size())
+   for(size_t i=0; i<cameraParametersVec_.size(); ++i) {
+     problem_->RemoveResidualBlock(states_.begin()->second.extrinsicsPriors.at(i).residualBlockId);
+@@ -819,6 +882,7 @@
+ 
+ void ViGraph::updateLandmarks()
+ {
++  okvis_portv::Scope portScopeUpd(okvis_portv::M_UPDLM, this);  // okvis_port (patch 0010)
+   // okvis_port (patch 0009): sampled dump of the per-landmark inputs and outputs (okvis_port/c/ok_graph.h)
+   static uint64_t portCall = 0;
+   const bool portOn = okvis_portg::Dump::get().onLm();
+@@ -993,6 +1057,62 @@
+ #warning openmp not detected, your system may be slower than expected
+ #endif
+ {
++  // okvis_port (patch 0010): ViGraph mutation record of this optimise() call: the graph state before the solve
++  // (states, parameter-block digests, IMU-link digests) and, after it, what the solver changed.
++  okvis_portv::Scope portScopeOpt(okvis_portv::M_OPT, this);
++  std::vector<double*> portBlkPtr;
++  std::vector<int> portBlkSize;
++  std::vector<double> portBlkShadow;  // 9 doubles per block
++  std::vector<std::pair<const ceres::ImuError*, uint64_t>> portImu;
++  if (portScopeOpt.top()) {
++    okvis_portv::Buf& a = portScopeOpt.a;
++    a.u32(uint32_t(maxIterations)); a.u32(uint32_t(options_.linear_solver_type)); a.f64(options_.function_tolerance);
++    a.u32(uint32_t(states_.size()));
++    for (const auto& st : states_) {
++      a.u64(st.first.value()); a.u32(st.second.isKeyframe ? 1u : 0u); okvis_portv::putTime(a, st.second.timestamp);
++      a.u32(uint32_t(st.second.observations.size())); a.u32(uint32_t(st.second.twoPoseLinks.size()));
++      a.u32(uint32_t(st.second.twoPoseConstLinks.size())); a.u32(uint32_t(st.second.relativePoseLinks.size()));
++    }
++    std::unordered_set<const double*> seen;
++    std::vector<std::pair<double*, uint32_t>> blk;  // pointer, size | flags << 8
++    std::vector<const Landmark*> lmOf;
++    std::vector<uint64_t> lmIdOf;
++    auto addBlk = [&](double* p, int size, uint32_t flags, const Landmark* lm = nullptr, uint64_t lmId = 0) {
++      if (!seen.insert(p).second) return;
++      lmOf.push_back(lm); lmIdOf.push_back(lmId);
++      portBlkPtr.push_back(p); portBlkSize.push_back(size);
++      blk.push_back(std::make_pair(p, flags));
++    };
++    for (const auto& st : states_) {
++      addBlk(st.second.pose->parameters(), 7, st.second.pose->fixed() ? 1u : 0u);
++      addBlk(st.second.speedAndBias->parameters(), 9, st.second.speedAndBias->fixed() ? 1u : 0u);
++      for (const auto& ex : st.second.extrinsics) addBlk(ex->parameters(), 7, ex->fixed() ? 1u : 0u);
++    }
++    for (const auto& lm : landmarks_) {
++      addBlk(lm.second.hPoint->parameters(), 4, (lm.second.hPoint->fixed() ? 1u : 0u) | (lm.second.hPoint->initialized() ? 2u : 0u), &lm.second, lm.first.value());
++    }
++    a.u32(uint32_t(blk.size()));
++    for (size_t i = 0; i < blk.size(); ++i) {
++      const int size = portBlkSize[i];
++      a.u64(uint64_t(reinterpret_cast<uintptr_t>(blk[i].first))); a.u32(uint32_t(size)); a.u32(blk[i].second);
++      a.u64(okvis_port_solve::fnv(blk[i].first, 8 * size_t(size)));
++      if (lmOf[i]) {  // landmark: quality and classification take part in the later decisions
++        a.f64(lmOf[i]->quality); a.u32(uint32_t(lmOf[i]->classification)); a.u64(lmIdOf[i]);
++      }
++      for (int k = 0; k < 9; ++k) portBlkShadow.push_back(k < size ? blk[i].first[k] : 0.0);
++    }
++    uint32_t nimu = 0;
++    for (const auto& st : states_) if (st.second.previousImuLink.errorTerm) ++nimu;
++    a.u32(nimu);
++    for (const auto& st : states_) {
++      const auto* imu = dynamic_cast<const ceres::ImuError*>(st.second.previousImuLink.errorTerm.get());
++      if (!st.second.previousImuLink.errorTerm) continue;
++      uint64_t h = 0;
++      if (imu) { okvis_port::Buf sb; imu->portSnapshotImpl(sb, false, true); h = okvis_port_solve::fnv(sb.b.data(), sb.b.size()); }
++      a.u64(st.first.value()); a.u64(h);
++      portImu.push_back(std::make_pair(imu, h));
++    }
++  }
+   // assemble options
+ 
+ #ifdef USE_OPENMP
+@@ -1149,6 +1269,34 @@
+   ::ceres::Solve(options_, problem_.get(), &summary_);
+   okvis_port_solve::g.armed = false;  // okvis_port (patch 0008)
+   if (okvis_port_solve::g.f) std::fflush(okvis_port_solve::g.f);
++  if (portScopeOpt.top()) {  // okvis_port (patch 0010): what the solver changed in the parameter blocks / IMU terms
++    okvis_portv::Buf& r = portScopeOpt.r;
++    okvis_portv::Buf ch;
++    uint32_t nch = 0;
++    for (size_t i = 0; i < portBlkPtr.size(); ++i) {
++      const int size = portBlkSize[i];
++      if (std::memcmp(portBlkPtr[i], &portBlkShadow[9 * i], 8 * size_t(size)) != 0) {
++        ch.u32(uint32_t(i)); ch.f64n(portBlkPtr[i], size_t(size)); ++nch;
++      }
++    }
++    r.u32(nch); r.raw(ch.b.data(), ch.b.size());
++    okvis_portv::Buf ci;
++    uint32_t nci = 0;
++    size_t k = 0;
++    for (const auto& st : states_) {
++      if (!st.second.previousImuLink.errorTerm) continue;
++      const auto& pi = portImu[k++];
++      if (!pi.first) continue;
++      okvis_port::Buf sb; pi.first->portSnapshotImpl(sb, false, true);
++      if (okvis_port_solve::fnv(sb.b.data(), sb.b.size()) != pi.second) {
++        bool redo; int counter; const double* sbRef;
++        pi.first->portRedoState(redo, counter, sbRef);
++        ci.u64(st.first.value()); ci.u32(redo ? 1u : 0u); ci.u32(uint32_t(counter)); ci.f64n(sbRef, 9); ++nci;
++      }
++    }
++    r.u32(nci); r.raw(ci.b.data(), ci.b.size());
++    r.u32(uint32_t(summary_.termination_type)); r.u32(uint32_t(summary_.iterations.size()));
++  }
+ 
+   if (portTrace) {
+     std::fprintf(portTrace, "solve %llu solver=%d states=%zu landmarks=%zu inputhash=%016llx obs=%016llx struct=%016llx nres=%d init=%.17g final=%.17g iters=%zu term=%d\n",
+@@ -1191,6 +1339,7 @@
+ 
+ int ViGraph::cleanUnobservedLandmarks(std::map<LandmarkId, std::set<KeypointIdentifier> > *removed)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_CLEANLM, this);  // okvis_port (patch 0010)
+   int ctr = 0;
+   for (auto it = landmarks_.begin(); it != landmarks_.end(); ) {
+     const auto& lm = it->second;
+@@ -1212,6 +1361,7 @@
+       ++it;
+     }
+   }
++  portScope.r.u32(uint32_t(ctr));
+   return ctr;
+ }
+ 
+--- a/okvis_ceres/src/ViGraphEstimator.cpp
++++ b/okvis_ceres/src/ViGraphEstimator.cpp
+@@ -41,12 +41,15 @@
+ #include <okvis/ceres/TwoPoseExtrinsicsGraphError.hpp>
+ #include <okvis/ViGraphEstimator.hpp>
+ #include <okvis/MstGraph.hpp>
++#include <okvis/ceres/OkvisPortDump.hpp>  // okvis_port (patch 0010)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+ 
+ bool ViGraphEstimator::removeAllObservations(StateId stateId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMALLOBS, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+   std::map<KeypointIdentifier, Observation> observations = states_.at(stateId).observations;
+   for(auto observation : observations) {
+@@ -57,6 +60,8 @@
+ 
+ bool ViGraphEstimator::eliminateStateByImuMerge(StateId stateId, StateId refId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_ELIM, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value()); portScope.a.u64(refId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+ 
+   // also remove relative pose links
+@@ -146,6 +151,14 @@
+   kinematics::Transformation T_Sk_W = otherstate.pose->estimate().inverse();
+   anyState.T_Sk_S = T_Sk_W * states_[stateId].pose->estimate();
+   anyState.v_Sk = T_Sk_W.C() * otherstate.speedAndBias->estimate().head<3>();
++  if (portScope.top()) {  // okvis_port (patch 0010)
++    portScope.r.u64(anyState.keyframeId.value()); okvis_portv::putT(portScope.r, anyState.T_Sk_S);
++    portScope.r.f64n(anyState.v_Sk.data(), 3);
++    const auto imu = std::dynamic_pointer_cast<ceres::ImuError>(previousImuLink.errorTerm);
++    uint64_t h = 0;
++    if (imu) { okvis_port::Buf sb; imu->portSnapshotImpl(sb, false, true); h = okvis_port_solve::fnv(sb.b.data(), sb.b.size()); }
++    portScope.r.u64(h);
++  }
+ 
+   // book-keeping
+   OKVIS_ASSERT_TRUE(Exception,
+@@ -159,6 +172,8 @@
+ bool ViGraphEstimator::mergeLandmark(LandmarkId fromId, LandmarkId intoId,
+                                      std::map<StateId, MultiFramePtr> &multiFrames)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_MERGELM, this);  // okvis_port (patch 0010)
++  portScope.a.u64(fromId.value()); portScope.a.u64(intoId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(fromId), "Landmark ID not found")
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(intoId), "Landmark ID not found")
+ 
+@@ -201,6 +216,8 @@
+ 
+ bool ViGraphEstimator::freezePosesUntil(StateId stateId, bool removeInCeres)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_FREEZE_POSES, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value()); portScope.a.u32(removeInCeres ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+   bool first = true;
+   for(auto iter = states_.find(stateId); ; --iter) {
+@@ -230,6 +247,8 @@
+ 
+ bool ViGraphEstimator::unfreezePosesFrom(StateId stateId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_UNFREEZE_POSES, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+   for(auto riter = states_.rbegin(); riter != states_.rend(); ++riter) {
+     riter->second.pose->setFixed(false);
+@@ -243,6 +262,8 @@
+ 
+ bool ViGraphEstimator::freezeSpeedAndBiasesUntil(StateId stateId, bool removeInCeres)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_FREEZE_SB, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value()); portScope.a.u32(removeInCeres ? 1u : 0u);
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+   bool first = true;
+   for(auto iter = states_.find(stateId); ; --iter) {
+@@ -272,6 +293,8 @@
+ 
+ bool ViGraphEstimator::unfreezeSpeedAndBiasesFrom(StateId stateId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_UNFREEZE_SB, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value());
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
+   for(auto riter = states_.rbegin(); riter != states_.rend(); ++riter) {
+     riter->second.speedAndBias->setFixed(false);
+@@ -324,9 +347,15 @@
+     std::vector<std::pair<StateId,StateId>> * removedTwoPoseErrors,
+     std::vector<KeypointIdentifier> * removedObservations)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_MST, this);  // okvis_port (patch 0010)
++  if (portScope.top()) {
++    portScope.a.u32(uint32_t(states.size())); for (const auto& v : states) portScope.a.u64(v.value());
++    portScope.a.u32(uint32_t(statesToConsider.size())); for (const auto& v : statesToConsider) portScope.a.u64(v.value());
++  }
+   // first build the MST
+   buildMst(statesToConsider);
+   if(mstEdges_.empty()) {
++    portScope.r.u32(0u);
+     return false; // nothing to do...
+   }
+ 
+@@ -592,6 +621,20 @@
+     }
+   }
+ 
++  if (portScope.top()) {  // okvis_port (patch 0010): results
++    portScope.r.u32(1u);
++    portScope.r.u32(uint32_t(mstEdges_.size()));
++    for (const auto& e : mstEdges_) { portScope.r.u64(mstFrameIds_.at(size_t(e.first))); portScope.r.u64(mstFrameIds_.at(size_t(e.second))); }
++    portScope.r.u32(createdPoseGraphEdges ? uint32_t(createdPoseGraphEdges->size()) : 0u);
++    if (createdPoseGraphEdges) for (const auto& e : *createdPoseGraphEdges) {
++      portScope.r.u64(e.referenceId.value()); portScope.r.u64(e.otherId.value());
++      portScope.r.u64(uint64_t(reinterpret_cast<uintptr_t>(e.poseGraphError.get())));
++    }
++    portScope.r.u32(removedTwoPoseErrors ? uint32_t(removedTwoPoseErrors->size()) : 0u);
++    if (removedTwoPoseErrors) for (const auto& e : *removedTwoPoseErrors) { portScope.r.u64(e.first.value()); portScope.r.u64(e.second.value()); }
++    portScope.r.u32(removedObservations ? uint32_t(removedObservations->size()) : 0u);
++    if (removedObservations) for (const auto& k : *removedObservations) okvis_portv::putKid(portScope.r, k);
++  }
+   return true;
+ }
+ 
+@@ -726,6 +769,12 @@
+ bool ViGraphEstimator::addExternalTwoPoseLink(
+     const std::shared_ptr<ceres::TwoPoseGraphErrorConst> & twoPoseError,
+     StateId referenceId, StateId otherId) {
++  okvis_portv::Scope portScope(okvis_portv::M_ADDEXTTP, this);  // okvis_port (patch 0010)
++  portScope.a.u64(referenceId.value()); portScope.a.u64(otherId.value());
++  if (portScope.top()) {
++    const auto* c = dynamic_cast<const ceres::TwoPoseStandardGraphErrorConst*>(twoPoseError.get());
++    portScope.a.u32(c ? 1u : 0u); if (c) c->portDump(portScope.a);
++  }
+   // create the link
+   TwoPoseConstLink twoPoseConstLink;
+   twoPoseConstLink.errorTerm = twoPoseError;
+@@ -765,6 +814,8 @@
+ }
+ 
+ bool ViGraphEstimator::removeTwoPoseConstLinks(StateId convertStateId) {
++  okvis_portv::Scope portScope(okvis_portv::M_RMTPC_ALL, this);  // okvis_port (patch 0010)
++  portScope.a.u64(convertStateId.value());
+   // undo pose graph errors into observations
+   const std::map<StateId, TwoPoseConstLink> & poseGraphErrorTerms =
+       states_.at(convertStateId).twoPoseConstLinks;
+@@ -790,6 +841,8 @@
+ 
+ bool ViGraphEstimator::removeTwoPoseConstLink(StateId pose_i, StateId pose_j)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMTPC, this);  // okvis_port (patch 0010)
++  portScope.a.u64(pose_i.value()); portScope.a.u64(pose_j.value());
+   // remove links in connected states
+   OKVIS_ASSERT_TRUE_DBG(Exception, states_.at(pose_i).twoPoseConstLinks.count(pose_j),
+                         "two pose link does not exist")
+@@ -806,6 +859,8 @@
+     std::set<StateId> *connectedStates,
+     std::vector<ceres::TwoPoseGraphError::Observation> *allObservations)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_CONVOBS, this);  // okvis_port (patch 0010)
++  portScope.a.u64(convertStateId.value());
+ 
+   // undo pose graph errors into observations
+   std::map<StateId, TwoPoseLink> & poseGraphErrorTerms =
+@@ -876,14 +931,29 @@
+   // erase all pose graph errors for this frame
+   poseGraphErrorTerms.clear();
+ 
++  if (portScope.top()) {  // okvis_port (patch 0010): results
++    portScope.r.u32(uint32_t(ctr));
++    portScope.r.u32(allObservations ? uint32_t(allObservations->size()) : 0u);
++    if (allObservations) for (const auto& o : *allObservations) {
++      okvis_portv::putKid(portScope.r, o.keypointIdentifier);
++      portScope.r.u64(uint64_t(reinterpret_cast<uintptr_t>(o.reprojectionError.get()))); portScope.r.u64(o.hPoint->id());
++    }
++    portScope.r.u32(createdLandmarks ? uint32_t(createdLandmarks->size()) : 0u);
++    if (createdLandmarks) for (const auto& l : *createdLandmarks) portScope.r.u64(l.value());
++    portScope.r.u32(connectedStates ? uint32_t(connectedStates->size()) : 0u);
++    if (connectedStates) for (const auto& l : *connectedStates) portScope.r.u64(l.value());
++  }
+   return ctr;
+ }
+ 
+ bool ViGraphEstimator::removeSpeedAndBiasPrior(StateId stateId)
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_RMSBPRIOR, this);  // okvis_port (patch 0010)
++  portScope.a.u64(stateId.value());
+   if(states_.at(stateId).speedAndBiasPrior.errorTerm) {
+     problem_->RemoveResidualBlock(states_.at(stateId).speedAndBiasPrior.residualBlockId);
+     states_.at(stateId).speedAndBiasPrior.errorTerm.reset();
++    portScope.r.u32(1u);
+     return true;
+   }
+   return false;
+@@ -891,6 +961,8 @@
+ 
+ void ViGraphEstimator::clear()
+ {
++  okvis_portv::Scope portScope(okvis_portv::M_CLEAR, this);  // okvis_port (patch 0010)
++
+   mstFrameIds_.clear(); // MST frame IDs.
+   mstGraphIdxs_.clear(); // MST graph indices.
+   mstEdges_.clear(); // MST edges.
+@@ -916,6 +988,7 @@
+   visibleFrames_.clear(); // Currently visible frames.
+ 
+   anyState_.clear(); // All states (including non-keyframes).
++  portScope.r.u64(uint64_t(reinterpret_cast<uintptr_t>(problem_.get())));
+ }
+ 
+ int ViGraphEstimator::buildMst(const std::set<StateId> &states, bool keyframesOnly)
+--- a/okvis_ceres/src/ViSlamBackend.cpp
++++ b/okvis_ceres/src/ViSlamBackend.cpp
+@@ -243,10 +243,14 @@
+   if(realtimeGraph_.landmarks_.count(landmarkId)==0) {
+     return false;
+   }
++  { okvis_portv::Scope portScope(okvis_portv::M_SETCLASS, &realtimeGraph_);  // okvis_port (patch 0010)
++    portScope.a.u64(landmarkId.value()); portScope.a.u32(uint32_t(classification)); }
+   realtimeGraph_.landmarks_.at(landmarkId).classification = classification;
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(landmarkId);
+   } else {
++    { okvis_portv::Scope portScope(okvis_portv::M_SETCLASS, &fullGraph_);  // okvis_port (patch 0010)
++      portScope.a.u64(landmarkId.value()); portScope.a.u32(uint32_t(classification)); }
+     fullGraph_.landmarks_.at(landmarkId).classification = classification;
+   }
+   return true;
+@@ -259,8 +263,12 @@
+     touchedLandmarks_.insert(realtimeGraph_.observations_.at(kid).landmarkId);
+     touchedStates_.insert(stateId);
+   } else {
++    { okvis_portv::Scope portScope(okvis_portv::M_POKE_SETINFO, &fullGraph_);  // okvis_port (patch 0010)
++      okvis_portv::putKid(portScope.a, kid); portScope.a.f64n(information.data(), 4); }
+     fullGraph_.observations_.at(kid).errorTerm->setInformation(information);
+   }
++  { okvis_portv::Scope portScope(okvis_portv::M_POKE_SETINFO, &realtimeGraph_);  // okvis_port (patch 0010)
++    okvis_portv::putKid(portScope.a, kid); portScope.a.f64n(information.data(), 4); }
+   realtimeGraph_.observations_.at(kid).errorTerm->setInformation(information);
+   return true;
+ }
+@@ -732,9 +740,10 @@
+     informationDiag[5] = 0.0;
+     initialFixation.reset(
+       new ceres::PoseError(realtimeGraph_.states_.at(StateId(1)).pose->estimate(), informationDiag));
++    { okvis_portv::Scope portScope(okvis_portv::M_POKE_FIX_ADD, &realtimeGraph_);  // okvis_port (patch 0010)
+     initialFixationId = realtimeGraph_.problem_->AddResidualBlock(
+         initialFixation.get(), nullptr,
+-        realtimeGraph_.states_.rbegin()->second.pose->parameters());
++        realtimeGraph_.states_.rbegin()->second.pose->parameters()); }
+     kinematics::Transformation T_WS(
+         realtimeGraph_.states_.at(StateId(1)).pose->estimate().r(),
+         realtimeGraph_.states_.rbegin()->second.pose->estimate().q());
+@@ -762,9 +771,10 @@
+       realtimeGraph_.freezeSpeedAndBiasesUntil(riter->first);
+       frozen = true;
+     }
++    { okvis_portv::Scope portScope(okvis_portv::M_POKE_LM_CONST, &realtimeGraph_);  /* okvis_port (patch 0010) */ portScope.a.u32(1u);
+     for(const auto & lm : realtimeGraph_.landmarks_) {
+       realtimeGraph_.problem_->SetParameterBlockConstant(lm.second.hPoint->parameters());
+-    }
++    } }
+ 
+     // freeze extrinsics
+     for (size_t i = 0; i < realtimeGraph_.cameraParametersVec_.size(); ++i) {
+@@ -794,20 +804,24 @@
+       realtimeGraph_.unfreezeSpeedAndBiasesFrom(unfreezeId);
+     }
+     if(onlyNewestState) {
++      { okvis_portv::Scope portScope(okvis_portv::M_POKE_LM_CONST, &realtimeGraph_);  /* okvis_port (patch 0010) */ portScope.a.u32(0u);
+       for(const auto & lm : realtimeGraph_.landmarks_) {
+         realtimeGraph_.problem_->SetParameterBlockVariable(lm.second.hPoint->parameters());
+-      }
++      } }
+     }
+ 
+     // undo initial fixation
+     if(initialFixation && initialFixationId) {
+-      realtimeGraph_.problem_->RemoveResidualBlock(initialFixationId);
++      { okvis_portv::Scope portScope(okvis_portv::M_POKE_FIX_REMOVE, &realtimeGraph_);  /* okvis_port (patch 0010) */ realtimeGraph_.problem_->RemoveResidualBlock(initialFixationId); }
+     }
+ 
+     // adopt pose change
+     auto riter = realtimeGraph_.states_.rbegin();
+     if(!isLoopClosing_ && !isLoopClosureAvailable_) {
+       ViGraph::State & fullState = fullGraph_.states_.at(riter->first);
++      { okvis_portv::Scope portScope(okvis_portv::M_POKE_COPYSTATE, &fullGraph_);  // okvis_port (patch 0010)
++        portScope.a.u64(riter->first.value()); okvis_portv::putTC(portScope.a, riter->second.pose->estimate());
++        portScope.a.f64n(riter->second.speedAndBias->estimate().data(), 9); }
+       fullState.pose->setEstimate(riter->second.pose->estimate());
+       fullState.speedAndBias->setEstimate(riter->second.speedAndBias->estimate());
+     }
+@@ -839,6 +853,9 @@
+     /// consciously ignoring extrinsics here. \todo generalise for non-fixed extrinsics...
+     if(!isLoopClosing_ && !isLoopClosureAvailable_) {
+       ViGraph::State & fullState = fullGraph_.states_.at(riter->first);
++      { okvis_portv::Scope portScope(okvis_portv::M_POKE_COPYSTATE, &fullGraph_);  // okvis_port (patch 0010)
++        portScope.a.u64(riter->first.value()); okvis_portv::putTC(portScope.a, riter->second.pose->estimate());
++        portScope.a.f64n(riter->second.speedAndBias->estimate().data(), 9); }
+       fullState.pose->setEstimate(riter->second.pose->estimate());
+       fullState.speedAndBias->setEstimate(riter->second.speedAndBias->estimate());
+     }
+@@ -862,6 +879,8 @@
+       continue;
+     }
+     if(!isLoopClosing_ && !isLoopClosureAvailable_) {
++      okvis_portv::Scope portScope(okvis_portv::M_POKE_SYNCIMU, &fullGraph_);  // okvis_port (patch 0010)
++      portScope.a.u64(uint64_t(reinterpret_cast<uintptr_t>(&realtimeGraph_))); portScope.a.u64(riter->first.value());
+       if (fullGraph_.imuParametersVec_.at(0).use) {
+         std::static_pointer_cast<ceres::ImuError>(
+           fullGraph_.states_.at(riter->first).previousImuLink.errorTerm)
+@@ -881,7 +900,7 @@
+ 
+   // unfreeze if necessary
+   if(initialFixation && initialFixationId) {
+-    realtimeGraph_.problem_->RemoveResidualBlock(initialFixationId);
++    { okvis_portv::Scope portScope(okvis_portv::M_POKE_FIX_REMOVE, &realtimeGraph_);  /* okvis_port (patch 0010) */ realtimeGraph_.problem_->RemoveResidualBlock(initialFixationId); }
+   }
+ 
+   // check consistency -- currently disabled
+@@ -1513,6 +1532,8 @@
+     }
+     auto & errorTerm = realtimeGraph_.states_.at(riter->first).previousImuLink.errorTerm;
+     if(errorTerm) {
++      okvis_portv::Scope portScope(okvis_portv::M_POKE_SYNCIMU, &realtimeGraph_);  // okvis_port (patch 0010)
++      portScope.a.u64(uint64_t(reinterpret_cast<uintptr_t>(&fullGraph_))); portScope.a.u64(riter->first.value());
+       if (fullGraph_.imuParametersVec_.at(0).use) {
+         std::static_pointer_cast<ceres::ImuError>(errorTerm)->syncFrom(
+           *std::static_pointer_cast<ceres::ImuError>(riter->second.previousImuLink.errorTerm));
+--- a/okvis_ceres/include/okvis/ceres/ImuError.hpp
++++ b/okvis_ceres/include/okvis/ceres/ImuError.hpp
+@@ -209,6 +209,10 @@
+                  const okvis::SpeedAndBias & speedAndBiases,
+                  const okvis::ImuMeasurementDeque & imuMeasurements,
+                  const okvis::Time& t_1);
++  /// \brief okvis_port (patch 0010): redo flag, redo counter and the reference biases of the last preintegration.
++  void portRedoState(bool& redo, int& counter, const double*& sbRef) const {
++    redo = redo_; counter = redoCounter_; sbRef = speedAndBiases_ref_.data();
++  }
+   /// \brief okvis_port: serialise all preintegration internals.
+   void portSnapshot(okvis_port::Buf& b) const;
+   /// \brief okvis_port: snapshot, optionally without the measurement deque / with uninitialised information zeroed.
+--- /dev/null
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp
+@@ -0,0 +1,84 @@
++/*
++ * okvis_port reference instrumentation (NOT upstream code, patch 0010): ViGraph-level mutation log for module M5d.
++ * Active only with OKVIS_PORT_GRAPH_DUMP_DIR. Records go into the same framed stream as the Ceres Problem log
++ * (problem.bin, tags >= 32; layouts in okvis_port/c/ok_vigraph.h), so one pass replays "graph mutation -> the Problem
++ * calls it caused": the Problem events of a mutation precede its record, which is written when the OUTERMOST
++ * mutation returns (nested ViGraph calls, e.g. removeObservation inside convertToPoseGraphMst, are not logged).
++ * Observational only: no computed value changes, no uninitialised memory is read.
++ */
++#ifndef OKVIS_PORT_VIGRAPH_LOG_HPP_
++#define OKVIS_PORT_VIGRAPH_LOG_HPP_
++
++#include <cstdint>
++#include <map>
++#include <set>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++#include <ceres/okvis_port_solve_hooks.h>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>
++#include <okvis/FrameTypedefs.hpp>
++#include <okvis/Measurements.hpp>
++#include <okvis/Parameters.hpp>
++#include <okvis/Time.hpp>
++#include <okvis/kinematics/Transformation.hpp>
++
++namespace okvis_portv {
++
++using Buf = okvis_portk::Buf;
++
++enum Op : uint32_t {
++  M_NEW = 32, M_ADDCAM, M_ADDIMU, M_INIT, M_PROP, M_ADDLM_ID, M_ADDLM_NEW, M_RMLM, M_SETLM_INIT, M_SETLMQ,
++  M_SETLM_FULL, M_SETLM, M_SETCLASS, M_ADDOBS, M_ADDEXTOBS, M_RMOBS, M_COVIS, M_ADDRELPOSE, M_RMRELPOSE, M_SETKF,
++  M_SETPOSE, M_SETSB, M_SETEXTR, M_UPDLM, M_OPT, M_CLEANLM, M_RMALLOBS, M_ELIM, M_MERGELM, M_FREEZE_POSES,
++  M_UNFREEZE_POSES, M_FREEZE_SB, M_UNFREEZE_SB, M_MST, M_ADDEXTTP, M_RMTPC_ALL, M_RMTPC, M_CONVOBS, M_RMSBPRIOR,
++  M_CLEAR, M_EXTVAR, M_SOFTEXT,
++  // direct accesses of ViSlamBackend to a graph's members
++  M_POKE_FIX_ADD = 96, M_POKE_FIX_REMOVE, M_POKE_LM_CONST, M_POKE_SETINFO, M_POKE_COPYSTATE, M_POKE_SYNCIMU
++};
++
++inline int& depth() { static thread_local int d = 0; return d; }
++inline bool on() { return okvis_port_solve::plog.on(); }
++
++inline void putTime(Buf& b, const okvis::Time& t) { b.u32(t.sec); b.u32(t.nsec); }
++inline void putMeas(Buf& b, const okvis::ImuMeasurementDeque& d) {
++  b.u64(d.size());
++  for (const auto& m : d) {
++    putTime(b, m.timeStamp);
++    b.f64n(m.measurement.gyroscopes.data(), 3);
++    b.f64n(m.measurement.accelerometers.data(), 3);
++  }
++}
++inline void putT(Buf& b, const okvis::kinematics::Transformation& T) { const auto& c = T.coeffs(); b.f64n(c.data(), 7); }
++inline void putTC(Buf& b, const okvis::kinematics::TransformationCacheless& T) { const auto& c = T.coeffs(); b.f64n(c.data(), 7); }
++inline void putKid(Buf& b, const okvis::KeypointIdentifier& k) { b.u64(k.frameId); b.u32(uint32_t(k.cameraIndex)); b.u32(uint32_t(k.keypointIndex)); }
++
++/// RAII record of one OUTERMOST graph mutation: `a` = arguments, `r` = results; written when it goes out of scope.
++class Scope {
++ public:
++  Scope(uint32_t op, const void* graph) : op_(op), graph_(graph) {
++    on_ = on();
++    if (on_) top_ = (depth()++ == 0);
++  }
++  ~Scope() {
++    if (!on_) return;
++    --depth();
++    if (!top_) return;
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(graph_)));
++    b.u32(uint32_t(a.b.size()));
++    b.raw(a.b.data(), a.b.size());
++    b.raw(r.b.data(), r.b.size());
++    okvis_port_solve::plog.write(op_, b);
++  }
++  bool top() const { return on_ && top_; }
++  Buf a, r;
++ private:
++  uint32_t op_;
++  const void* graph_;
++  bool on_ = false, top_ = false;
++};
++
++}  // namespace okvis_portv
++#endif

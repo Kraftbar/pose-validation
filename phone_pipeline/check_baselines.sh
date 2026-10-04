@@ -4,7 +4,7 @@
 #  1. stella_vio exact-port check: fr1_xyz trajectory.tum of stella_vio/sv_run (reinit_sec=0 init_max_level=0 init_confirm=1) is cmp-identical to stella_port's sv_run
 #     (built from stella_port/c exactly like tools/run_stella_port_replay.py does, into a temp dir; stella_port itself is not touched)
 #  2. gnss_fusion: gf_table.py (608 numbers, section 11) and gf_gait_study.py fusion (section 12) re-run and compared with the saved JSONs of before the change
-#     (gnss_fusion/work/pre13/{table,gait_fusion}.json, saved before the change), compare_py.py (C vs python) and test_geo.py.
+#     (gnss_fusion/work/pre15/{table,gait_fusion,georef_table}.json, saved before section 15), compare_py.py (C vs python) and test_geo.py.
 # usage: check_baselines.sh <tmpdir>      (python with numpy: external/gnss/venv/bin/python)
 set -e
 T=${1:?tmpdir}
@@ -27,6 +27,7 @@ $PY tools/test_georef.py   # new opt-in georef module (section 14)
 $PY tools/compare_py.py complex_rtk complex_sim complex_rtk_blk complex_sim_blk o1_okvis o2_okvis o1_orb3mono o2_orb3mono
 $PY tools/gf_table.py > "$T/gf_table.log" 2>&1
 $PY tools/gf_gait_study.py fusion --workers 4 > "$T/gf_gait.log" 2>&1
+$PY tools/gf_georef_table.py > "$T/gf_georef.log" 2>&1   # section 14 table (140 numbers), reference work/pre15/georef_table.json
 $PY - <<EOF
 import json
 def flat(d,p=''):
@@ -35,8 +36,8 @@ def flat(d,p=''):
     elif isinstance(d,list):
         for i,v in enumerate(d): yield from flat(v,p+'[%d]'%i)
     elif isinstance(d,(int,float)) and not isinstance(d,bool): yield p,d
-for name in ('table','gait_fusion'):
-    a=dict(flat(json.load(open('work/pre13/%s.json'%name)))); b=dict(flat(json.load(open('work/%s.json'%name))))
+for name in ('table','gait_fusion','georef_table'):
+    a=dict(flat(json.load(open('work/pre15/%s.json'%name)))); b=dict(flat(json.load(open('work/%s.json'%name))))
     n=0; bad=[]
     for k in a:
         if any(s in k for s in ('wall','timing','stdout')): continue

@@ -22,6 +22,7 @@
  */
 #define _POSIX_C_SOURCE 200809L /* nanosleep for --wait-fixtures */
 #include "sv_system.h"
+#include "sv_eigen_quaternion.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -121,7 +122,7 @@ static uint8_t* read_pgm(const char* path, int* w, int* h) {
     return buf;
 }
 
-#ifndef SV_RUN_NO_MAIN /* sequence association: only the stand-alone driver needs it (the harness takes exact timestamps from the dump) */
+#if !defined(SV_RUN_NO_MAIN) || defined(SV_RUN_HOST) /* sequence association: only the stand-alone driver needs it (the harness takes exact timestamps from the dump) */
 /* tum_rgbd_sequence::acquire_image_information skips the first 3 lines of rgb.txt / depth.txt (the TUM header).
  * Here every line starting with '#' is skipped instead, which is identical for TUM files (exactly 3 '#' lines) and
  * also correct for files with a different number of header lines (including none). */
@@ -192,6 +193,11 @@ static int associate(const char* seq_dir, double** frame_ts, unsigned int* n_fra
 /* ------------------------------------------------------------------ */
 /* the run                                                            */
 /* ------------------------------------------------------------------ */
+/* Optional per-frame hook (default NULL: nothing changes). A host that includes this file with SV_RUN_NO_MAIN (phone_pipeline/c/pp_live.c) sets it to receive every
+ * frame's LIVE report right after sv_system_feed(): the pose as tracked at that moment, before any later BA / loop correction. */
+void (*sv_run_frame_hook)(void* user, unsigned int frame, double ts, const sv_frame_result* r, const sv_system* sys) = NULL;
+void* sv_run_frame_hook_user = NULL;
+
 typedef struct sv_run_opts {
     long max_frames;
     long skip; /* --skip N: start at frame N (timestamps / fixtures keep their global index) */
@@ -207,6 +213,7 @@ typedef struct sv_run_opts {
     const char* set[32]; /* --set key=value (stella_vio parameters, see apply_set) */
     int width, height; /* --size WxH; 0 = take the size from the first fixture image */
     int has_camera;
+    const char* live_out; /* --live-out F: per-frame LIVE poses (opt-in, off by default): "t x y z qx qy qz qw map rframe seg loop_accepted scale_cal up_n ux uy uz", valid frames only */
     const char* imu_path; /* --imu imu.csv (t_ns,gx,gy,gz,ax,ay,az) */
     const char* imu_ext;  /* --imu-ext ext.txt: 12 numbers, R_BC row-major then p_BC */
     double imu_toff;      /* --imu-toff s: IMU clock = camera clock + s */
@@ -375,7 +382,7 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
     sv_imu_buf imu;
     sv_system* sys;
     char path[4096];
-    FILE *fb = NULL, *ft = NULL, *fdc = NULL, *fm = NULL, *fa = NULL, *fk = NULL, *fl = NULL, *flog = NULL;
+    FILE *fb = NULL, *ft = NULL, *fdc = NULL, *fm = NULL, *fa = NULL, *fk = NULL, *fl = NULL, *flog = NULL, *flive = NULL;
     unsigned int i, k;
     long processed = 0, last_frame = -1;
     int rc = 0;
@@ -493,6 +500,13 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
     fprintf(fa, "frame_idx\tnum_keyframes\tnum_landmarks\n");
     fprintf(flog, "kind\tframe\ta\tb\n");
 
+    if (o->live_out) {
+        flive = fopen(o->live_out, "w");
+        if (!flive) {
+            fprintf(stderr, "sv_run: cannot write %s\n", o->live_out);
+            return 2;
+        }
+    }
     for (i = (unsigned int)o->skip; i < n_frames; ++i) {
         sv_frame_result r;
         int w, h;
@@ -524,6 +538,22 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
         sv_system_feed(sys, gray, ts[i], &r);
         free(gray);
         ++processed;
+        if (flive && r.live_valid) {
+            double rot[9];
+            sv_quat q;
+            int a, b;
+            for (b = 0; b < 3; ++b) {
+                for (a = 0; a < 3; ++a) {
+                    rot[b * 3 + a] = r.pose_wc[b * 4 + a];
+                }
+            }
+            sv_quat_from_mat3(rot, &q);
+            fprintf(flive, "%.15g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %d %d %d %u %.9g %.9g %.9g\n", ts[i], r.pose_wc[12], r.pose_wc[13], r.pose_wc[14], q.x, q.y, q.z,
+                    q.w, r.live_map_id, r.live_rframe, r.live_seg, r.loop_accepted ? 1 : 0, r.cal_f != 0.0 ? 1 : 0, r.live_up_n, r.live_up[0], r.live_up[1], r.live_up[2]);
+        }
+        if (sv_run_frame_hook) {
+            sv_run_frame_hook(sv_run_frame_hook_user, i, ts[i], &r, sys);
+        }
 
         /* frames_before.tsv */
         fprintf(fb, "%u\t%.9g\t%d\t", i, ts[i], r.pose_valid ? 1 : 0);
@@ -611,6 +641,9 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
                 fprintf(flog, "erased\t%d\t%u\t%d\n", e, k, d);
             }
         }
+    }
+    if (flive) {
+        fclose(flive);
     }
     fclose(fb);
     fclose(ft);
@@ -742,8 +775,8 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
     return rc;
 }
 
-#ifndef SV_RUN_NO_MAIN
-int main(int argc, char** argv) {
+/* the whole driver; a host that includes this file with SV_RUN_NO_MAIN calls it (after setting sv_run_frame_hook) */
+int sv_run_main(int argc, char** argv) {
     sv_run_opts o;
     double* ts = NULL;
     unsigned int n = 0;
@@ -792,6 +825,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--set") && i + 1 < argc && o.n_set < 32) {
             o.set[o.n_set++] = argv[++i];
         }
+        else if (!strcmp(argv[i], "--live-out") && i + 1 < argc) {
+            o.live_out = argv[++i];
+        }
         else if (!strcmp(argv[i], "--imu") && i + 1 < argc) {
             o.imu_path = argv[++i];
         }
@@ -832,4 +868,7 @@ int main(int argc, char** argv) {
         return rc;
     }
 }
+
+#ifndef SV_RUN_NO_MAIN
+int main(int argc, char** argv) { return sv_run_main(argc, argv); }
 #endif

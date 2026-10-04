@@ -22,7 +22,8 @@ dumps dir as the M1 imu_*.bin files.
 The M4 harness (check_ok_solve) reads solve.bin (patch 0008, run_okvis_reference.py --solve-dump); tags with only a
 solve.bin (m4, s4) run just that harness, tags without one skip it. The M5 harnesses read graph.bin (check_ok_graph:
 TwoPose* terms, updateLandmarks) and problem.bin (check_ok_problem: ceres::Problem program order), both from
-patch 0009 / --graph-dump (m5, s5).
+patch 0009 / --graph-dump (m5, s5). check_ok_vigraph replays the ViGraph mutation log of patch 0010 that
+the same problem.bin carries from tag m6/s6 on (see okvis_port/c/ok_vigraph.h).
 
 --eigen-tests additionally builds okvis_port/reference_tools/eigen_*_test.cc against the real Eigen 3.4.0
 (external/vio/deps, flags -O2 -DNDEBUG -ffp-contract=off -fno-fast-math) and runs them (random-case,
@@ -81,6 +82,24 @@ def build_harness(path, sources):
     return out
 
 
+def has_vigraph_log(dump_dir):
+    """True if problem.bin starts with the mutation records of patch 0010 (tags >= 32 appear within the first records)."""
+    path = dump_dir / "problem.bin"
+    if not path.exists():
+        return False
+    import struct
+    with open(path, "rb") as f:
+        for _ in range(64):
+            h = f.read(12)
+            if len(h) < 12:
+                return False
+            tag, ln = struct.unpack("<IQ", h)
+            if tag >= 32:
+                return True
+            f.seek(ln, 1)
+    return False
+
+
 def eigen_tests():
     """Build+run the C++ cross-checks against real Eigen / the real OKVIS2 classes. Returns list of (name, ok)."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,7 +153,7 @@ def main():
     ap.add_argument("--tag", default="run1", help="comma-separated run tags")
     ap.add_argument("--max", type=int, default=-1)
     ap.add_argument("--eigen-tests", action="store_true")
-    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*",
+    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*,check_ok_vigraph*",
                     help="comma-separated globs of okvis_port/c/ harnesses that consume the reference dumps "
                          "(other modules, e.g. check_ok_brisk*, have their own dump trees/runners)")
     args = ap.parse_args()
@@ -171,7 +190,9 @@ def main():
                 continue  # tag without the M5 graph dump (patch 0009, --graph-dump)
             if name.startswith("check_ok_problem") and not (dump_dir / "problem.bin").exists():
                 continue  # tag without the M5 Problem log (patch 0009, --graph-dump)
-            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem")) and not list(dump_dir.glob("imu_*.bin")):
+            if name.startswith("check_ok_vigraph") and not has_vigraph_log(dump_dir):
+                continue  # tag recorded before patch 0010 (no ViGraph mutation records in problem.bin)
+            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem", "check_ok_vigraph")) and not list(dump_dir.glob("imu_*.bin")):
                 continue  # solver/graph-only tag (m4/s4/m5/s5): no M1-M3 dumps
             cmd = [str(exe), seq, "-", str(dump_dir)] + ([str(args.max)] if args.max > 0 else [])
             proc = subprocess.run(cmd, capture_output=True, text=True)

@@ -80,6 +80,7 @@ typedef struct ok_tp_obs {
     int hpoint_initialised;
     double hpoint[4];               /* the observation's hPoint parameters (bookkeeping only) */
     ok_reproj_err err;              /* the (cloned) reprojection error */
+    const int* hp_live_init;        /* (ok_vigraph) the live landmark block's initialisation flag, NULL: use hpoint_initialised */
 } ok_tp_obs;
 typedef struct ok_tp_group { uint64_t lm_id; int nobs, cap; ok_tp_obs* obs; } ok_tp_group;
 typedef struct ok_tp_lm_S0 { uint64_t id; double hp_S0[4]; } ok_tp_lm_S0;

@@ -1769,7 +1769,18 @@ static void fill_report(sv_system* s, sv_frame_result* res, sv_sys_fd* fd, int s
     res->local_kfs = t->local.kfs;
     res->local_lms = t->local.lms;
     res->reset_happened = s->cur_reset;
-    (void)fd;
+    res->live_valid = 0; res->live_map_id = res->live_rframe = res->live_seg = 0; res->live_up_n = 0;
+    res->live_up[0] = res->live_up[1] = 0.0; res->live_up[2] = 1.0;
+    if (fd && fd->id < s->fs_cap) { /* stella_vio live view: what current_trajectory() would report for this frame right now */
+        const sv_sys_fstat* e = &s->fs[fd->id];
+        if (e->known && e->valid && !e->lost && res->pose_valid) {
+            res->live_valid = 1;
+            res->live_map_id = label_root(s, (int)e->map);
+            res->live_rframe = e->rframe;
+            res->live_seg = (int)e->map;
+            res->live_up_n = sv_system_map_up(s, res->live_map_id, res->live_up);
+        }
+    }
 }
 
 /* stella_vio: up direction of the current map from the accelerometer. With R_wc the tracked camera rotation and f the mean specific force over
@@ -1949,6 +1960,7 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
         if (s->cur_reset) { /* Wrong: reset() and return nullptr */
             fill_report(s, res, fd, state_before);
             res->pose_valid = 0;
+            res->live_valid = 0;
             return 0; /* fd stays fd_cur (the report's views refer to it); released at the next feed */
         }
     }
@@ -2057,6 +2069,7 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
             reset_current(s);
             fill_report(s, res, fd, state_before);
             res->pose_valid = 0;
+            res->live_valid = 0;
             return 0;
         }
     }
@@ -2078,6 +2091,7 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
             }
             fill_report(s, res, fd, state_before);
             res->pose_valid = 0;
+            res->live_valid = 0;
             return 0;
         }
     }

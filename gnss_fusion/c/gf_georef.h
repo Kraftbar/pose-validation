@@ -47,6 +47,8 @@ int         gf_georef_add_fix(gf_georef *g, double t, const double z[3], double 
 int         gf_georef_solve(gf_georef *g);
 /* Apply the current fit. Returns 0 if there is none yet (p_out untouched). yaw/scale/ok in fit are optional outputs. */
 int         gf_georef_map(const gf_georef *g, const double p[3], double p_out[3]);
+/* Where the CURRENT fit puts the stream at time t (interpolated in the ring; same pairing rules as add_fix). Returns 0 if there is no fit or no stream around t. */
+int         gf_georef_predict(const gf_georef *g, double t, double out[3]);
 int         gf_georef_fit(const gf_georef *g, double *psi, double *scale, double *sigma_res, int *n_pairs);
 
 #ifdef __cplusplus

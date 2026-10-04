@@ -1,0 +1,12 @@
+rdvio_port: clean-room pure-C port of RD-VIO (work in progress)
+
+Files under rdvio_port/c/ derived from RD-VIO (Jianxff/rd_vio, Apache-2.0; rd_vio is "separated and modified from" XRSLAM,
+Copyright 2022 XRSLAM Authors, Apache-2.0; full text rdvio_port/LICENSES/rdvio-Apache-2.0.txt) are translations of the original C++ and
+carry that notice: rd_imu.{h,c}, rd_lie.{h,c}. The upstream repository names no copyright holder in its LICENSE (unfilled template) and has
+no per-file headers; the notice above is the conservative reading.
+Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
+(Copyright (C) Gael Guennebaud, Benoit Jacob and the Eigen authors); they reuse okvis_port/c/ok_eigen.c and ok_dense.c (MPL-2.0 / BSD-3).
+Later modules derived from Ceres Solver (BSD-3-Clause, Google Inc.; text in rdvio_port/LICENSES/ceres-solver-BSD-3-Clause.txt) and from
+OpenCV (Apache-2.0, OpenCV Foundation / Intel / contributors) will add their notices here.
+The reference instrumentation (rdvio_port/reference/patches/0003-*.patch) and the oracle program (rdvio_port/reference_tools) are never
+distributed. EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).

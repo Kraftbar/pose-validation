@@ -355,6 +355,7 @@ int ok_twopose_add_observation(ok_twopose* t, uint64_t frame_id, int cam, int kp
     o->is_duplication = is_duplication;
     o->pose_id = pose_id; o->hpoint_id = hpoint_id; o->extr_id = extr_id;
     o->hpoint_initialised = hpoint_initialised;
+    o->hp_live_init = NULL;
     memcpy(o->hpoint, hpoint, sizeof o->hpoint);
     o->err = *err;                                               /* reprojectionError->clone() */
     if (is_duplication) ok_reproj_err_set_information(&o->err, o->err.info); /* setInformation(information()) */

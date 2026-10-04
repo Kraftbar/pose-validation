@@ -1,0 +1,253 @@
+--- /dev/null
++++ b/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
+@@ -0,0 +1,57 @@
++#pragma once
++// rdvio_port instrumentation (reference build only, never distributed): binary record dumps used by rdvio_port/c/check_rd_*.c.
++// Enabled by RDVIO_PORT_DUMP_DIR; sampling by RDVIO_PORT_DUMP_EVERY="integ=1,pred=1,pie=20,plus=50" (0 = count only).
++// Pure observation: reads state, never modifies it.
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++namespace rdvio {
++namespace portdump {
++struct Chan {
++    FILE *f = nullptr;
++    uint64_t count = 0, every = 1;
++    const char *name;
++};
++inline Chan &chan(int k) {
++    static Chan ch[4] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"}};
++    static bool init = false;
++    if (!init) {
++        init = true;
++        if (const char *e = std::getenv("RDVIO_PORT_DUMP_EVERY")) {
++            std::string s(e);
++            for (auto &c : ch) {
++                size_t p = s.find(std::string(c.name) + "=");
++                if (p != std::string::npos) c.every = std::strtoull(s.c_str() + p + strlen(c.name) + 1, nullptr, 10);
++            }
++        }
++    }
++    return ch[k];
++}
++// returns the open channel if this call is to be recorded, else nullptr
++inline Chan *want(int k) {
++    const char *dir = std::getenv("RDVIO_PORT_DUMP_DIR");
++    if (!dir) return nullptr;
++    Chan &c = chan(k);
++    uint64_t n = c.count++;
++    if (c.every == 0 || n % c.every != 0) return nullptr;
++    if (!c.f) {
++        std::string p = std::string(dir) + "/" + c.name + ".bin";
++        c.f = std::fopen(p.c_str(), "wb");
++    }
++    return c.f ? &c : nullptr;
++}
++inline void u32(Chan *c, uint32_t v) { std::fwrite(&v, 4, 1, c->f); }
++inline void f64(Chan *c, const double *p, size_t n) { std::fwrite(p, 8, n, c->f); }
++inline void f64(Chan *c, double v) { std::fwrite(&v, 8, 1, c->f); }
++inline void flush_all() {
++    for (int k = 0; k < 4; ++k)
++        if (chan(k).f) std::fflush(chan(k).f);
++}
++struct Flusher {
++    ~Flusher() { flush_all(); }
++};
++inline thread_local bool via_prior = false;
++} // namespace portdump
++} // namespace rdvio
+--- a/src/rdvio_estimation/src/preintegrator.cpp
++++ b/src/rdvio_estimation/src/preintegrator.cpp
+@@ -1,6 +1,7 @@
+ #include <rdvio/estimation/preintegrator.h>
+ #include <rdvio/geometry/lie_algebra.h>
+ #include <rdvio/map/frame.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -78,6 +79,46 @@
+ bool PreIntegrator::integrate(double t, const vector<3> &bg,
+                               const vector<3> &ba, bool compute_jacobian,
+                               bool compute_covariance) {
++    portdump::Chan *pc = portdump::want(0);
++    if (pc) {
++        portdump::u32(pc, (uint32_t)data.size());
++        portdump::u32(pc, (compute_jacobian ? 1u : 0u) | (compute_covariance ? 2u : 0u));
++        portdump::f64(pc, t);
++        portdump::f64(pc, bg.data(), 3);
++        portdump::f64(pc, ba.data(), 3);
++        portdump::f64(pc, cov_w.data(), 9);
++        portdump::f64(pc, cov_a.data(), 9);
++        portdump::f64(pc, cov_bg.data(), 9);
++        portdump::f64(pc, cov_ba.data(), 9);
++        for (const ImuData &d : data) {
++            portdump::f64(pc, d.t);
++            portdump::f64(pc, d.w.data(), 3);
++            portdump::f64(pc, d.a.data(), 3);
++        }
++    }
++    bool ret = integrate_impl(t, bg, ba, compute_jacobian, compute_covariance);
++    if (pc) {
++        portdump::u32(pc, ret ? 1u : 0u);
++        if (ret) {
++            portdump::f64(pc, delta.t);
++            portdump::f64(pc, delta.q.coeffs().data(), 4);
++            portdump::f64(pc, delta.p.data(), 3);
++            portdump::f64(pc, delta.v.data(), 3);
++            portdump::f64(pc, delta.cov.data(), 225);
++            portdump::f64(pc, delta.sqrt_inv_cov.data(), 225);
++            portdump::f64(pc, jacobian.dq_dbg.data(), 9);
++            portdump::f64(pc, jacobian.dp_dbg.data(), 9);
++            portdump::f64(pc, jacobian.dp_dba.data(), 9);
++            portdump::f64(pc, jacobian.dv_dbg.data(), 9);
++            portdump::f64(pc, jacobian.dv_dba.data(), 9);
++        }
++    }
++    return ret;
++}
++
++bool PreIntegrator::integrate_impl(double t, const vector<3> &bg,
++                                   const vector<3> &ba, bool compute_jacobian,
++                                   bool compute_covariance) {
+     if (data.size() == 0)
+         return false;
+     reset();
+@@ -100,6 +141,29 @@
+ }
+ 
+ void PreIntegrator::predict(const Frame *old_frame, Frame *new_frame) {
++    portdump::Chan *pc = portdump::want(1);
++    if (pc) {
++        portdump::f64(pc, old_frame->pose.q.coeffs().data(), 4);
++        portdump::f64(pc, old_frame->pose.p.data(), 3);
++        portdump::f64(pc, old_frame->motion.v.data(), 3);
++        portdump::f64(pc, old_frame->motion.bg.data(), 3);
++        portdump::f64(pc, old_frame->motion.ba.data(), 3);
++        portdump::f64(pc, delta.t);
++        portdump::f64(pc, delta.q.coeffs().data(), 4);
++        portdump::f64(pc, delta.p.data(), 3);
++        portdump::f64(pc, delta.v.data(), 3);
++    }
++    predict_impl(old_frame, new_frame);
++    if (pc) {
++        portdump::f64(pc, new_frame->pose.q.coeffs().data(), 4);
++        portdump::f64(pc, new_frame->pose.p.data(), 3);
++        portdump::f64(pc, new_frame->motion.v.data(), 3);
++        portdump::f64(pc, new_frame->motion.bg.data(), 3);
++        portdump::f64(pc, new_frame->motion.ba.data(), 3);
++    }
++}
++
++void PreIntegrator::predict_impl(const Frame *old_frame, Frame *new_frame) {
+     static const vector<3> gravity = {0, 0, -GRAVITY_NOMINAL};
+     new_frame->motion.bg = old_frame->motion.bg;
+     new_frame->motion.ba = old_frame->motion.ba;
+--- a/src/rdvio_estimation/include/rdvio/estimation/preintegrator.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/preintegrator.h
+@@ -32,6 +32,9 @@
+     bool integrate(double t, const vector<3> &bg, const vector<3> &ba,
+                    bool compute_jacobian, bool compute_covariance);
+     void compute_sqrt_inv_cov();
++    bool integrate_impl(double t, const vector<3> &bg, const vector<3> &ba,
++                        bool compute_jacobian, bool compute_covariance);
++    void predict_impl(const Frame *old_frame, Frame *new_frame);
+ 
+     void predict(const Frame *old_frame, Frame *new_frame);
+ 
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/quaternion_parameterization.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/quaternion_parameterization.h
+@@ -3,6 +3,7 @@
+ #include <ceres/ceres.h>
+ #include <rdvio/types.h>
+ #include <rdvio/geometry/lie_algebra.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -10,8 +11,14 @@
+     bool Plus(const double *q, const double *dq,
+               double *q_plus_dq) const override {
+         map<quaternion> result(q_plus_dq);
++        portdump::Chan *pc = portdump::want(3);
++        if (pc) {
++            portdump::f64(pc, q, 4);
++            portdump::f64(pc, dq, 3);
++        }
+         result = (const_map<quaternion>(q) * expmap(const_map<vector<3>>(dq)))
+                      .normalized();
++        if (pc) portdump::f64(pc, q_plus_dq, 4);
+         return true;
+     }
+     bool PlusJacobian(const double *, double *jacobian) const override {
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/preintegration_factor.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/preintegration_factor.h
+@@ -5,6 +5,7 @@
+ #include <rdvio/estimation/preintegration_factor.h>
+ #include <rdvio/geometry/lie_algebra.h>
+ #include <rdvio/map/frame.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -154,6 +155,36 @@
+ 
+         r = pre.delta.sqrt_inv_cov * r;
+ 
++        if (portdump::Chan *pc = portdump::want(2)) {
++            static const int sz[10] = {4, 3, 3, 3, 3, 4, 3, 3, 3, 3};
++            portdump::u32(pc, jacobians ? 1u : 0u);
++            uint32_t mask = 0;
++            if (jacobians)
++                for (int k = 0; k < 10; ++k)
++                    if (jacobians[k]) mask |= 1u << k;
++            portdump::u32(pc, mask);
++            portdump::u32(pc, portdump::via_prior ? 1u : 0u);
++            for (int k = 0; k < 10; ++k) portdump::f64(pc, parameters[k], sz[k]);
++            portdump::f64(pc, imu_i.q_cs.coeffs().data(), 4);
++            portdump::f64(pc, imu_i.p_cs.data(), 3);
++            portdump::f64(pc, imu_j.q_cs.coeffs().data(), 4);
++            portdump::f64(pc, imu_j.p_cs.data(), 3);
++            portdump::f64(pc, bg_i_0.data(), 3);
++            portdump::f64(pc, ba_i_0.data(), 3);
++            portdump::f64(pc, pre.delta.t);
++            portdump::f64(pc, pre.delta.q.coeffs().data(), 4);
++            portdump::f64(pc, pre.delta.p.data(), 3);
++            portdump::f64(pc, pre.delta.v.data(), 3);
++            portdump::f64(pc, pre.jacobian.dq_dbg.data(), 9);
++            portdump::f64(pc, pre.jacobian.dp_dbg.data(), 9);
++            portdump::f64(pc, pre.jacobian.dp_dba.data(), 9);
++            portdump::f64(pc, pre.jacobian.dv_dbg.data(), 9);
++            portdump::f64(pc, pre.jacobian.dv_dba.data(), 9);
++            portdump::f64(pc, pre.delta.sqrt_inv_cov.data(), 225);
++            portdump::f64(pc, residuals, 15);
++            for (int k = 0; k < 10; ++k)
++                if (jacobians && jacobians[k]) portdump::f64(pc, jacobians[k], 15 * sz[k]);
++        }
+         return true;
+     }
+ 
+@@ -183,15 +214,19 @@
+             parameters[2],
+             parameters[3],
+             parameters[4]};
++        portdump::via_prior = true;
++        bool ok;
+         if (jacobians) {
+             std::array<double *, 10> jacobs = {
+                 nullptr,      nullptr,      nullptr,      nullptr,
+                 nullptr,      jacobians[0], jacobians[1], jacobians[2],
+                 jacobians[3], jacobians[4]};
+-            return piefactor.Evaluate(params.data(), residuals, jacobs.data());
++            ok = piefactor.Evaluate(params.data(), residuals, jacobs.data());
+         } else {
+-            return piefactor.Evaluate(params.data(), residuals, nullptr);
++            ok = piefactor.Evaluate(params.data(), residuals, nullptr);
+         }
++        portdump::via_prior = false;
++        return ok;
+     }
+ 
+     CeresPreIntegrationErrorFactor piefactor;

@@ -14,6 +14,7 @@ usage:
   run.py stages <seq> [--variants a,b] [--fuse a,b] [--stream JPEG_DIR]     sv_run variants (parallel, one lock-step pass over the frames), then every fusion
   run.py sv    <seq> [--variants ..] [--stream JPEG_DIR]
   run.py fuse  <seq> [--variants ..] [--fuse ..]
+  run.py live  <seq> [--variants full] [--stream JPEG_DIR] [--pp "--pp-set key=val"]   section 15: the one-process live pipeline pp_live -> live_<variant>/ (pp.auto|sm|geo = live outputs)
 <seq> = indoor1 indoor2 outdoor1 outdoor2 advio15 advio20 (configs/<seq>.json). Outputs: runs/phone_pipeline/<seq>/.
 --stream: the images are JPEGs in JPEG_DIR (cam0/data + cam0/data.csv of the fetch layout); gray PGMs are produced just in time, shared by all
 variants and deleted behind the slowest one (peak disk ~1.5 GB instead of 5-8 GB per sequence). Without it, <out>/_fx/<seq>/*.pgm must exist.
@@ -109,20 +110,29 @@ class Feeder(threading.Thread):
             self.error = e; self.ready0.set()
 
 
-def run_sv(seq, variants, stream=None, ahead=1000):
+PP_LIVE = ROOT / 'phone_pipeline/c/pp_live'
+
+
+def run_sv(seq, variants, stream=None, ahead=1000, live=False, pp_extra=(), keep_jpeg=False):
+    """live=True: the same command line through pp_live (one process: stella_vio + gait + fusion, section 15) into live_<variant>/ (its sv outputs are the same files as sv_<variant>/)"""
     c = cfg_of(seq); out = OUT / seq; fx = out / '_fx' / seq; fx.mkdir(parents=True, exist_ok=True)
     cmds, logs, procs, outs = {}, {}, {}, {}
     feeder = None
     if stream:
         # processes need the first frames; the feeder is told about the processes afterwards through shared lists
         pl, ll = [], []
-        feeder = Feeder(stream, fx, ll, pl, ahead=ahead); feeder.start(); feeder.ready0.wait()
+        feeder = Feeder(stream, fx, ll, pl, ahead=ahead, keep_jpeg=keep_jpeg); feeder.start(); feeder.ready0.wait()
     for v in variants:
-        d = out / f'sv_{v}'; d.mkdir(parents=True, exist_ok=True); outs[v] = d
-        cmd = [str(SV_RUN), str(VOCAB), rp(c['rgb_dir']), str(fx), str(d), '--no-snap', '--lean', '--wait-fixtures', '--size', c['size'], '--camera', c['camera'],
+        d = out / (f'live_{v}' if live else f'sv_{v}'); d.mkdir(parents=True, exist_ok=True); outs[v] = d
+        cmd = [str(PP_LIVE if live else SV_RUN), str(VOCAB), rp(c['rgb_dir']), str(fx), str(d), '--no-snap', '--lean', '--wait-fixtures', '--size', c['size'], '--camera', c['camera'],
                '--imu', rp(c['imu']), '--imu-ext', str(d / 'ext.txt'), '--imu-toff', str(c['imu_toff']), '--imu-bg', ','.join(str(x) for x in c['imu_bg'])]
         (d / 'ext.txt').write_text(' '.join(repr(float(x)) for x in c['imu_ext_cal' if v == 'fullcal' else 'imu_ext']) + '\n')
         for s in SV_VARIANTS[v]: cmd += ['--set', s]
+        if live:
+            cmd += ['--live-out', str(d / 'live.tum'), '--pp-out', str(d / 'pp'), '--pp-speed-out', str(d / 'pp.speed')]
+            if c['fixes']: cmd += ['--pp-fix', rp(c['fixes'])]
+            if c['gait']['mode'] == 'user': cmd += ['--pp-gait-c', repr(c['gait']['c'])]
+            cmd += list(pp_extra)
         cmds[v] = cmd; logs[v] = d / 'log.txt'
     t0 = time.time()
     for v in variants:
@@ -136,7 +146,7 @@ def run_sv(seq, variants, stream=None, ahead=1000):
         nfr = int(re.findall(r'sv_run: frame (\d+) kfs', logs[v].read_text())[-1]) if logs[v].exists() else 0
         res[v] = dict(rc=p.returncode, cpu_s=ru.ru_utime + ru.ru_stime, wall_s=time.time() - t0, max_rss_mb=ru.ru_maxrss / 1024.0)
         (outs[v] / 'run.json').write_text(json.dumps(res[v]))
-        print(f'{seq} sv_{v}: rc={p.returncode} cpu {ru.ru_utime + ru.ru_stime:.0f}s', flush=True)
+        print(f'{seq} {"live" if live else "sv"}_{v}: rc={p.returncode} cpu {ru.ru_utime + ru.ru_stime:.0f}s', flush=True)
     if feeder:
         feeder.join(timeout=5)
         for q in fx.glob('*.pgm'): q.unlink()          # fixtures left in the look-ahead window
@@ -199,16 +209,20 @@ def run_gait(seq, out):
     return dict(n_epochs=len(e), n_speed=n, wall_s=wall, n_imu=n_imu, us_per_imu=wall / max(n_imu, 1) * 1e6)
 
 
-def run_fuse(seq, variant, mode, extra=(), tag=None, loose=True, fix_sigma_k=1.0):
+def run_fuse(seq, variant, mode, extra=(), tag=None, loose=True, fix_sigma_k=1.0, live_dir=None):
+    """live_dir: a pp_live output dir (live_<variant>/): the odometry is its LIVE stream (pp.odom) and the speed measurements its pp.speed; outputs go to live_dir/fuse_<tag|mode>/"""
     c = cfg_of(seq); sv = OUT / seq / f'sv_{variant}'
-    d = OUT / seq / f'fuse_{variant}_{tag or mode}'; d.mkdir(parents=True, exist_ok=True)
+    d = (live_dir / f'fuse_{tag or mode}') if live_dir else (OUT / seq / f'fuse_{variant}_{tag or mode}'); d.mkdir(parents=True, exist_ok=True)
     use_fix, use_gait = FUSE_MODES[mode]
-    ostats = make_odom(sv, d / 'odom.txt', loose=loose)
+    if live_dir:
+        shutil.copy(live_dir / 'pp.odom', d / 'odom.txt'); ostats = dict(n_poses=sum(1 for _ in open(d / 'odom.txt')))
+    else:
+        ostats = make_odom(sv, d / 'odom.txt', loose=loose)
     nfix = 0
     if use_fix and c['fixes']: nfix = read_fixes(rp(c['fixes']), d / 'fix.txt', fix_sigma_k)
     else: (d / 'fix.txt').write_text('')
     res = dict(odom=ostats, n_fix=nfix, runs={}, init_wait_s=(30.0 if nfix else INIT_WAIT_NOFIX))
-    sp = OUT / seq / 'speed.txt'
+    sp = (live_dir / 'pp.speed') if live_dir else OUT / seq / 'speed.txt'
     for md in ('batch', 'causal'):
         cmd = [str(GF_RUN), '--odom', str(d / 'odom.txt'), '--fix', str(d / 'fix.txt'), '--out', str(d / f'{md}.out'), '--mode', md, '--timing', '--nodes', str(d / f'{md}.nodes')]
         if md == 'causal': cmd += ['--out-live', str(d / 'causal.live')]
@@ -227,11 +241,12 @@ def run_fuse(seq, variant, mode, extra=(), tag=None, loose=True, fix_sigma_k=1.0
 GEOREF_RUN = ROOT / 'gnss_fusion/c/gf_georef_run'
 
 
-def run_georef(seq, variant, extra=(), tag='georef'):
+def run_georef(seq, variant, extra=(), tag='georef', live_dir=None):
     """section 14: the fix-free (gait only) stream of fuse_<variant>_gait is geo-referenced by ONE slowly varying similarity from the fixes (gf_georef_run);
     causal = live stream of the gait run + the fixes up to now, batch = batch stream + one fit over all fixes. Needs fuse_<variant>_gait."""
-    c = cfg_of(seq); src = OUT / seq / f'fuse_{variant}_gait'
-    d = OUT / seq / f'fuse_{variant}_{tag}'; d.mkdir(parents=True, exist_ok=True)
+    c = cfg_of(seq)
+    src = (live_dir / 'fuse_gait') if live_dir else OUT / seq / f'fuse_{variant}_gait'
+    d = (live_dir / f'fuse_{tag}') if live_dir else OUT / seq / f'fuse_{variant}_{tag}'; d.mkdir(parents=True, exist_ok=True)
     nfix = read_fixes(rp(c['fixes']), d / 'fix.txt')
     shutil.copy(src / 'odom.txt', d / 'odom.txt')
     res = dict(n_fix=nfix, runs={}, init_wait_s=30.0)
@@ -249,12 +264,13 @@ def run_georef(seq, variant, extra=(), tag='georef'):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('stage', choices=['stages', 'sv', 'fuse', 'gait', 'georef'])
+    ap.add_argument('stage', choices=['stages', 'sv', 'fuse', 'gait', 'georef', 'live'])
     ap.add_argument('seq'); ap.add_argument('--variants', default='default,rm,full,fullcal'); ap.add_argument('--fuse', default='gait,gnss,both')
-    ap.add_argument('--stream'); ap.add_argument('--ahead', type=int, default=1000)
+    ap.add_argument('--stream'); ap.add_argument('--ahead', type=int, default=1000); ap.add_argument('--keep-jpeg', action='store_true'); ap.add_argument('--pp', default='', help='extra pp_live options (live stage), e.g. "--pp-set policy=1"')
     a = ap.parse_args()
     vs = a.variants.split(','); fm = a.fuse.split(',')
     if a.stage in ('stages', 'sv'): run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead)
+    if a.stage == 'live': run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead, live=True, pp_extra=a.pp.split(), keep_jpeg=a.keep_jpeg)
     if a.stage in ('stages', 'gait', 'fuse'):
         g = run_gait(a.seq, OUT / a.seq); (OUT / a.seq / 'gait.json').write_text(json.dumps(g))
     if a.stage == 'georef':

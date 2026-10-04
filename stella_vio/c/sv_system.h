@@ -114,6 +114,12 @@ typedef struct sv_frame_result {
     unsigned int n_local_kfs, n_local_lms;   /* local map of this frame (0 when tracking did not get that far) */
     const unsigned int* local_kfs;           /* borrowed, valid until the next sv_system_feed() */
     const unsigned int* local_lms;
+    /* stella_vio LIVE view of this frame (opt-in for the consumer, nothing else reads it): the pose AS TRACKED at the moment of the frame (pose_wc above), with the
+     * labels the trajectory file would give the frame now (map labels can still be merged later, poses corrected by later BA / loops) */
+    int live_valid;                /* the frame is a valid, not lost tracked (or R-frame) frame */
+    int live_map_id, live_rframe, live_seg;
+    unsigned int live_up_n;        /* gravity: frames accumulated for this map so far (0 = unknown) */
+    double live_up[3];             /* up direction of the map at this moment, in the map's axes (unit) */
 } sv_frame_result;
 
 sv_system* sv_system_create(const sv_system_params* p);

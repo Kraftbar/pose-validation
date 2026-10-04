@@ -187,6 +187,13 @@ int gf_georef_map(const gf_georef *g, const double p[3], double out[3])
     return 1;
 }
 
+int gf_georef_predict(const gf_georef *g, double t, double out[3])
+{
+    double a[3];
+    if (!g || !g->have || !ring_at(g, t, g->c.max_gap_s, a)) return 0;
+    return gf_georef_map(g, a, out);
+}
+
 int gf_georef_fit(const gf_georef *g, double *psi, double *scale, double *sigma_res, int *n_pairs)
 {
     if (!g) return 0;

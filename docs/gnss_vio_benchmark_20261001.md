@@ -977,3 +977,90 @@ The stream itself carries the section-13.4 calibration remarks (sequence-fitted 
 * The two stages run the smoother without the fixes, so tracking-loss stretches are bridged by the gait speed (PDR-like) and fixes in holes longer than 2.5 s are not used; the old GNSS-only nodes of the fix-in-smoother path are not in the georef path.
 * The fix statistics (40 s correlation, white part 0.3 m) come from two phone models / two datasets; other receivers or a better phone GNSS (dual frequency) will change `corr_s` and may favour the smoother again (complex_rtk: 0.08 m with the smoother). No automatic switch between the two.
 * Python GLS prototype only for the coloured-noise variant; no Gauss-Markov bias state in the C smoother.
+
+## 15. True live pipeline and the automatic smoother <-> georef switch (2026-10-04)
+
+Questions: (1) what does the phone pipeline lose when every stage consumes the poses AS COMPUTED frame by frame (stella_vio's tracking pose at that moment, before later local BA / loop corrections) instead of the final trajectory? (2) can the choice between the smoother (section 13) and the geo-referencing (section 14) be made online from observable signals? (3) CPU per frame of every stage. Own code, nothing GPL read. Images of all six sequences were re-fetched with the section-9.2 scripts into the scratch dir (peak about 6 GB, deleted afterwards).
+
+### 15.1 What was built (all opt-in, defaults unchanged)
+
+* `stella_vio/sv_run --live-out F`: per tracked frame, at the moment it is computed: `t x y z q map_id rframe seg loop_accepted scale_cal up_n ux uy uz` (`sv_frame_result.live_*`; `sv_run.c` has `sv_run_frame_hook` and `sv_run_main()`). Off by default; with it off every output file is unchanged.
+* `phone_pipeline/c/pp_live.c` (C99, stdio in the driver only): ONE process = sv_run driver + per-frame hook: IMU samples and fixes with time <= the frame time are fed to `gf_gait` / `gf_auto`; the live pose is gravity-aligned with the CURRENT up estimate of its map (frozen after 150 contributing frames; no sample before 5), flagged like `run.py make_odom` (new map id = NEW_FRAME, new segment = GAP|LOOSE, R-frame = LOOSE) and streamed into `gf_auto` (smoother with fixes A, fix-free gait smoother B -> `gf_georef`, switch). Output per frame: `pp.auto` (what a live consumer sees) plus `pp.sm`, `pp.geo`, `pp.odom` (the live odometry; replaying it through `gf_auto_run` reproduces the stream to print precision), `pp.speed`, `pp.sig` (signals), `pp.timing`. `phone_pipeline/run.py live <seq> --variants full`, `live_eval.py`, `live_report.py`.
+* `gnss_fusion/c/gf_auto.{h,c}` + driver `gf_auto_run`: the streaming combination and the switch (below). `policy=0` is bit-for-bit (print precision) `gf_run` causal live, `policy=1` the two-stage georef (`tools/test_auto.py`, 6 checks incl. causality: the first half of the output is byte-identical when the second half of odometry and fixes is cut).
+* Determinism: the final trajectory (`trajectory_maps.tum`, `trajectory_gz.tum`) written by the same pp_live run is `cmp`-identical to the section-13 `sv_<full>` files on all six sequences, so the live and final numbers below come from the same front-end run.
+
+### 15.2 Live vs final (ATE SE3 [m], `full` stella_vio variant; one deterministic run per row; causal scored from +30 s, GNSS-free sequences from +12 s)
+
+| sequence | GNSS alone | final traj: batch / causal | live odometry, whole-graph batch / causal replay | live, streamed: smoother / georef / AUTO (causal) | live vs final batch | live vs final causal |
+|---|---|---|---|---|---|---|
+| Indoor-1 | - | 1.16 / 1.02 | 0.79 / 1.21 | 1.21 / - / **1.21** | -32% | +19% |
+| Indoor-2 | - | 0.31 / 0.31 | 1.06 / 1.10 | 1.10 / - / **1.10** | +243% | +257% |
+| Outdoor-1 | 5.73 | 5.50 / 7.10 | 5.12 / 6.87 | 6.87 / 4.28 / **4.31** | -7% | -3% |
+| Outdoor-2 | 14.66 | 13.28 / 15.10 | 13.52 / 15.65 | 15.65 / 11.33 / **11.33** | +2% | +4% |
+| ADVIO-15 | - | 0.90 / 0.66 | 0.80 / 0.85 | 0.85 / - / **0.85** | -12% | +30% |
+| ADVIO-20 | 12.00 | 11.76 / 12.32 | 11.87 / 12.30 | 12.30 / 11.85 / **11.82** | +1% | -0% |
+
+("final" with fixes = smoother with gait + GNSS of section 13; georef rows final / live: Outdoor-1 5.36 / 4.71 vs 5.26 / 4.28, Outdoor-2 4.81 / 11.34 vs 4.72 / 11.33, ADVIO-20 11.76 / 11.79 vs 11.76 / 11.85 batch / causal. The final-vs-live columns compare the SAME fusion on final vs live poses; the "streamed" smoother equals the causal replay.)
+Reading: the live cost is small on the outdoor sequences (within +-7 %, i.e. inside the run-to-run noise of a chaotic front end; the fix-dominated error hides it) and large on the short monocular indoor sequences, where the corridor loop closure / BA later rescales the map: Indoor-2 live-vs-final Sim3 scale of the poses 0.82 (extent 3.2 map units), Indoor-1 0.80; the gait speed prior corrects the scale online, but not the shape. Indoor-2 is the honest worst case: 0.31 -> 1.10 m (3.5x), still ahead of XRSLAM 0.98 / RD-VIO 1.06 only marginally. Indoor-1 batch gets better (0.79) and causal worse (1.21): the 1.16 final batch is itself the chaotic gyro-prior result of section 13 (default config 0.83). Outdoor differences of a few percent are not rankings.
+Choices measured on the three small sequences (not on the test outcome of the outdoor ones): flagging loop-closure / scale-calibration frames as `GF_ODOM_GAP` (position jump of the map) costs 0.1-0.7 m (Indoor-1 1.49 / 1.61 vs 0.78 / 1.20, Indoor-2 1.16 / 1.26 vs 1.06 / 1.10, ADVIO-15 1.00 / 0.91 vs 0.80 / 0.85 batch / causal), so it is off (`--pp-jump 0`); gravity: running estimate worse than frozen after 150 frames (Indoor-1 0.88 / 1.28 vs 0.78 / 1.20), 30-400 frames identical, oracle (final) up vector 0.82 / 1.09 (the remaining gap is the early up error).
+
+### 15.3 The switch (`gf_auto`, causal, observable signals only)
+
+Both estimates run all the time; the output is the smoother A, the georef G or a cross-fade (weight up 1/20 s, down 1/2 s). G is used only while ALL hold: (a) G has >= 30 pairs and the stream is metric (`geo.scale_sigma <= 10`: gait stream, metric VIO; a free-scale monocular stream needs the smoother's per-window scale) and has not restarted in a new frame (raw streams); (b) the fixes are poor: reported sigma (EW mean) >= 4 m (a global similarity can only help where the smoother's 30 s window cannot average the fix error out; accurate fixes can bend the stream); (c) the stream agrees with the fixes: rho = rms prequential error of G at the fixes (EW 300 s, error of each fix against the fit that has not seen it) / max(reported sigma, 0.1 m) <= 0.75 to enter, < 1.125 to stay; (d) the smoother's own consistency test does not distrust the odometry (its distrusted share, EW 60 s, <= 0.2 to enter, < 0.3 to stay: slow drift and collapse of the stream); (e) no sudden failure: the latest prequential error <= 3 x max(rms, 2 sigma), otherwise weight 0 at once and G barred for 60 s. Signals logged per sample (`--sig`): pairs, fit residual, georef scale, EW prequential errors, reported/white fix noise, disagreement A-G, distrust share, new-frame/gap counts.
+Rejected on the way (details `docs/rejected_trials.md`): a residual-trend ratio e_fast/e_slow <= 1.3 (kills the phone cases where the common fix error wanders: ratio 1.5-1.9 on p_o1/p_o2), a 0.5 m noise floor (RTK: 0.10 -> 0.44), scale-free mono georef (o2_orb3mono 4.14 vs 2.52, a20_orb3mono 14.60 vs 12.46), using the georef before the smoother is aligned (a collapsing XRSLAM stream gave 130-150 m).
+
+### 15.4 Result over all cases (live/causal ATE SE3 [m]; earlier list: `gnss_fusion/tools/gf_auto_table.py`, stream = raw odometry; phone: pipeline inputs replayed through `gf_auto_run`, stream = gait smoother B)
+
+| case | GNSS alone | smoother live | georef | AUTO | AUTO vs best of two | AUTO vs GNSS alone | smoother vs GNSS (current) |
+|---|---|---|---|---|---|---|---|
+| complex_rtk | 0.00 | 0.10 | 2.16 | 0.10 | +0% | n/a | n/a |
+| complex_sim | 4.18 | 2.15 | 2.56 | 2.15 | +0% | -49% | -49% |
+| complex_rtk_blk | 0.00 | 0.67 | 1.78 | 0.67 | +0% | n/a | n/a |
+| complex_sim_blk | 4.33 | 2.16 | 2.01 | 2.16 | +8% | -50% | -50% |
+| o1_okvis | 5.73 | 7.40 | 42.16 | 8.76 | **+18%** | **+53%** | +29% |
+| o2_okvis | 14.66 | 16.70 | 7322.62 | 16.70 | +0% | +14% | +14% |
+| a15_okvis | 1.56 | 1.36 | - | 1.36 | +0% | -13% | -13% |
+| a20_okvis | 12.00 | 12.13 | 11.91 (20%) | 12.13 | +2% | +1% | +1% |
+| o1_orb3mono | 5.73 | 2.98 | 3.00 | 2.98 | +0% | -48% | -48% |
+| o2_orb3mono | 14.66 | 2.52 | 4.14 | 2.52 | +0% | -83% | -83% |
+| a15_orb3mono | 1.56 | 0.96 | - | 0.96 | +0% | -39% | -39% |
+| a20_orb3mono | 12.00 | 12.46 | 14.60 | 12.46 | +0% | +4% | +4% |
+| o1_stella | 5.73 | 6.94 | 5.51 | 6.94 | **+26%** | +21% | +21% |
+| o2_stella | 14.66 | 17.67 | 41.38 | 17.67 | +0% | +21% | +21% |
+| m14_okvis | 1.37 | 1.72 | 2.13 | 1.72 | +0% | +25% | +25% |
+| o1d_okvis | 2.20 | 1.43 | 2.16 | 1.43 | +0% | -35% | -35% |
+| o1_xrslam | 5.73 | 6.11 | 4.03 | 4.03 | +0% | -30% | +7% |
+| o2_xrslam | 14.66 | 17.01 | 142418 | 17.01 | +0% | +16% | +16% |
+| a20_xrslam | 12.00 | 12.15 | 80497 | 12.15 | +0% | +1% | +1% |
+| phone Outdoor-1, final odometry (gait stream) | 5.73 | 7.10 | 4.71 | 4.78 | +1% | -17% | +24% |
+| phone Outdoor-2, final | 14.66 | 15.10 | 11.34 | 11.25 | -1% | -23% | +3% |
+| phone ADVIO-20, final | 12.00 | 12.32 | 11.79 | 11.76 | +0% | -2% | +3% |
+| phone Outdoor-1, LIVE odometry | 5.73 | 6.87 | 4.28 | 4.31 | +1% | -25% | +20% |
+| phone Outdoor-2, LIVE | 14.66 | 15.65 | 11.33 | 11.33 | +0% | -23% | +7% |
+| phone ADVIO-20, LIVE | 12.00 | 12.30 | 11.85 | 11.82 | +0% | -2% | +3% |
+
+Target "never worse than ~10 % over the better of the two": met on 23 of 25 rows. **Not met: o1_okvis (+18 %, and +53 % vs GNSS alone against the smoother's own +29 %: the OKVIS stream is plausible for 190 s, the georef is used and then the stream drifts; the distrust share only crosses 0.2 at ~190 s) and o1_stella (+26 %: a free-scale monocular stream is excluded by rule (a); the georef would have given 5.51 vs 6.94)**; complex_sim_blk +8 % is inside the target. "Never worse than GNSS alone by more than the current worst (+29 %)" is violated only by o1_okvis (+53 %).
+Leave-one-case-out (25 items = the 22 above + the 3 live phone rows; grid rho_on {0.75, 1.0} x distr_on {0.1, 0.15, 0.2} x sigma_min {4, 6} x fail_k {3, 4}; python simulation `tools/gf_auto_rule.py` of the saved streams, the C rows above are authoritative): the setting picked on the other 24 is the shipped one for 24 of 25 held-out cases and the held-out regret equals the full-data regret except where the held-out case itself is the o1_okvis / o1_stella failure (1.18 / 1.26). An earlier 729-point grid (with min span, distr_off) picked the same corner. **Settings were chosen on these 22 cases, not on independent data; the reported-sigma threshold (4 m) separates "consumer GNSS" from RTK / PX4 / simulated fixes by construction of the case list.** The simulation and the C switch disagree on one item (Outdoor-2 live: simulation 14.7 m, C 11.33 m); the C numbers are the measured ones.
+
+### 15.5 CPU per frame (pp_live, thread CPU time, machine shared with other jobs: stella_vio rows are inflated by cache contention, the earlier idle-ish sv_run numbers were 36-68 ms/frame)
+
+| sequence | frames | stella_vio ms/frame (mean / p99) | gait us/frame (about 6.7 IMU samples) | fusion all us/frame (mean / p99 / max) | of which smoother A | stream smoother B | georef + switch | fix handling (per frame equivalent) |
+|---|---|---|---|---|---|---|---|---|
+| Indoor-1 | 1779 | 39.8 / 100.1 | 2.9 | 30.8 / 165.7 / 418.9 | 5.7 | 6.7 | 2.1 | 0.0 |
+| Indoor-2 | 1535 | 35.5 / 73.2 | 2.9 | 29.5 / 199.5 / 363.5 | 6.0 | 6.9 | 2.0 | 0.0 |
+| Outdoor-1 | 5898 | 52.4 / 246.2 | 2.9 | 77.6 / 667.6 / 2788.2 | 21.0 | 8.1 | 4.5 | 19.0 |
+| Outdoor-2 | 6737 | 52.6 / 204.4 | 2.6 | 73.0 / 653.4 / 2764.7 | 19.2 | 7.2 | 4.4 | 18.2 |
+| ADVIO-15 | 1553 | 38.2 / 68.7 | 2.0 | 22.5 / 119.6 / 238.8 | 3.2 | 3.6 | 1.9 | 0.0 |
+| ADVIO-20 | 9076 | 52.7 / 211.9 | 2.0 | 44.9 / 692.7 / 4172.6 | 18.9 | 6.6 | 3.1 | 0.2 |
+
+The fusion (both smoothers, gait, georef, switch) costs 0.1-0.2 % of the front end; stella_vio is the whole budget (median 30-40 ms/frame, p99 up to 250 ms on keyframes / BA, max up to 0.47 s). Worst fusion call 4 ms (a window solve at a fix). `runs/phone_pipeline/live_tables.md`, `<seq>/live_full/{scores.json,pp.timing}`.
+
+### 15.6 Baseline checks
+`phone_pipeline/check_baselines.sh` (updated: compares with `gnss_fusion/work/pre15/`): stella_vio fr1_xyz with `reinit_sec=0 init_max_level=0 init_confirm=1` vs stella_port `sv_run`: 787 poses, `trajectory.tum` CMP-IDENTICAL (after the sv_run / sv_system changes); `gf_table.py` 893 numbers 0 differ; `gf_gait_study.py fusion` 1578 numbers 0 differ; `gf_georef_table.py` 140 numbers 0 differ; `compare_py.py` 8 cases and `test_geo.py`, `test_georef.py` pass; `test_auto.py` 6 checks pass. pp_live's final trajectory files are cmp-identical to the saved `sv_full/` on all six sequences, i.e. the default stella_vio trajectories are unchanged.
+
+### 15.7 Open issues
+* Live Indoor-2 (0.31 -> 1.10) and the short monocular sequences generally: the live map scale drifts until a loop closes; a better online scale (the gait prior is only a soft factor) or delayed-smoothing output would help; not tried.
+* The switch fails on o1_okvis (+18 %) and the free-scale o1_stella (+26 %); the thresholds were selected on the case list (22 cases, 2 datasets plus drone/GVINS), the sigma_min = 4 m rule is a consumer-vs-good-GNSS proxy. Outdoor-1 final has distrust max 0.26 against the 0.2 entry threshold (it passes because the share only crosses it after the georef is already on): fragile.
+* Free-scale monocular streams never use the georef in AUTO; the python simulation and the C switch differ on one live item.
+* Tracking-loss stretches: pp_live emits GNSS-only nodes through `pp.auto` only when fixes arrive during a tracking loss; no output is produced for the frames in between.
+* Timing was measured on a machine shared with other jobs (thread CPU time, cache contention).

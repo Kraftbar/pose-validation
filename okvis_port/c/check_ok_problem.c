@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
         if (len > cap) { cap = (size_t)len * 2 + 1024; buf = (unsigned char*)realloc(buf, cap); }
         if (len && fread(buf, 1, (size_t)len, f) != (size_t)len) break;
         c.p = buf; c.off = 0; c.len = (size_t)len; c.bad = 0;
+        if (tag >= 32) continue;   /* ViGraph mutation records of patch 0010 (replayed by check_ok_vigraph) */
         if (tag < 16) C_recs[tag]++;
         ptr = cu64(&c);
         if (tag == OK_P_NEW) {

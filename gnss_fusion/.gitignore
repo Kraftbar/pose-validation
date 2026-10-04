@@ -2,3 +2,4 @@ c/gf_run
 work/
 __pycache__/
 c/gf_georef_run
+c/gf_auto_run

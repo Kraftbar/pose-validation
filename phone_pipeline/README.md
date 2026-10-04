@@ -40,6 +40,15 @@ Variants (`run.py` `SV_VARIANTS`): `default` = stella_vio defaults + `gravity=1`
 `fullcal` = full with the dataset-calibration camera-IMU extrinsic instead of the sequence-fitted one (sensitivity). Fusion modes: `gait` (no fixes), `gnss` (fixes, no gait), `both`.
 Sequences without usable fixes (Indoor-1/2: iPhone indoor fixes have sigma 20-67 m; ADVIO-15: 38 indoor fixes) run GNSS-free: metric scale and yaw come from the gait speed only, the output frame is arbitrary (metric, not geo-referenced).
 
+## Live mode and automatic switch (section 15)
+```bash
+make -C phone_pipeline/c                                   # pp_live: stella_vio + gf_gait + gf_auto in one process (binary ignored by git)
+$PY phone_pipeline/run.py live outdoor1 --variants full --stream <fetch_dir>/outdoor1 [--keep-jpeg] [--pp "--pp-set policy=1"]   # -> runs/phone_pipeline/outdoor1/live_full/
+$PY phone_pipeline/live_eval.py outdoor1 && $PY phone_pipeline/live_report.py > runs/phone_pipeline/live_tables.md
+$PY phone_pipeline/auto_eval.py --src both                 # replay of final / live odometry through gnss_fusion/c/gf_auto_run (smoother / georef / auto)
+```
+Each frame's pose is emitted when it is computed (`sv_run --live-out`, opt-in) and streamed through gait, the two smoothers, the georef and the switch; `pp.auto` is what a live consumer sees. Results (live vs final, switch table, CPU per stage): `docs/gnss_vio_benchmark_20261001.md` section 15, `runs/phone_pipeline/live_tables.md`. Short: live costs -7..+4 % on the outdoor sequences and 3.5x on Indoor-2 (0.31 -> 1.10 m); AUTO = georef on all three outdoor sequences (4.31 / 11.33 / 11.82 live), smoother elsewhere.
+
 ## Configs (`configs/<seq>.json`, one per dataset)
 Camera intrinsics (dataset calibration, `tools/gnss_harness/robust_cfg/<seq>/port_camera.txt`), IMU csv, camera-IMU extrinsic (`imu_ext`: sequence-fitted rotation from `stella_vio/tools/ext_fit.py`; `imu_ext_cal`: dataset calibration),
 camera-IMU time offset `imu_toff` (same fit; ADVIO -0.31 / -0.32 s: its video clock lags the IMU clock), gyro bias `imu_bg` (first <= 60 s visual fit, `runs/stella_vio/imu/gyro_pred.md`, only used by `gyro=1`), fixes file,

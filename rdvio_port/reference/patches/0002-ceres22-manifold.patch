@@ -1,0 +1,65 @@
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/quaternion_parameterization.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/quaternion_parameterization.h
+@@ -6,7 +6,7 @@
+ 
+ namespace rdvio {
+ 
+-struct QuaternionParameterization : public ceres::LocalParameterization {
++struct QuaternionParameterization : public ceres::Manifold {
+     bool Plus(const double *q, const double *dq,
+               double *q_plus_dq) const override {
+         map<quaternion> result(q_plus_dq);
+@@ -14,15 +14,29 @@
+                      .normalized();
+         return true;
+     }
+-    bool ComputeJacobian(const double *, double *jacobian) const override {
++    bool PlusJacobian(const double *, double *jacobian) const override {
+         map<matrix<4, 3, true>> J(jacobian);
+         J.setIdentity(); // the composited jacobian is computed in
+                          // PreIntegrationError::Evaluate(), we simply forward
+                          // it.
+         return true;
+     }
+-    int GlobalSize() const override { return 4; }
+-    int LocalSize() const override { return 3; }
++    // Ceres 2.x only needs Minus / MinusJacobian for covariance estimation and
++    // gradient checking, neither of which rdvio uses.
++    bool Minus(const double *y, const double *x,
++               double *y_minus_x) const override {
++        map<vector<3>> result(y_minus_x);
++        result = logmap(const_map<quaternion>(x).conjugate() *
++                        const_map<quaternion>(y));
++        return true;
++    }
++    bool MinusJacobian(const double *, double *jacobian) const override {
++        map<matrix<3, 4, true>> J(jacobian);
++        J.setIdentity();
++        return true;
++    }
++    int AmbientSize() const override { return 4; }
++    int TangentSize() const override { return 3; }
+ };
+ 
+ } // namespace rdvio
+--- a/src/rdvio_estimation/src/solver.cpp
++++ b/src/rdvio_estimation/src/solver.cpp
+@@ -17,7 +17,7 @@
+     }
+     std::unique_ptr<ceres::Problem> problem;
+     std::unique_ptr<ceres::LossFunction> cauchy_loss;
+-    std::unique_ptr<ceres::LocalParameterization> quaternion_parameterization;
++    std::unique_ptr<ceres::Manifold> quaternion_parameterization;
+     std::vector<std::unique_ptr<ReprojectionErrorFactor>> managed_rpefactors;
+     std::vector<std::unique_ptr<ReprojectionPriorFactor>> managed_rppfactors;
+     std::vector<std::unique_ptr<RotationPriorFactor>> managed_ropfactors;
+@@ -30,8 +30,7 @@
+     ceres::Problem::Options problem_options;
+     problem_options.cost_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+     problem_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+-    problem_options.local_parameterization_ownership =
+-        ceres::DO_NOT_TAKE_OWNERSHIP;
++    problem_options.manifold_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+     details->problem = std::make_unique<ceres::Problem>(problem_options);
+     details->cauchy_loss = std::make_unique<ceres::CauchyLoss>(
+         1.0); // TODO(jinyu): make configurable

@@ -1,0 +1,93 @@
+// RD-VIO deterministic reference driver (rdvio_port). Own glue code, derived from tools/vio_harness/rdvio/main_headless.cpp.
+// EuRoC-layout dir -> TUM trajectory of the body (IMU) pose, one line per camera frame while tracking, printed with %.17g so that
+// two runs can be compared byte for byte.
+// Usage: rdvio_ref_driver <sensor.yaml> <setting.yaml> <mav0 dir> <out.tum> [max_seconds]
+// Images are undistorted here with the radtan parameters of cam0 in sensor.yaml (the library never applies them).
+// The library is built with THREADING=OFF (synchronous Handler), so no pacing and no timing-dependent logic is involved.
+#include <unistd.h>
+#include <rdvio/handler.h>
+#include <rdvio/map/frame.h>
+#include <rdvio/feature_tracker.h>
+#include <rdvio/frontend.h>
+#include <rdvio/extra/yaml_config.h>
+#include <rdvio/extra/opencv_image.h>
+#include <opencv2/opencv.hpp>
+#include <yaml-cpp/yaml.h>
+#if __has_include(<rdvio/estimation/port_dump.h>)
+#include <rdvio/estimation/port_dump.h>
+#define RDVIO_HAVE_DUMP 1
+#endif
+#include <algorithm>
+#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+using namespace std;
+static double ts(const string &s) { double v = stod(s); return v > 1e12 ? v / 1e9 : v; }
+int main(int argc, char **argv) {
+  if (argc < 5) { cerr << "usage: rdvio_ref_driver sensor.yaml setting.yaml mav0 out.tum [max_seconds]\n"; return 1; }
+  string calib = argv[1], conf = argv[2], d = argv[3], outp = argv[4];
+  double maxs = argc > 5 ? atof(argv[5]) : 1e18;
+  YAML::Node y = YAML::LoadFile(calib);
+  auto K = y["cam0"]["intrinsics"].as<vector<double>>();
+  auto D = y["cam0"]["distortion"].as<vector<double>>();
+  auto res = y["cam0"]["resolution"].as<vector<int>>();
+  cv::Mat Km = (cv::Mat_<double>(3, 3) << K[0], 0, K[2], 0, K[1], K[3], 0, 0, 1);
+  cv::Mat Dm = (cv::Mat_<double>(1, 4) << D[0], D[1], D[2], D[3]);
+  cv::Mat m1, m2;
+  string dmodel = y["cam0"]["distortion_model"] ? y["cam0"]["distortion_model"].as<string>() : "radtan";
+  if (dmodel == "equidistant")
+    cv::fisheye::initUndistortRectifyMap(Km, Dm, cv::Mat::eye(3, 3, CV_64F), Km, cv::Size(res[0], res[1]), CV_32FC1, m1, m2);
+  else
+    cv::initUndistortRectifyMap(Km, Dm, cv::Mat(), Km, cv::Size(res[0], res[1]), CV_32FC1, m1, m2);
+  auto yc = make_shared<rdvio::extra::YamlConfig>(conf, calib);
+  rdvio::Handler h(yc);
+  struct I { double t, w[3], a[3]; };
+  vector<I> imus;
+  vector<pair<double, string>> cams;
+  string line;
+  { ifstream f(d + "/imu0/data.csv"); getline(f, line);
+    while (getline(f, line)) {
+      if (line.empty()) continue;
+      replace(line.begin(), line.end(), ',', ' ');
+      istringstream ss(line); string t; I m; ss >> t; m.t = ts(t);
+      for (int i = 0; i < 3; i++) ss >> m.w[i];
+      for (int i = 0; i < 3; i++) ss >> m.a[i];
+      imus.push_back(m); } }
+  { ifstream f(d + "/cam0/data.csv"); getline(f, line);
+    while (getline(f, line)) {
+      if (line.empty()) continue;
+      auto p = line.find(','); string t = line.substr(0, p), fn = line.substr(p + 1);
+      fn.erase(remove_if(fn.begin(), fn.end(), [](char c) { return c == ' ' || c == '\r' || c == '\n'; }), fn.end());
+      cams.push_back({ts(t), fn}); } }
+  double t0 = min(imus.front().t, cams.front().first);
+  FILE *out = fopen(outp.c_str(), "w");
+  size_t ii = 0, frames = 0, poses = 0; int prev = -1; double first_pose = -1;
+  for (auto &c : cams) {
+    if (c.first - t0 > maxs) break;
+    while (ii < imus.size() && imus[ii].t <= c.first) {
+      auto &m = imus[ii];
+      h.track_gyroscope(m.t, m.w[0], m.w[1], m.w[2]);
+      h.track_accelerometer(m.t, m.a[0], m.a[1], m.a[2]);
+      ii++; }
+    cv::Mat raw = cv::imread(d + "/cam0/data/" + c.second, cv::IMREAD_GRAYSCALE);
+    if (raw.empty()) { cerr << "bad image " << c.second << endl; continue; }
+    cv::Mat un; cv::remap(raw, un, m1, m2, cv::INTER_LINEAR);
+    auto im = make_shared<rdvio::extra::OpenCvImage>();
+    im->image = un.clone(); im->raw = un.clone(); im->t = c.first;
+    h.track_camera(im); frames++;
+    int st = (int)h.get_system_state();
+    if (st != prev) { fprintf(stderr, "t=%.3f state %d -> %d\n", c.first - t0, prev, st); prev = st; }
+    if (st == rdvio::SYS_TRACKING) {
+      auto [tt, p] = h.get_latest_state();
+      fprintf(out, "%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", c.first, p.p.x(), p.p.y(), p.p.z(), p.q.x(), p.q.y(), p.q.z(), p.q.w());
+      poses++; if (first_pose < 0) first_pose = c.first - t0;
+    }
+  }
+  fprintf(stderr, "FRAMES %zu POSES %zu FIRST_POSE_S %.2f\n", frames, poses, first_pose);
+#ifdef RDVIO_HAVE_DUMP
+  rdvio::portdump::flush_all();
+#endif
+  fflush(out); fclose(out); fflush(stdout); fflush(stderr);
+  _exit(0);  // skip static destructors (Ceres / OpenCV thread pools), the output is already flushed
+}

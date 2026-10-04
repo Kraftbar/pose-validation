@@ -12,6 +12,7 @@ c/gf_math.h         internal helpers (3x3, quaternion, 5x5 block Cholesky / bloc
 c/gf_gait.{h,c}     gait (step cadence) speed prior from a phone IMU: step detector, cadence, speed model, still detector, online GNSS calibration
 c/gf_georef.{h,c}   slowly varying geo-referencing of a metric pose stream by ONE similarity from all fixes (section 14, opt-in)
 c/gf_georef_run.c   driver for gf_georef: stream + fixes in, geo-referenced stream out (causal = live, or batch)
+c/gf_auto.{h,c}     streaming smoother + georef + automatic switch (section 15, opt-in); gf_auto_cfg.h key=value parsing; gf_auto_run.c driver
 c/gf_run.c          command line driver (stdio, timers): text files in, TUM trajectory out, per-call timing
 c/gf_gait_run.c     driver for gf_gait: IMU csv in, per-epoch cadence / speed / state out
 c/Makefile          cc -std=c99 -O2 -Wall -Wextra -pedantic (no warnings)
@@ -100,6 +101,14 @@ gnss_fusion/c/gf_run --odom odom.txt --fix none.txt ... --out-live stream.live  
 gnss_fusion/c/gf_georef_run --stream stream.live --fix fixes.txt --out geo.txt --mode causal     # stage B  (keys: min_fixes min_extent scale_sigma corr_s forget_s huber_k use_sigma max_gap_s ...)
 ```
 Library: `gf_georef_create / add_pose / add_fix / map / solve / fit` (`c/gf_georef.h`). It is NOT a replacement of the smoother: a global similarity cannot follow a drifting or re-initialising odometry (earlier case list: far worse for OKVIS2 phone cases, complex with RTK fixes, collapsing XRSLAM; `tools/gf_georef_table.py`).
+
+## Automatic smoother <-> georef switch (section 15 of the study; opt-in, `gf_auto`)
+
+`gf_auto` runs the smoother with fixes (A), optionally a fix-free smoother (B, gait prior) whose live output is the georef stream, and `gf_georef`, all causally, and outputs A, the georef or a cross-fade, from signals observable at the time: the georef is used only while the stream is metric (`geo.scale_sigma <= 10`), the fixes are poor (reported sigma EW mean >= `sig_min` 4 m), the stream agrees with the fixes (rms prequential error of the georef at the fixes / sigma <= `rho_on` 0.75 to enter, < `rho_off` 1.125 to stay), the smoother's own consistency test does not distrust the odometry (distrusted share EW 60 s <= `distr_on` 0.2 / < `distr_off` 0.3) and the latest prequential error is not a sudden failure (> `fail_k` 3 x max(rms, 2 sigma): weight drops to 0 at once, georef barred 60 s). Weight rises at 1/20 s, falls at 1/2 s.
+```
+gnss_fusion/c/gf_auto_run --odom odom.txt --fix fixes.txt [--speed speed.txt] --out auto.live --out-sm sm.live --out-geo geo.live --sig sig.txt  preset=robust g.scale_sigma=0.15 [stream=1 b.KEY=..]
+```
+`policy=0` reproduces `gf_run` causal live, `policy=1` the two-stage `gf_run` + `gf_georef_run` live output (checked by `tools/test_auto.py`); `tools/gf_auto_table.py` scores the earlier case list, `tools/gf_auto_rule.py` simulates rule variants on saved streams (leave-one-case-out). Results and failures: `docs/gnss_vio_benchmark_20261001.md` section 15.
 
 ## API (see `c/gf_fusion.h`)
 

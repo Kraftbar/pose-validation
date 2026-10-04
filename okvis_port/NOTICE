@@ -29,6 +29,11 @@ PseudoInverse; the Cauchy corrector transcription inside compute() follows Ceres
 (small lazy products, SelfAdjointEigenSolver for n = 3 / 6 / dynamic, GEMV, fixed-size norms), MPL-2.0; ok_problem.{h,c}
 (the ceres::Problem / ProblemImpl bookkeeping that defines the program order) is derived from Ceres Solver 2.2.0
 (internal/ceres/problem_impl.cc, program.h, parameter_block.h, residual_block.h; BSD-3-Clause, Google Inc.).
+Module 5d (graph state and mutations): ok_vigraph.{h,c} (ViGraph / ViGraphEstimator: addStates*, landmarks, observations,
+priors, eliminateStateByImuMerge, freeze / unfreeze, convertToPoseGraphMst with the MstGraph Kruskal, convertToObservations,
+mergeLandmark, cleanUnobservedLandmarks, two-pose const links, computeCovisibilities) are OKVIS2-derived (BSD-3-Clause,
+same notices as above); the sorted-array / hash containers and the mutation-log harness are original. Patch
+0010-vigraph-mutation-log.patch only instruments the OKVIS2 tree under runs/ and is never distributed.
 The reference build (runs/okvis_port/reference_build) links Ceres (BSD-3 + Apache-2.0 parts), glog, gflags, OpenCV,
 Boost, OpenBLAS and is never distributed. Dumps and datasets under runs/ are EuRoC-derived (non-commercial) and
 must never be committed. See docs/okvis2_license_audit.md.

@@ -3,7 +3,8 @@
 
     python3 tools/run_okvis_reference.py MH_01_easy --tag run1 [--dump] [--dump-every eval=50]
            [--solve-dump --solve-every 20 --solve-full-every 4]   (M4 solver dump, patch 0008)
-           [--graph-dump [--graph-lm-every 2 --graph-lm-sub 8 --graph-tpeval-every 50]]   (M5 graph dump, patch 0009)
+           [--graph-dump [--graph-lm-every 2 --graph-lm-sub 8 --graph-tpeval-every 50]]   (M5 graph dump, patch 0009;
+            from patch 0010 on problem.bin also carries the ViGraph mutation log of module M5d)
 
 Dataset: external/vio/data/<seq>/mav0 (tools/vio_harness/fetch_seq_stream.py). Outputs go to
 runs/okvis_port/reference_runs/<seq>/<tag>/ : final.csv (final trajectory), causal.csv (causal
