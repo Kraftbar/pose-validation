@@ -1,0 +1,307 @@
+--- a/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
+@@ -1,7 +1,8 @@
+ #pragma once
+ // rdvio_port instrumentation (reference build only, never distributed): binary record dumps used by rdvio_port/c/check_rd_*.c.
+ // Enabled by RDVIO_PORT_DUMP_DIR; sampling by RDVIO_PORT_DUMP_EVERY="integ=1,pred=1,pie=20,plus=50,rpe=100,..." (0 = count only).
+-// Channels: M1 integ pred pie plus; M2 rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp (layouts in rdvio_port/c/rd_factor.h, rd_geom.h).
++// Channels: M1 integ pred pie plus; M2 rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp (layouts in rdvio_port/c/rd_factor.h, rd_geom.h);
++// M3 fess frot fhom pess phom pois (rd_ransac.h, rd_poisson.h). pess/phom/pois are replayed as sequences (persistent PARSAC bin state, filter op streams): keep every=1.
+ // Pure observation: reads state, never modifies it.
+ #include <cstdint>
+ #include <cstdio>
+@@ -17,10 +18,12 @@
+     const char *name;
+ };
+ inline Chan &chan(int k) {
+-    static Chan ch[17] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"},
++    static Chan ch[23] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"},
+                           {nullptr, 0, 100, "rpe"}, {nullptr, 0, 10, "rot"}, {nullptr, 0, 50, "wahba"}, {nullptr, 0, 100, "ess5"},
+                           {nullptr, 0, 1, "hom4"}, {nullptr, 0, 1, "decess"}, {nullptr, 0, 1, "dechom"}, {nullptr, 0, 1, "tri2"},
+-                          {nullptr, 0, 1, "trin"}, {nullptr, 0, 1, "trk"}, {nullptr, 0, 5, "tang"}, {nullptr, 0, 50, "glp"}, {nullptr, 0, 5, "slp"}};
++                          {nullptr, 0, 1, "trin"}, {nullptr, 0, 1, "trk"}, {nullptr, 0, 5, "tang"}, {nullptr, 0, 50, "glp"}, {nullptr, 0, 5, "slp"},
++                          {nullptr, 0, 1, "fess"}, {nullptr, 0, 1, "frot"}, {nullptr, 0, 1, "fhom"}, {nullptr, 0, 1, "pess"},
++                          {nullptr, 0, 1, "phom"}, {nullptr, 0, 1, "pois"}};
+     static bool init = false;
+     if (!init) {
+         init = true;
+@@ -51,13 +54,27 @@
+ inline void f64(Chan *c, const double *p, size_t n) { std::fwrite(p, 8, n, c->f); }
+ inline void f64(Chan *c, double v) { std::fwrite(&v, 8, 1, c->f); }
+ inline void flush_all() {
+-    for (int k = 0; k < 17; ++k)
++    for (int k = 0; k < 23; ++k)
+         if (chan(k).f) std::fflush(chan(k).f);
+ }
+ struct Flusher {
+     ~Flusher() { flush_all(); }
+ };
+ inline thread_local bool via_prior = false;
++inline void u64(Chan *c, uint64_t v) { std::fwrite(&v, 8, 1, c->f); }
++// find_*_matrix record: u32 n, f64 threshold, f64 confidence, u64 max_iteration, i32 seed, n x p1, n x p2, f64 M[9], u32 mask_len, mask
++template <int D>
++inline void find_record(Chan *c, const std::vector<Eigen::Matrix<double, D, 1>> &a, const std::vector<Eigen::Matrix<double, D, 1>> &b, double thr, double conf,
++                        size_t maxit, int seed, const Eigen::Matrix3d &M, const std::vector<char> &mask) {
++    u32(c, (uint32_t)a.size()); f64(c, thr); f64(c, conf); u64(c, (uint64_t)maxit);
++    std::fwrite(&seed, 4, 1, c->f);
++    for (const auto &p : a) f64(c, p.data(), D);
++    for (const auto &p : b) f64(c, p.data(), D);
++    f64(c, M.data(), 9);
++    u32(c, (uint32_t)mask.size());
++    if (!mask.empty()) std::fwrite(mask.data(), 1, mask.size(), c->f);
++}
++inline uint64_t next_filter_id() { static uint64_t id = 0; return id++; }
+ inline void obs(Chan *c, const Eigen::Quaterniond &pq, const Eigen::Vector3d &pp, const Eigen::Quaterniond &cq, const Eigen::Vector3d &cp, const Eigen::Vector3d &kp) {
+     f64(c, pq.coeffs().data(), 4); f64(c, pp.data(), 3); f64(c, cq.coeffs().data(), 4); f64(c, cp.data(), 3); f64(c, kp.data(), 3);
+ }
+--- a/src/rdvio_extra/include/rdvio/extra/poisson_disk_filter.h
++++ b/src/rdvio_extra/include/rdvio/extra/poisson_disk_filter.h
+@@ -2,6 +2,7 @@
+ 
+ #include <unordered_map>
+ #include <rdvio/types.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio::extra {
+ 
+@@ -13,14 +14,31 @@
+     PoissonDiskFilter(double radius)
+         : radius(radius), radius_squared(radius * radius),
+           grid_size(radius / sqrt(double(dimension))),
+-          grid_span((int)ceil(sqrt((double)dimension))) {}
++          grid_span((int)ceil(sqrt((double)dimension))) {
++        pd_id = portdump::next_filter_id();
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 0); portdump::u64(pc, pd_id); portdump::f64(pc, radius);
++        }
++    }
++
++    ~PoissonDiskFilter() {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 6); portdump::u64(pc, pd_id);
++        }
++    }
+ 
+     void clear() {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 5); portdump::u64(pc, pd_id);
++        }
+         points.clear();
+         sparse_grid.clear();
+     }
+ 
+     void preset_point(const point_type &point) {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 1); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2);
++        }
+         grid_index_type index = to_index(point);
+         sparse_grid[index] = points.size();
+         points.emplace_back(point);
+@@ -34,20 +52,30 @@
+ 
+     bool permit_point(const point_type &point) const {
+         grid_index_type index;
+-        return test_point(point, index);
++        bool r = test_point(point, index);
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 2); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2); portdump::u32(pc, r ? 1u : 0u);
++        }
++        return r;
+     }
+ 
+     bool insert_point(const point_type &point) {
++        bool r = false;
+         if (grid_index_type index; test_point(point, index)) {
+             sparse_grid[index] = points.size();
+             points.emplace_back(point);
+-            return true;
+-        } else {
+-            return false;
++            r = true;
+         }
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 3); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2); portdump::u32(pc, r ? 1u : 0u);
++        }
++        return r;
+     }
+ 
+     void insert_points(std::vector<point_type> &candidate_points) {
++        std::vector<point_type> dump_in;
++        portdump::Chan *dpc = portdump::want(22);
++        if (dpc) dump_in = candidate_points;
+         size_t n_point_before = points.size();
+         for (const auto &p : candidate_points) {
+             if (grid_index_type index; test_point(p, index)) {
+@@ -57,6 +85,12 @@
+         }
+         std::vector<point_type>(points.begin() + n_point_before, points.end())
+             .swap(candidate_points);
++        if (dpc) {
++            portdump::u32(dpc, 4); portdump::u64(dpc, pd_id); portdump::u32(dpc, (uint32_t)dump_in.size());
++            for (const auto &p : dump_in) portdump::f64(dpc, p.data(), 2);
++            portdump::u32(dpc, (uint32_t)candidate_points.size());
++            for (const auto &p : candidate_points) portdump::f64(dpc, p.data(), 2);
++        }
+     }
+ 
+     const std::vector<point_type> &get_points() const { return points; }
+@@ -93,6 +127,7 @@
+         return true;
+     }
+ 
++    uint64_t pd_id = 0;
+     double radius, radius_squared;
+     double grid_size;
+     int grid_span;
+--- a/src/rdvio_geometry/src/stereo.cpp
++++ b/src/rdvio_geometry/src/stereo.cpp
+@@ -1,4 +1,5 @@
+ #include <rdvio/geometry/essential.h>
++#include <rdvio/estimation/port_dump.h>
+ #include <rdvio/geometry/homography.h>
+ #include <rdvio/geometry/lie_algebra.h>
+ #include <rdvio/geometry/stereo.h>
+@@ -61,6 +62,8 @@
+         2.0 * t1 * threshold * threshold, confidence, max_iteration, seed);
+     matrix<3> E = ransac.solve(points1, points2);
+     inlier_mask.swap(ransac.inlier_mask);
++    if (portdump::Chan *pc = portdump::want(17))
++        portdump::find_record<2>(pc, points1, points2, threshold, confidence, max_iteration, seed, E, inlier_mask);
+     return E;
+ }
+ 
+@@ -87,6 +90,8 @@
+         t2 * threshold * threshold, confidence, max_iteration, seed);
+     matrix<3> R = ransac.solve(points1, points2);
+     inlier_mask.swap(ransac.inlier_mask);
++    if (portdump::Chan *pc = portdump::want(18))
++        portdump::find_record<3>(pc, points1, points2, threshold, confidence, max_iteration, seed, R, inlier_mask);
+     return R;
+ }
+ 
+@@ -115,6 +120,8 @@
+         2.0 * t2 * threshold * threshold, confidence, max_iteration, seed);
+     matrix<3> H = ransac.solve(points1, points2);
+     inlier_mask.swap(ransac.inlier_mask);
++    if (portdump::Chan *pc = portdump::want(19))
++        portdump::find_record<2>(pc, points1, points2, threshold, confidence, max_iteration, seed, H, inlier_mask);
+     return H;
+ }
+ 
+@@ -151,6 +158,8 @@
+         2.0 * t1 * threshold * threshold, confidence, max_iteration, seed);
+     matrix<3> E = parsac.solve(binConfidences, points1, points2);
+     inlier_mask.swap(parsac.inlier_mask);
++    if (portdump::Chan *pc = portdump::want(20))
++        portdump::find_record<2>(pc, points1, points2, threshold, confidence, max_iteration, seed, E, inlier_mask);
+     return E;
+ }
+ 
+@@ -180,6 +189,8 @@
+         2.0 * t2 * threshold * threshold, confidence, max_iteration, seed);
+     matrix<3> H = parsac.solve(binConfidences, points1, points2);
+     inlier_mask.swap(parsac.inlier_mask);
++    if (portdump::Chan *pc = portdump::want(21))
++        portdump::find_record<2>(pc, points1, points2, threshold, confidence, max_iteration, seed, H, inlier_mask);
+     return H;
+ }
+ 
+--- a/src/rdvio_util/include/rdvio/util/poisson_disk_filter.h
++++ b/src/rdvio_util/include/rdvio/util/poisson_disk_filter.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <rdvio/types.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -12,14 +13,31 @@
+     PoissonDiskFilter(double radius)
+         : radius(radius), radius_squared(radius * radius),
+           grid_size(radius / sqrt(double(dimension))),
+-          grid_span((int)ceil(sqrt((double)dimension))) {}
++          grid_span((int)ceil(sqrt((double)dimension))) {
++        pd_id = portdump::next_filter_id();
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 0); portdump::u64(pc, pd_id); portdump::f64(pc, radius);
++        }
++    }
++
++    ~PoissonDiskFilter() {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 6); portdump::u64(pc, pd_id);
++        }
++    }
+ 
+     void clear() {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 5); portdump::u64(pc, pd_id);
++        }
+         points.clear();
+         sparse_grid.clear();
+     }
+ 
+     void preset_point(const point_type &point) {
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 1); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2);
++        }
+         grid_index_type index = to_index(point);
+         sparse_grid[index] = points.size();
+         points.emplace_back(point);
+@@ -33,20 +51,30 @@
+ 
+     bool permit_point(const point_type &point) const {
+         grid_index_type index;
+-        return test_point(point, index);
++        bool r = test_point(point, index);
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 2); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2); portdump::u32(pc, r ? 1u : 0u);
++        }
++        return r;
+     }
+ 
+     bool insert_point(const point_type &point) {
++        bool r = false;
+         if (grid_index_type index; test_point(point, index)) {
+             sparse_grid[index] = points.size();
+             points.emplace_back(point);
+-            return true;
+-        } else {
+-            return false;
++            r = true;
+         }
++        if (portdump::Chan *pc = portdump::want(22)) {
++            portdump::u32(pc, 3); portdump::u64(pc, pd_id); portdump::f64(pc, point.data(), 2); portdump::u32(pc, r ? 1u : 0u);
++        }
++        return r;
+     }
+ 
+     void insert_points(std::vector<point_type> &candidate_points) {
++        std::vector<point_type> dump_in;
++        portdump::Chan *dpc = portdump::want(22);
++        if (dpc) dump_in = candidate_points;
+         size_t n_point_before = points.size();
+         for (const auto &p : candidate_points) {
+             if (grid_index_type index; test_point(p, index)) {
+@@ -56,6 +84,12 @@
+         }
+         std::vector<point_type>(points.begin() + n_point_before, points.end())
+             .swap(candidate_points);
++        if (dpc) {
++            portdump::u32(dpc, 4); portdump::u64(dpc, pd_id); portdump::u32(dpc, (uint32_t)dump_in.size());
++            for (const auto &p : dump_in) portdump::f64(dpc, p.data(), 2);
++            portdump::u32(dpc, (uint32_t)candidate_points.size());
++            for (const auto &p : candidate_points) portdump::f64(dpc, p.data(), 2);
++        }
+     }
+ 
+     const std::vector<point_type> &get_points() const { return points; }
+@@ -92,6 +126,7 @@
+         return true;
+     }
+ 
++    uint64_t pd_id = 0;
+     double radius, radius_squared;
+     double grid_size;
+     int grid_span;

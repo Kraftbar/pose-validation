@@ -2,11 +2,16 @@ rdvio_port: clean-room pure-C port of RD-VIO (work in progress)
 
 Files under rdvio_port/c/ derived from RD-VIO (Jianxff/rd_vio, Apache-2.0; rd_vio is "separated and modified from" XRSLAM,
 Copyright 2022 XRSLAM Authors, Apache-2.0; full text rdvio_port/LICENSES/rdvio-Apache-2.0.txt) are translations of the original C++ and
-carry that notice: rd_imu.{h,c}, rd_lie.{h,c}. The upstream repository names no copyright holder in its LICENSE (unfilled template) and has
+carry that notice: rd_imu.{h,c}, rd_lie.{h,c}, rd_factor.{h,c}, rd_geom.{h,c}, rd_rand.{h,c}, rd_ransac.{h,c}, rd_poisson.{h,c}. The upstream repository names no copyright holder in its LICENSE (unfilled template) and has
 no per-file headers; the notice above is the conservative reading.
-Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
+Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, rd_svd.{h,c}, rd_qr.{h,c}, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
 (Copyright (C) Gael Guennebaud, Benoit Jacob and the Eigen authors); they reuse okvis_port/c/ok_eigen.c and ok_dense.c (MPL-2.0 / BSD-3).
 Later modules derived from Ceres Solver (BSD-3-Clause, Google Inc.; text in rdvio_port/LICENSES/ceres-solver-BSD-3-Clause.txt) and from
 OpenCV (Apache-2.0, OpenCV Foundation / Intel / contributors) will add their notices here.
 The reference instrumentation (rdvio_port/reference/patches/0003-*.patch) and the oracle program (rdvio_port/reference_tools) are never
 distributed. EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).
+
+Read-only reuse by path (not copied, notices stay with the originals): okvis_port/c/ok_eigen.c, ok_dense.c (MPL-2.0 / BSD-3),
+stella_port/c/sv_eigen_svd.c, sv_eigen_qr.c, sv_eigen_eigensolver.c (MPL-2.0). rd_qr.c is a copy of stella_port/c/sv_eigen_qr.c (MPL-2.0) with one
+added parameter; rd_svd.c is derived from stella_port/c/sv_eigen_svd.c (MPL-2.0). The libstdc++ (minstd_rand0, uniform_int_distribution) and glibc
+(rand) behaviours in rd_rand.c are re-derived from their documented algorithms and verified against the real library calls.

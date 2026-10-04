@@ -125,6 +125,7 @@ typedef struct ok_vg_conv_result {
     int ctr;
     int nobs; ok_vg_kid* kid; ok_reproj_err** err; uint64_t* lm;
     int nlm; uint64_t* lms; int nconnected; uint64_t* connected;
+    int* cauchy;              /* per observation: the term had the Cauchy loss (obs.lossFunction != nullptr) */
 } ok_vg_conv_result;
 
 ok_vg* ok_vg_new(void);
@@ -182,6 +183,10 @@ void ok_vg_update_landmarks(ok_vg* g);
 int ok_vg_clean_unobserved_landmarks(ok_vg* g);
 int ok_vg_eliminate_state_by_imu_merge(ok_vg* g, uint64_t id, uint64_t ref, uint64_t* kf, double T_Sk_S[7], double v_Sk[3]);
 int ok_vg_merge_landmark(ok_vg* g, uint64_t from, uint64_t into);
+/* eliminateStateByImuMerge plus the hash of the post-merge IMU snapshot that patch 0010 logs in the result */
+int ok_vg_eliminate_state_by_imu_merge_h(ok_vg* g, uint64_t id, uint64_t ref, uint64_t* kf, double T_Sk_S[7], double v_Sk[3], uint64_t* imu_hash);
+/* cleanUnobservedLandmarks(&removed): arrays of the removed landmarks (ascending id), the observation each had (if any); malloc'd */
+int ok_vg_clean_unobserved_landmarks_ex(ok_vg* g, uint64_t** lms, ok_vg_kid** kids, int** has_kid, int* nrem);
 int ok_vg_freeze_poses_until(ok_vg* g, uint64_t id, int remove_in_ceres);
 int ok_vg_unfreeze_poses_from(ok_vg* g, uint64_t id);
 int ok_vg_freeze_sb_until(ok_vg* g, uint64_t id, int remove_in_ceres);
@@ -204,6 +209,30 @@ int ok_vg_poke_landmarks_constant(ok_vg* g, int constant);
 int ok_vg_poke_set_observation_information(ok_vg* g, ok_vg_kid kid, const double info[4]);
 int ok_vg_poke_copy_state(ok_vg* g, uint64_t id, const double T7[7], const double sb[9]);
 int ok_vg_poke_sync_imu(ok_vg* g, const ok_vg* src, uint64_t id);
+
+/* ---- read access for ViSlamBackend (module M6) ---- */
+typedef struct ok_vg_state_view { uint64_t id; int is_kf, pose_fixed, sb_fixed, nobs, ntp, ntpc, nrel, has_prev_imu; ok_time ts; } ok_vg_state_view;
+typedef struct ok_vg_lm_view { uint64_t id; double hp[4]; int initialised; double quality; int nobs; } ok_vg_lm_view;
+int ok_vg_state_count(const ok_vg* g);
+int ok_vg_state_at(const ok_vg* g, int idx, ok_vg_state_view* v);         /* states_ in ascending id order */
+int ok_vg_state_find(const ok_vg* g, uint64_t id, ok_vg_state_view* v);   /* 0 if absent (v may be NULL) */
+int ok_vg_state_index(const ok_vg* g, uint64_t id);                       /* -1 if absent */
+int ok_vg_state_obs(const ok_vg* g, uint64_t id, ok_vg_kid** kids, uint64_t** lms);   /* observations in key order; malloc'd */
+int ok_vg_landmark_count(const ok_vg* g);
+uint64_t ok_vg_landmark_id_at(const ok_vg* g, int i);                      /* landmarks_ in ascending id order */
+int ok_vg_landmark_find(const ok_vg* g, uint64_t id, ok_vg_lm_view* v);
+int ok_vg_landmark_obs(const ok_vg* g, uint64_t id, ok_vg_kid** kids);    /* in key order; malloc'd */
+int ok_vg_obs_find(const ok_vg* g, ok_vg_kid kid, uint64_t* lm, const ok_reproj_err** err, int* cauchy);
+int ok_vg_anystate_get(const ok_vg* g, uint64_t id, uint64_t* kf, double T7[7], double v3[3]);
+int ok_vg_imu_use(const ok_vg* g);
+int ok_vg_num_cameras(const ok_vg* g);
+void ok_vg_set_solver_options(ok_vg* g, int linear_solver_type, double function_tolerance);   /* Solver::Options as the OPT record logs them */
+int ok_vg_solver_type(const ok_vg* g);
+double ok_vg_function_tolerance(const ok_vg* g);
+int ok_vg_pose_fixed(const ok_vg* g, uint64_t id);
+/* (state0, state1) of the links stored in a state (kind 0 relative pose, 1 two-pose, 2 two-pose const), in map order; malloc'd */
+int ok_vg_state_links(const ok_vg* g, uint64_t id, int kind, uint64_t (**pairs)[2]);
+int ok_vg_rel_link_get(const ok_vg* g, uint64_t s0, uint64_t s1, double T7[7], double info_cm[36]);
 
 /* ---- observation of the state for the replay harness ---- */
 int ok_vg_num_states(const ok_vg* g);

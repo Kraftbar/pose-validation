@@ -1,0 +1,410 @@
+0011: module M6 instrumentation (ViSlamBackend entry log), active only with OKVIS_PORT_GRAPH_DUMP_DIR.
+ New records in problem.bin (tags 128.., layouts in okvis_port/c/ok_vslam.h): one record at the ENTRY of every
+ ViSlamBackend method the frontend / ThreadedSlam drives (addStates with the multiframe keypoints, addLandmark, addObservation,
+ applyStrategy, optimiseRealtimeGraph, attemptLoopClosure, ...; tag | 0x100 = its results at exit) and one per MultiFrame::setLandmarkId.
+ They are the INPUTS of the backend; the graph records (tag >= 32) that follow are what the C backend must regenerate.
+ No computed value changes.
+
+diff -ruN a/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp
+--- a/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp	2026-10-04 18:46:12.918081208 +0200
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp	2026-10-04 20:20:45.157766895 +0200
+@@ -80,5 +80,40 @@
+   bool on_ = false, top_ = false;
+ };
+ 
++// ---- patch 0011 (module M6): ViSlamBackend entry records (the INPUTS of the backend) -------------------------------
++// Written right when the backend method is entered (not through Scope: the graph records it causes follow), with the
++// result record (tag | 0x100) when the method returns. Layouts in okvis_port/c/ok_vslam.h.
++enum BOp : uint32_t {
++  B_ADDCAM = 128, B_ADDIMU, B_ADDSTATES, B_SETKF, B_ADDLM_ID, B_ADDLM_NEW, B_SETLM, B_SETCLASS, B_ADDOBS, B_RMOBS,
++  B_SETOBSINFO, B_MERGELMS, B_MERGELM, B_APPLYSTRATEGY, B_OPTRT, B_OPTFULL, B_SYNC, B_CLEANLM, B_LCATTEMPT,
++  B_ADDLCFRAME, B_SETPOSE, B_SETSB, B_SETEXTR, B_CLEAR, B_DETRADIUS, B_FINALBA,
++  B_ML = 160, B_RESULT = 0x100
++};
++inline void bWrite(uint32_t tag, const Buf& b) {
++  okvis_port_solve::Buf w; w.raw(b.b.data(), b.b.size());
++  okvis_port_solve::plog.write(tag, w);
++}
++inline void mlWrite(uint64_t frame, uint32_t cam, uint32_t kp, uint64_t id) {
++  if (!on()) return;
++  Buf b; b.u64(frame); b.u32(cam); b.u32(kp); b.u64(id);
++  bWrite(B_ML, b);
++}
++struct MlInstall { MlInstall() { okvis_portk::mlHook() = &mlWrite; } };
++static MlInstall mlInstall;
++
++/// RAII: `args` is written when the object is created (call enter() after filling it), `res` when it goes out of scope.
++class BRec {
++ public:
++  explicit BRec(uint32_t tag) : tag_(tag), on_(on()) {}
++  bool live() const { return on_; }
++  void enter() { if (on_) bWrite(tag_, a); }
++  ~BRec() { if (on_ && hasRes) bWrite(tag_ | B_RESULT, r); }
++  Buf a, r;
++  bool hasRes = false;
++ private:
++  uint32_t tag_;
++  bool on_;
++};
++
+ }  // namespace okvis_portv
+ #endif
+diff -ruN a/okvis_ceres/include/okvis/ViSlamBackend.hpp b/okvis_ceres/include/okvis/ViSlamBackend.hpp
+--- a/okvis_ceres/include/okvis/ViSlamBackend.hpp	2026-10-01 18:15:19.367859347 +0200
++++ b/okvis_ceres/include/okvis/ViSlamBackend.hpp	2026-10-04 20:21:43.426060635 +0200
+@@ -175,6 +175,9 @@
+   bool addObservation(LandmarkId landmarkId, StateId stateId,
+                       size_t camIdx, size_t keypointIdx, bool useCauchy = true) {
+     KeypointIdentifier kid{stateId.value(), camIdx, keypointIdx};
++    { okvis_portv::BRec portBr(okvis_portv::B_ADDOBS);  // okvis_port (patch 0011)
++      if (portBr.live()) { portBr.a.u64(landmarkId.value()); portBr.a.u64(stateId.value()); portBr.a.u32(uint32_t(camIdx));
++        portBr.a.u32(uint32_t(keypointIdx)); portBr.a.u32(useCauchy ? 1u : 0u); portBr.enter(); } }
+     OKVIS_ASSERT_TRUE_DBG(Exception, multiFrames_.count(stateId), "frame does noe exist")
+ 
+     MultiFramePtr multiFrame = multiFrames_.at(stateId);
+diff -ruN a/okvis_ceres/src/ViSlamBackend.cpp b/okvis_ceres/src/ViSlamBackend.cpp
+--- a/okvis_ceres/src/ViSlamBackend.cpp	2026-10-04 18:49:42.008552357 +0200
++++ b/okvis_ceres/src/ViSlamBackend.cpp	2026-10-04 20:34:58.999475511 +0200
+@@ -49,6 +49,11 @@
+ #include <okvis/PseudoInverse.hpp>
+ #include <okvis/Component.hpp>
+ #include <okvis/timing/Timer.hpp>
++#include <okvis/ceres/OkvisPortVigraphLog.hpp>  // okvis_port (patch 0011)
++#include <okvis/cameras/PinholeCamera.hpp>
++#include <okvis/cameras/RadialTangentialDistortion.hpp>
++#include <okvis/cameras/EquidistantDistortion.hpp>
++#include <okvis/cameras/NoDistortion.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -57,14 +62,60 @@
+ static int numRealtimePoseGraphFrames = 12;
+ static const int numPoseGraphFrames = 12;
+ 
++// okvis_port (patch 0011): serialisation helpers of the backend entry records
++namespace {
++inline void portPutSet(okvis_portv::Buf& b, const std::set<okvis::StateId>& s) {
++  b.u32(uint32_t(s.size()));
++  for (const auto& id : s) b.u64(id.value());
++}
++inline void portPutCamHeader(okvis_portv::Buf& b, const okvis::cameras::CameraBase* g) {
++  using namespace okvis::cameras;
++  if (auto p = dynamic_cast<const PinholeCamera<RadialTangentialDistortion>*>(g)) { p->portHeader(b); return; }
++  if (auto p = dynamic_cast<const PinholeCamera<EquidistantDistortion>*>(g)) { p->portHeader(b); return; }
++  if (auto p = dynamic_cast<const PinholeCamera<NoDistortion>*>(g)) { p->portHeader(b); return; }
++  b.u32(99u);  // unsupported geometry
++}
++inline void portPutMultiFrame(okvis_portv::Buf& b, const okvis::MultiFramePtr& mf) {
++  const size_t nc = mf->numFrames();
++  b.u32(uint32_t(nc));
++  for (size_t i = 0; i < nc; ++i) {
++    okvis_portv::Buf h;
++    portPutCamHeader(h, mf->geometry(i).get());
++    b.u32(uint32_t(h.b.size())); b.raw(h.b.data(), h.b.size());
++    okvis_portv::putT(b, *mf->T_SC(i));
++    b.u32(uint32_t(mf->image(i).rows)); b.u32(uint32_t(mf->image(i).cols));
++    const size_t nk = mf->numKeypoints(i);
++    b.u32(uint32_t(nk));
++    uint32_t nz = 0;
++    cv::KeyPoint kp;
++    for (size_t k = 0; k < nk; ++k) {
++      mf->getCvKeypoint(i, k, kp);
++      const float v[3] = {kp.pt.x, kp.pt.y, kp.size};
++      b.raw(v, 12);
++      if (mf->landmarkId(i, k) != 0) ++nz;
++    }
++    b.u32(nz);
++    for (size_t k = 0; k < nk; ++k) if (mf->landmarkId(i, k) != 0) { b.u32(uint32_t(k)); b.u64(mf->landmarkId(i, k)); }
++  }
++}
++}  // namespace
++
+ int ViSlamBackend::addCamera(const CameraParameters &cameraParameters)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_ADDCAM);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u32(cameraParameters.online_calibration.do_extrinsics ? 1u : 0u);
++      br.a.f64(cameraParameters.online_calibration.sigma_r); br.a.f64(cameraParameters.online_calibration.sigma_alpha); br.enter(); } }
+   fullGraph_.addCamera(cameraParameters);
+   return realtimeGraph_.addCamera(cameraParameters);
+ }
+ 
+ int ViSlamBackend::addImu(const ImuParameters &imuParameters)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_ADDIMU);  // okvis_port (patch 0011)
++    if (br.live()) { auto& a = br.a; a.u32(imuParameters.use ? 1u : 0u); okvis_portv::putT(a, imuParameters.T_BS);
++      a.f64(imuParameters.a_max); a.f64(imuParameters.g_max); a.f64(imuParameters.sigma_g_c); a.f64(imuParameters.sigma_bg);
++      a.f64(imuParameters.sigma_a_c); a.f64(imuParameters.sigma_ba); a.f64(imuParameters.sigma_gw_c); a.f64(imuParameters.sigma_aw_c);
++      a.f64n(imuParameters.g0.data(), 3); a.f64n(imuParameters.a0.data(), 3); a.f64(imuParameters.g); br.enter(); } }
+   fullGraph_.addImu(imuParameters);
+   return realtimeGraph_.addImu(imuParameters);
+ }
+@@ -72,6 +123,9 @@
+ bool ViSlamBackend::addStates(MultiFramePtr multiFrame, const ImuMeasurementDeque &imuMeasurements,
+                               bool asKeyframe)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_ADDSTATES);  // okvis_port (patch 0011)
++    if (br.live()) { okvis_portv::putTime(br.a, multiFrame->timestamp()); okvis_portv::putMeas(br.a, imuMeasurements);
++      br.a.u32(asKeyframe ? 1u : 0u); br.a.f64(kptradius_); portPutMultiFrame(br.a, multiFrame); br.enter(); } }
+   AuxiliaryState auxiliaryState;
+   auxiliaryState.isImuFrame = true;
+   auxiliaryState.isKeyframe = asKeyframe;
+@@ -197,6 +251,8 @@
+ }
+ 
+ bool ViSlamBackend::setKeyframe(StateId id, bool isKeyframe) {
++  { okvis_portv::BRec br(okvis_portv::B_SETKF);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(id.value()); br.a.u32(isKeyframe ? 1u : 0u); br.enter(); } }
+   auxiliaryStates_.at(id).isKeyframe = isKeyframe;
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedStates_.insert(id);
+@@ -209,6 +265,8 @@
+ bool ViSlamBackend::addLandmark(LandmarkId landmarkId, const Eigen::Vector4d &landmark,
+                                 bool isInitialised)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_ADDLM_ID);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(landmarkId.value()); br.a.f64n(landmark.data(), 4); br.a.u32(isInitialised ? 1u : 0u); br.enter(); } }
+   bool success = realtimeGraph_.addLandmark(landmarkId, landmark, isInitialised);
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(landmarkId);
+@@ -220,6 +278,8 @@
+ 
+ LandmarkId ViSlamBackend::addLandmark(const Eigen::Vector4d &homogeneousPoint, bool initialised)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_ADDLM_NEW);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.f64n(homogeneousPoint.data(), 4); br.a.u32(initialised ? 1u : 0u); br.enter(); } }
+   const LandmarkId lmId = realtimeGraph_.addLandmark(homogeneousPoint, initialised);
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(lmId);
+@@ -231,6 +291,8 @@
+ 
+ bool ViSlamBackend::setLandmark(LandmarkId landmarkId, const Eigen::Vector4d & landmark,
+                                 bool isInitialised) {
++  { okvis_portv::BRec br(okvis_portv::B_SETLM);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(landmarkId.value()); br.a.f64n(landmark.data(), 4); br.a.u32(isInitialised ? 1u : 0u); br.enter(); } }
+   bool success = realtimeGraph_.setLandmark(landmarkId, landmark, isInitialised);
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(landmarkId);
+@@ -240,6 +302,8 @@
+   return success;
+ }
+ bool ViSlamBackend::setLandmarkClassification(LandmarkId landmarkId, int classification) {
++  { okvis_portv::BRec br(okvis_portv::B_SETCLASS);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(landmarkId.value()); br.a.u32(uint32_t(classification)); br.enter(); } }
+   if(realtimeGraph_.landmarks_.count(landmarkId)==0) {
+     return false;
+   }
+@@ -258,6 +322,9 @@
+ 
+ bool ViSlamBackend::setObservationInformation(
+     StateId stateId, size_t camIdx, size_t keypointIdx, const Eigen::Matrix2d & information) {
++  { okvis_portv::BRec br(okvis_portv::B_SETOBSINFO);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(stateId.value()); br.a.u32(uint32_t(camIdx)); br.a.u32(uint32_t(keypointIdx));
++      br.a.f64n(information.data(), 4); br.enter(); } }
+   KeypointIdentifier kid(stateId.value(), camIdx, keypointIdx);
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(realtimeGraph_.observations_.at(kid).landmarkId);
+@@ -276,6 +343,8 @@
+ bool ViSlamBackend::removeObservation(StateId stateId, size_t camIdx,
+                                       size_t keypointIdx)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_RMOBS);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(stateId.value()); br.a.u32(uint32_t(camIdx)); br.a.u32(uint32_t(keypointIdx)); br.enter(); } }
+   KeypointIdentifier kid(stateId.value(), camIdx, keypointIdx);
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+     touchedLandmarks_.insert(realtimeGraph_.observations_.at(kid).landmarkId);
+@@ -463,6 +532,11 @@
+                                   std::set<StateId> &affectedFrames,
+                                   bool expand)
+ {
++  okvis_portv::BRec portBr(okvis_portv::B_APPLYSTRATEGY);  // okvis_port (patch 0011)
++  if (portBr.live()) { portBr.a.u64(numKeyframes); portBr.a.u64(numLoopClosureFrames); portBr.a.u64(numImuFrames);
++    portBr.a.u32(expand ? 1u : 0u); portBr.enter(); }
++  struct PortAff { okvis_portv::BRec& br; std::set<StateId>& s;
++    ~PortAff() { if (br.live()) { portPutSet(br.r, s); br.hasRes = true; } } } portAff{portBr, affectedFrames};
+   // check/handle lost
+   TimerSwitchable t1("7.1 check/handle lost");
+   if(imuFrames_.size()>1 && !keyFrames_.empty()) {
+@@ -724,6 +798,11 @@
+   int numIter, std::vector<StateId> & updatedStates, int numThreads, bool verbose,
+   bool onlyNewestState, bool isInitialised)
+ {
++  okvis_portv::BRec portBr(okvis_portv::B_OPTRT);  // okvis_port (patch 0011)
++  if (portBr.live()) { portBr.a.u32(uint32_t(numIter)); portBr.a.u32(uint32_t(numThreads)); portBr.a.u32(verbose ? 1u : 0u);
++    portBr.a.u32(onlyNewestState ? 1u : 0u); portBr.a.u32(isInitialised ? 1u : 0u); portBr.enter(); }
++  struct PortUpd { okvis_portv::BRec& br; std::vector<StateId>& v;
++    ~PortUpd() { if (br.live()) { br.r.u32(uint32_t(v.size())); for (const auto& id : v) br.r.u64(id.value()); br.hasRes = true; } } } portUpd{portBr, updatedStates};
+ 
+   //OKVIS_ASSERT_TRUE(Exception, areLandmarksInFrontOfCameras(), "before optimisation")
+ 
+@@ -929,6 +1008,8 @@
+ 
+ bool ViSlamBackend::setPose(StateId id, const kinematics::TransformationCacheless &pose)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_SETPOSE);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(id.value()); okvis_portv::putTC(br.a, pose); br.enter(); } }
+   bool success = realtimeGraph_.setPose(id, pose);
+   // also manage the full graph, if possible
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+@@ -941,6 +1022,8 @@
+ 
+ bool ViSlamBackend::setSpeedAndBias(StateId id, const SpeedAndBias &speedAndBias)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_SETSB);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(id.value()); br.a.f64n(speedAndBias.data(), 9); br.enter(); } }
+   bool success = realtimeGraph_.setSpeedAndBias(id, speedAndBias);
+   // also manage the full graph, if possible
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+@@ -954,6 +1037,8 @@
+ bool ViSlamBackend::setExtrinsics(StateId id, uchar camIdx,
+                                   const kinematics::TransformationCacheless & extrinsics)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_SETEXTR);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(id.value()); br.a.u32(uint32_t(camIdx)); okvis_portv::putTC(br.a, extrinsics); br.enter(); } }
+   bool success = realtimeGraph_.setExtrinsics(id, camIdx, extrinsics);
+   // also manage the full graph, if possible
+   if(isLoopClosing_ || isLoopClosureAvailable_) {
+@@ -1310,6 +1395,10 @@
+                                         std::set<LandmarkId> & loopClosureLandmarks,
+                                         bool skipFullGraphOptimisation)
+ {
++  okvis_portv::BRec portBr(okvis_portv::B_ADDLCFRAME);  // okvis_port (patch 0011)
++  if (portBr.live()) { portBr.a.u64(loopClosureFrameId.value()); portBr.a.u32(skipFullGraphOptimisation ? 1u : 0u); portBr.enter(); }
++  struct PortLm { okvis_portv::BRec& br; std::set<LandmarkId>& s;
++    ~PortLm() { if (br.live()) { br.r.u32(uint32_t(s.size())); for (const auto& id : s) br.r.u64(id.value()); br.hasRes = true; } } } portLm{portBr, loopClosureLandmarks};
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_,
+                     "trying to add loop closure while loop closing")
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosureAvailable_,
+@@ -1435,6 +1524,10 @@
+ 
+ bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &updatedStates)
+ {
++  okvis_portv::BRec portBr(okvis_portv::B_SYNC);  // okvis_port (patch 0011)
++  portBr.enter();
++  struct PortUpd { okvis_portv::BRec& br; std::vector<StateId>& v;
++    ~PortUpd() { if (br.live()) { br.r.u32(uint32_t(v.size())); for (const auto& id : v) br.r.u64(id.value()); br.hasRes = true; } } } portUpd{portBr, updatedStates};
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "cannot synchronise while loop-closing")
+ 
+   // first, we move the loop-closure frames into the set of regular keyframes...
+@@ -1676,6 +1769,8 @@
+ }
+ 
+ int ViSlamBackend::cleanUnobservedLandmarks() {
++  okvis_portv::BRec portBr(okvis_portv::B_CLEANLM);  // okvis_port (patch 0011)
++  portBr.enter();
+   // check consistency -- currently disabled
+   //if (!isLoopClosing_ && !isLoopClosureAvailable_) {
+   //  OKVIS_ASSERT_TRUE(Exception,
+@@ -1700,10 +1795,12 @@
+         touchedStates_.insert(StateId(obs.frameId));
+       }
+     }
++    portBr.r.u32(uint32_t(removed1)); portBr.hasRes = true;  // okvis_port (patch 0011)
+     return removed1; /// \todo This can be done with some refactoring
+   } else {
+     int removed0 = fullGraph_.cleanUnobservedLandmarks();
+     OKVIS_ASSERT_TRUE(Exception, removed0 == removed1, "landmarks cleaned inconsistent!")
++    portBr.r.u32(uint32_t(removed1)); portBr.hasRes = true;  // okvis_port (patch 0011)
+     return removed1;
+   }
+ 
+@@ -1711,6 +1808,8 @@
+ 
+ bool ViSlamBackend::mergeLandmark(const LandmarkId &fromId, const LandmarkId &intoId)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_MERGELM);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u64(fromId.value()); br.a.u64(intoId.value()); br.enter(); } }
+   bool success = (realtimeGraph_.mergeLandmark(fromId, intoId, multiFrames_));
+   // also reset associated keypoints
+   auto observations = realtimeGraph_.landmarks_.at(intoId).observations;
+@@ -1737,6 +1836,9 @@
+ 
+ int ViSlamBackend::mergeLandmarks(std::vector<LandmarkId> fromIds, std::vector<LandmarkId> intoIds)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_MERGELMS);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u32(uint32_t(fromIds.size())); for (const auto& i : fromIds) br.a.u64(i.value());
++      br.a.u32(uint32_t(intoIds.size())); for (const auto& i : intoIds) br.a.u64(i.value()); br.enter(); } }
+   OKVIS_ASSERT_TRUE_DBG(Exception, fromIds.size() == intoIds.size(), "vectors must be same lengths")
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "loop closure not finished, cannot merge landmarks")
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosureAvailable_,
+@@ -1779,6 +1881,8 @@
+ void ViSlamBackend::optimiseFullGraph(int numIter, ::ceres::Solver::Summary &summary,
+                                       int numThreads, bool verbose)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_OPTFULL);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u32(uint32_t(numIter)); br.a.u32(uint32_t(numThreads)); br.a.u32(verbose ? 1u : 0u); br.enter(); } }
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "can't optimise posegraph; already loop-closing")
+   needsFullGraphOptimisation_ = false;
+   isLoopClosing_ = true;
+@@ -1814,6 +1918,8 @@
+     std::set<StateId> & updatedStatesBa, double extrinsicsPositionUncertainty,
+     double extrinsicsOrientationUncertainty, int numThreads, bool verbose)
+ {
++  { okvis_portv::BRec br(okvis_portv::B_FINALBA);  // okvis_port (patch 0011)
++    if (br.live()) { br.a.u32(uint32_t(numIter)); br.a.f64(extrinsicsPositionUncertainty); br.a.f64(extrinsicsOrientationUncertainty); br.enter(); } }
+   // convert all posegraph edges
+   int i=0;
+   for(const auto & state : fullGraph_.states_) {
+@@ -2089,6 +2195,11 @@
+                                        bool & skipFullGraphOptimisation,
+                                        double driftPercentageHeuristic)
+ {
++  okvis_portv::BRec portBr(okvis_portv::B_LCATTEMPT);  // okvis_port (patch 0011)
++  if (portBr.live()) { portBr.a.u64(pose_i.value()); portBr.a.u64(pose_j.value()); okvis_portv::putT(portBr.a, T_Si_Sj);
++    portBr.a.f64n(information.data(), 36); portBr.a.f64(driftPercentageHeuristic); portBr.enter(); }
++  struct PortLc { okvis_portv::BRec& br; bool& skip; bool ret;
++    ~PortLc() { if (br.live()) { br.r.u32(ret ? 1u : 0u); br.r.u32(skip ? 1u : 0u); br.hasRes = true; } } } portLc{portBr, skipFullGraphOptimisation, false};
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "Loop closure still running")
+   OKVIS_ASSERT_TRUE(Exception, !isLoopClosureAvailable_,
+                     "loop closure not finished, cannot merge landmarks")
+@@ -2269,6 +2380,7 @@
+   auxiliaryStates_.at(pose_j).closedLoop = true;
+ 
+   fullGraphRelativePoseConstraints_.push_back(RelPoseInfo{T_Si_Sj, information, pose_i, pose_j});
++  portLc.ret = true;  // okvis_port (patch 0011)
+ 
+   //const kinematics::Transformation T_SiSj_estimated = (pose(pose_i).inverse() * pose(pose_j));
+   //OKVIS_ASSERT_TRUE(Exception,
+@@ -2379,6 +2491,7 @@
+ 
+ void ViSlamBackend::clear()
+ {
++  { okvis_portv::BRec br(okvis_portv::B_CLEAR); br.enter(); }  // okvis_port (patch 0011)
+   // clear underlying graphs
+   realtimeGraph_.clear();
+   fullGraph_.clear();
+diff -ruN a/okvis_cv/include/okvis/implementation/MultiFrame.hpp b/okvis_cv/include/okvis/implementation/MultiFrame.hpp
+--- a/okvis_cv/include/okvis/implementation/MultiFrame.hpp	2026-10-01 18:15:19.379859226 +0200
++++ b/okvis_cv/include/okvis/implementation/MultiFrame.hpp	2026-10-04 20:20:32.205924008 +0200
+@@ -278,6 +278,7 @@
+                                uint64_t landmarkId)
+ {
+   OKVIS_ASSERT_TRUE_DBG(Exception, cameraIdx < frames_.size(), "Out of range")
++  if (okvis_portk::mlHook()) okvis_portk::mlHook()(id_, uint32_t(cameraIdx), uint32_t(keypointIdx), landmarkId);  // okvis_port (patch 0011)
+   return frames_[cameraIdx].setLandmarkId(keypointIdx, landmarkId);
+ }
+ 
+diff -ruN a/okvis_cv/include/okvis/MultiFrame.hpp b/okvis_cv/include/okvis/MultiFrame.hpp
+--- a/okvis_cv/include/okvis/MultiFrame.hpp	2026-10-01 18:15:19.377859246 +0200
++++ b/okvis_cv/include/okvis/MultiFrame.hpp	2026-10-04 20:20:45.157766895 +0200
+@@ -43,6 +43,7 @@
+ #include <memory>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/Frame.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port (patch 0011)
+ #include <okvis/cameras/NCameraSystem.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+diff -ruN a/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp b/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp
+--- a/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp	2026-10-03 00:26:05.494063156 +0200
++++ b/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp	2026-10-04 20:20:32.204924020 +0200
+@@ -39,6 +39,10 @@
+   NUM_KINDS
+ };
+ 
++/// okvis_port (patch 0011): hook called by MultiFrame::setLandmarkId (installed by okvis_ceres' backend log)
++using MlHook = void (*)(uint64_t frame, uint32_t cam, uint32_t kp, uint64_t id);
++inline MlHook& mlHook() { static MlHook h = nullptr; return h; }
++
+ struct Buf {
+   std::vector<char> b;
+   void raw(const void* p, size_t n) { const char* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }

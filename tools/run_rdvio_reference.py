@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--sensor", default=str(REPO / "rdvio_port/reference/configs/euroc_sensor.yaml"))
     ap.add_argument("--setting", default=str(REPO / "rdvio_port/reference/configs/setting.yaml"))
     ap.add_argument("--max-seconds", default=None)
-    ap.add_argument("--dump", action="store_true", help="set RDVIO_PORT_DUMP_DIR (needs patch 0004 in the build)")
+    ap.add_argument("--dump", action="store_true", help="set RDVIO_PORT_DUMP_DIR (needs patches 0003-0005 in the build)")
     ap.add_argument("--dump-every", default=None, help="RDVIO_PORT_DUMP_EVERY, e.g. 'eval=200'")
     ap.add_argument("--stock-binary", default=None, help="run another driver binary (e.g. the stock build) with the same arguments")
     a = ap.parse_args()

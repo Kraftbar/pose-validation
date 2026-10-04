@@ -1,0 +1,486 @@
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/reprojection_factor.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/reprojection_factor.h
+@@ -6,6 +6,7 @@
+ #include <rdvio/geometry/lie_algebra.h>
+ #include <rdvio/geometry/stereo.h>
+ #include <rdvio/map/track.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -23,6 +24,38 @@
+ 
+     bool Evaluate(const double *const *parameters, double *residuals,
+                   double **jacobians) const override {
++        portdump::Chan *pc = portdump::want(4);
++        if (pc) {
++            uint32_t mask = 0;
++            if (jacobians)
++                for (int k = 0; k < 5; ++k)
++                    if (jacobians[k]) mask |= 1u << k;
++            portdump::u32(pc, jacobians ? 1u : 0u);
++            portdump::u32(pc, mask);
++            portdump::u32(pc, portdump::via_prior ? 1u : 0u);
++            portdump::f64(pc, parameters[0], 4); portdump::f64(pc, parameters[1], 3);
++            portdump::f64(pc, parameters[2], 4); portdump::f64(pc, parameters[3], 3);
++            portdump::f64(pc, parameters[4], 1);
++            const auto &[fr, kir] = track->first_keypoint();
++            portdump::f64(pc, frame->get_keypoint(keypoint_index).data(), 3);
++            portdump::f64(pc, fr->get_keypoint(kir).data(), 3);
++            portdump::f64(pc, fr->camera.q_cs.coeffs().data(), 4); portdump::f64(pc, fr->camera.p_cs.data(), 3);
++            portdump::f64(pc, frame->camera.q_cs.coeffs().data(), 4); portdump::f64(pc, frame->camera.p_cs.data(), 3);
++            portdump::f64(pc, frame->sqrt_inv_cov.data(), 4);
++        }
++        bool ret = evaluate_impl(parameters, residuals, jacobians);
++        if (pc) {
++            static const int SZ[5] = {4, 3, 4, 3, 1};
++            portdump::f64(pc, residuals, 2);
++            if (jacobians)
++                for (int k = 0; k < 5; ++k)
++                    if (jacobians[k]) portdump::f64(pc, jacobians[k], 2 * SZ[k]);
++        }
++        return ret;
++    }
++
++    bool evaluate_impl(const double *const *parameters, double *residuals,
++                       double **jacobians) const {
+         const_map<quaternion> q_tgt_center(parameters[0]);
+         const_map<vector<3>> p_tgt_center(parameters[1]);
+         const_map<quaternion> q_ref_center(parameters[2]);
+@@ -109,13 +142,17 @@
+             rpefactor.track->first_frame()->pose.q.coeffs().data(),
+             rpefactor.track->first_frame()->pose.p.data(),
+             &(rpefactor.track->landmark.inv_depth)};
++        portdump::via_prior = true;
++        bool ret;
+         if (jacobians) {
+             std::array<double *, 5> jacobs = {jacobians[0], jacobians[1],
+                                               nullptr, nullptr, nullptr};
+-            return rpefactor.Evaluate(params.data(), residuals, jacobs.data());
++            ret = rpefactor.Evaluate(params.data(), residuals, jacobs.data());
+         } else {
+-            return rpefactor.Evaluate(params.data(), residuals, nullptr);
++            ret = rpefactor.Evaluate(params.data(), residuals, nullptr);
+         }
++        portdump::via_prior = false;
++        return ret;
+     }
+ 
+     CeresReprojectionErrorFactor rpefactor;
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/rotation_factor.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/rotation_factor.h
+@@ -5,6 +5,7 @@
+ #include <rdvio/geometry/lie_algebra.h>
+ #include <rdvio/map/frame.h>
+ #include <rdvio/map/track.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -21,6 +22,29 @@
+ 
+     bool Evaluate(const double *const *parameters, double *residuals,
+                   double **jacobians) const override {
++        portdump::Chan *pc = portdump::want(5);
++        if (pc) {
++            const auto &[fr, kir] = track->first_keypoint();
++            bool has_jac = jacobians && jacobians[0];
++            portdump::u32(pc, has_jac ? 1u : 0u);
++            portdump::f64(pc, parameters[0], 4);
++            portdump::f64(pc, fr->pose.q.coeffs().data(), 4);
++            portdump::f64(pc, frame->get_keypoint(keypoint_index).data(), 3);
++            portdump::f64(pc, fr->get_keypoint(kir).data(), 3);
++            portdump::f64(pc, fr->camera.q_cs.coeffs().data(), 4); portdump::f64(pc, fr->camera.p_cs.data(), 3);
++            portdump::f64(pc, frame->camera.q_cs.coeffs().data(), 4); portdump::f64(pc, frame->camera.p_cs.data(), 3);
++            portdump::f64(pc, frame->sqrt_inv_cov.data(), 4);
++        }
++        bool ret = evaluate_impl(parameters, residuals, jacobians);
++        if (pc) {
++            portdump::f64(pc, residuals, 2);
++            if (jacobians && jacobians[0]) portdump::f64(pc, jacobians[0], 8);
++        }
++        return ret;
++    }
++
++    bool evaluate_impl(const double *const *parameters, double *residuals,
++                       double **jacobians) const {
+         const_map<quaternion> q_tgt_center(parameters[0]);
+         map<vector<2>> r(residuals);
+ 
+--- a/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
++++ b/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
+@@ -1,12 +1,14 @@
+ #pragma once
+ // rdvio_port instrumentation (reference build only, never distributed): binary record dumps used by rdvio_port/c/check_rd_*.c.
+-// Enabled by RDVIO_PORT_DUMP_DIR; sampling by RDVIO_PORT_DUMP_EVERY="integ=1,pred=1,pie=20,plus=50" (0 = count only).
++// Enabled by RDVIO_PORT_DUMP_DIR; sampling by RDVIO_PORT_DUMP_EVERY="integ=1,pred=1,pie=20,plus=50,rpe=100,..." (0 = count only).
++// Channels: M1 integ pred pie plus; M2 rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp (layouts in rdvio_port/c/rd_factor.h, rd_geom.h).
+ // Pure observation: reads state, never modifies it.
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <Eigen/Eigen>
+ namespace rdvio {
+ namespace portdump {
+ struct Chan {
+@@ -15,7 +17,10 @@
+     const char *name;
+ };
+ inline Chan &chan(int k) {
+-    static Chan ch[4] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"}};
++    static Chan ch[17] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"},
++                          {nullptr, 0, 100, "rpe"}, {nullptr, 0, 10, "rot"}, {nullptr, 0, 50, "wahba"}, {nullptr, 0, 100, "ess5"},
++                          {nullptr, 0, 1, "hom4"}, {nullptr, 0, 1, "decess"}, {nullptr, 0, 1, "dechom"}, {nullptr, 0, 1, "tri2"},
++                          {nullptr, 0, 1, "trin"}, {nullptr, 0, 1, "trk"}, {nullptr, 0, 5, "tang"}, {nullptr, 0, 50, "glp"}, {nullptr, 0, 5, "slp"}};
+     static bool init = false;
+     if (!init) {
+         init = true;
+@@ -46,12 +51,15 @@
+ inline void f64(Chan *c, const double *p, size_t n) { std::fwrite(p, 8, n, c->f); }
+ inline void f64(Chan *c, double v) { std::fwrite(&v, 8, 1, c->f); }
+ inline void flush_all() {
+-    for (int k = 0; k < 4; ++k)
++    for (int k = 0; k < 17; ++k)
+         if (chan(k).f) std::fflush(chan(k).f);
+ }
+ struct Flusher {
+     ~Flusher() { flush_all(); }
+ };
+ inline thread_local bool via_prior = false;
++inline void obs(Chan *c, const Eigen::Quaterniond &pq, const Eigen::Vector3d &pp, const Eigen::Quaterniond &cq, const Eigen::Vector3d &cp, const Eigen::Vector3d &kp) {
++    f64(c, pq.coeffs().data(), 4); f64(c, pp.data(), 3); f64(c, cq.coeffs().data(), 4); f64(c, cp.data(), 3); f64(c, kp.data(), 3);
++}
+ } // namespace portdump
+ } // namespace rdvio
+--- a/src/rdvio_geometry/include/rdvio/geometry/stereo.h
++++ b/src/rdvio_geometry/include/rdvio/geometry/stereo.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <rdvio/types.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -68,10 +69,10 @@
+                                         size_t max_iteration = 1000,
+                                         int seed = 0);
+ 
+-inline vector<4> triangulate_point(const matrix<3, 4> &P1,
+-                                   const matrix<3, 4> &P2,
+-                                   const vector<3> &point1,
+-                                   const vector<3> &point2) {
++inline vector<4> triangulate_point_impl(const matrix<3, 4> &P1,
++                                        const matrix<3, 4> &P2,
++                                        const vector<3> &point1,
++                                        const vector<3> &point2) {
+     matrix<4> A;
+     A.row(0) = point1(0) * P1.row(2) - point1(2) * P1.row(0);
+     A.row(1) = point1(1) * P1.row(2) - point1(2) * P1.row(1);
+@@ -80,8 +81,8 @@
+     return A.jacobiSvd(Eigen::ComputeFullV).matrixV().col(3);
+ }
+ 
+-inline vector<4> triangulate_point(const std::vector<matrix<3, 4>> &Ps,
+-                                   const std::vector<vector<3>> &points) {
++inline vector<4> triangulate_point_impl(const std::vector<matrix<3, 4>> &Ps,
++                                        const std::vector<vector<3>> &points) {
+     matrix<Eigen::Dynamic, 4> A(points.size() * 2, 4);
+     for (size_t i = 0; i < points.size(); ++i) {
+         A.row(i * 2 + 0) =
+@@ -92,4 +93,31 @@
+     return A.jacobiSvd(Eigen::ComputeFullV).matrixV().col(3);
+ }
+ 
++inline vector<4> triangulate_point(const matrix<3, 4> &P1,
++                                   const matrix<3, 4> &P2,
++                                   const vector<3> &point1,
++                                   const vector<3> &point2) {
++    portdump::Chan *pc = portdump::want(11);
++    vector<4> r = triangulate_point_impl(P1, P2, point1, point2);
++    if (pc) {
++        portdump::f64(pc, P1.data(), 12); portdump::f64(pc, P2.data(), 12);
++        portdump::f64(pc, point1.data(), 3); portdump::f64(pc, point2.data(), 3);
++        portdump::f64(pc, r.data(), 4);
++    }
++    return r;
++}
++
++inline vector<4> triangulate_point(const std::vector<matrix<3, 4>> &Ps,
++                                   const std::vector<vector<3>> &points) {
++    portdump::Chan *pc = portdump::want(12);
++    vector<4> r = triangulate_point_impl(Ps, points);
++    if (pc) {
++        portdump::u32(pc, (uint32_t)points.size());
++        for (const auto &P : Ps) portdump::f64(pc, P.data(), 12);
++        for (const auto &p : points) portdump::f64(pc, p.data(), 3);
++        portdump::f64(pc, r.data(), 4);
++    }
++    return r;
++}
++
+ } // namespace rdvio
+--- a/src/rdvio_geometry/include/rdvio/geometry/wahba.h
++++ b/src/rdvio_geometry/include/rdvio/geometry/wahba.h
+@@ -1,12 +1,13 @@
+ #pragma once
+ 
+ #include <rdvio/types.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+ // h(p2) = R * h(p1)
+-inline matrix<3> solve_rotation_2pt(const std::array<vector<3>, 2> &points1,
+-                                    const std::array<vector<3>, 2> &points2) {
++inline matrix<3> solve_rotation_2pt_impl(const std::array<vector<3>, 2> &points1,
++                                         const std::array<vector<3>, 2> &points2) {
+     matrix<3> cov = matrix<3>::Zero();
+     for (size_t i = 0; i < points1.size(); ++i) {
+         cov += points1[i] * points2[i].transpose();
+@@ -25,5 +26,17 @@
+     return V * E * U.transpose();
+ }
+ 
++inline matrix<3> solve_rotation_2pt(const std::array<vector<3>, 2> &points1,
++                                    const std::array<vector<3>, 2> &points2) {
++    portdump::Chan *pc = portdump::want(6);
++    matrix<3> R = solve_rotation_2pt_impl(points1, points2);
++    if (pc) {
++        for (int i = 0; i < 2; ++i) portdump::f64(pc, points1[i].data(), 3);
++        for (int i = 0; i < 2; ++i) portdump::f64(pc, points2[i].data(), 3);
++        portdump::f64(pc, R.data(), 9);
++    }
++    return R;
++}
++
+ } // namespace rdvio
+ 
+--- a/src/rdvio_geometry/src/essential.cpp
++++ b/src/rdvio_geometry/src/essential.cpp
+@@ -1,4 +1,5 @@
+ #include <rdvio/geometry/essential.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ /* #define DECOMPOSE_ESSENTIAL_HORN 1 */
+ 
+@@ -219,7 +220,7 @@
+ 
+ } // namespace
+ 
+-void decompose_essential(const matrix<3> &E, matrix<3> &R1, matrix<3> &R2,
++static void decompose_essential_impl(const matrix<3> &E, matrix<3> &R1, matrix<3> &R2,
+                          vector<3> &T) {
+ #ifdef DECOMPOSE_ESSENTIAL_HORN
+     matrix<3> EET = E * E.transpose();
+@@ -282,9 +283,19 @@
+ #endif
+ }
+ 
+-std::vector<matrix<3>>
+-solve_essential_5pt(const std::array<vector<2>, 5> &points1,
+-                    const std::array<vector<2>, 5> &points2) {
++void decompose_essential(const matrix<3> &E, matrix<3> &R1, matrix<3> &R2,
++                         vector<3> &T) {
++    portdump::Chan *pc = portdump::want(9);
++    decompose_essential_impl(E, R1, R2, T);
++    if (pc) {
++        portdump::f64(pc, E.data(), 9); portdump::f64(pc, R1.data(), 9);
++        portdump::f64(pc, R2.data(), 9); portdump::f64(pc, T.data(), 3);
++    }
++}
++
++static std::vector<matrix<3>>
++solve_essential_5pt_impl(const std::array<vector<2>, 5> &points1,
++                         const std::array<vector<2>, 5> &points2) {
+     matrix<9, 4> basis = generate_nullspace_basis(points1, points2);
+     matrix<10, 20> polynomials = generate_polynomials(basis);
+     matrix<10> action = generate_action_matrix(polynomials);
+@@ -296,4 +307,18 @@
+     return results;
+ }
+ 
++std::vector<matrix<3>>
++solve_essential_5pt(const std::array<vector<2>, 5> &points1,
++                    const std::array<vector<2>, 5> &points2) {
++    portdump::Chan *pc = portdump::want(7);
++    std::vector<matrix<3>> r = solve_essential_5pt_impl(points1, points2);
++    if (pc) {
++        for (int i = 0; i < 5; ++i) portdump::f64(pc, points1[i].data(), 2);
++        for (int i = 0; i < 5; ++i) portdump::f64(pc, points2[i].data(), 2);
++        portdump::u32(pc, (uint32_t)r.size());
++        for (const auto &E : r) portdump::f64(pc, E.data(), 9);
++    }
++    return r;
++}
++
+ } // namespace rdvio
+--- a/src/rdvio_geometry/src/homography.cpp
++++ b/src/rdvio_geometry/src/homography.cpp
+@@ -1,10 +1,11 @@
+ #include <rdvio/geometry/homography.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+-bool decompose_homography(const matrix<3> &H, matrix<3> &R1, matrix<3> &R2,
+-                          vector<3> &T1, vector<3> &T2, vector<3> &n1,
+-                          vector<3> &n2) {
++static bool decompose_homography_impl(const matrix<3> &H, matrix<3> &R1, matrix<3> &R2,
++                                      vector<3> &T1, vector<3> &T2, vector<3> &n1,
++                                      vector<3> &n2) {
+     matrix<3> Hn = H / H.jacobiSvd().singularValues()(1);
+     matrix<3> S = Hn.transpose() * Hn - matrix<3>::Identity();
+ 
+@@ -115,8 +116,8 @@
+ 
+ } // namespace
+ 
+-matrix<3> solve_homography_4pt(const std::array<vector<2>, 4> &points1,
+-                               const std::array<vector<2>, 4> &points2) {
++static matrix<3> solve_homography_4pt_impl(const std::array<vector<2>, 4> &points1,
++                                           const std::array<vector<2>, 4> &points2) {
+     static const double sqrt2 = sqrt(2.0);
+ 
+     vector<2> pa_mean = vector<2>::Zero();
+@@ -155,4 +156,31 @@
+     return Nb * NH * Na;
+ }
+ 
++bool decompose_homography(const matrix<3> &H, matrix<3> &R1, matrix<3> &R2,
++                          vector<3> &T1, vector<3> &T2, vector<3> &n1,
++                          vector<3> &n2) {
++    portdump::Chan *pc = portdump::want(10);
++    bool ret = decompose_homography_impl(H, R1, R2, T1, T2, n1, n2);
++    if (pc) {
++        portdump::f64(pc, H.data(), 9);
++        portdump::u32(pc, ret ? 1u : 0u);
++        portdump::f64(pc, R1.data(), 9); portdump::f64(pc, R2.data(), 9);
++        portdump::f64(pc, T1.data(), 3); portdump::f64(pc, T2.data(), 3);
++        portdump::f64(pc, n1.data(), 3); portdump::f64(pc, n2.data(), 3);
++    }
++    return ret;
++}
++
++matrix<3> solve_homography_4pt(const std::array<vector<2>, 4> &points1,
++                               const std::array<vector<2>, 4> &points2) {
++    portdump::Chan *pc = portdump::want(8);
++    matrix<3> H = solve_homography_4pt_impl(points1, points2);
++    if (pc) {
++        for (int i = 0; i < 4; ++i) portdump::f64(pc, points1[i].data(), 2);
++        for (int i = 0; i < 4; ++i) portdump::f64(pc, points2[i].data(), 2);
++        portdump::f64(pc, H.data(), 9);
++    }
++    return H;
++}
++
+ } // namespace rdvio
+--- a/src/rdvio_map/include/rdvio/map/track.h
++++ b/src/rdvio_map/include/rdvio/map/track.h
+@@ -65,10 +65,14 @@
+     void remove_keypoint(Frame *frame, bool suicide_if_empty = true);
+ 
+     std::optional<vector<3>> triangulate();
++    std::optional<vector<3>> triangulate_impl();
+     double triangulation_angle(const vector<3> &p) const;
++    double triangulation_angle_impl(const vector<3> &p) const;
+ 
+     vector<3> get_landmark_point() const;
++    vector<3> get_landmark_point_impl() const;
+     void set_landmark_point(const vector<3> &p);
++    void set_landmark_point_impl(const vector<3> &p);
+ 
+     std::unique_lock<std::mutex> lock() const { return map->lock(); }
+ 
+--- a/src/rdvio_map/src/track.cpp
++++ b/src/rdvio_map/src/track.cpp
+@@ -1,6 +1,7 @@
+ #include <rdvio/estimation/solver.h>
+ #include <rdvio/geometry/stereo.h>
+ #include <rdvio/map/track.h>
++#include <rdvio/estimation/port_dump.h>
+ 
+ namespace rdvio {
+ 
+@@ -43,7 +44,23 @@
+     }
+ }
+ 
++static void dump_obs(portdump::Chan *pc, Frame *frame, size_t keypoint_index) {
++    portdump::obs(pc, frame->pose.q, frame->pose.p, frame->camera.q_cs, frame->camera.p_cs, frame->get_keypoint(keypoint_index));
++}
++
+ std::optional<vector<3>> Track::triangulate() {
++    portdump::Chan *pc = portdump::want(13);
++    std::optional<vector<3>> r = triangulate_impl();
++    if (pc) {
++        portdump::u32(pc, (uint32_t)keypoint_map().size());
++        for (const auto &[frame, keypoint_index] : keypoint_map()) dump_obs(pc, frame, keypoint_index);
++        portdump::u32(pc, r.has_value() ? 1u : 0u);
++        if (r) portdump::f64(pc, r->data(), 3);
++    }
++    return r;
++}
++
++std::optional<vector<3>> Track::triangulate_impl() {
+     std::vector<matrix<3, 4>> Ps;
+     std::vector<vector<3>> ps;
+     for (const auto &[frame, keypoint_index] : keypoint_map()) {
+@@ -76,6 +93,18 @@
+ }
+ 
+ double Track::triangulation_angle(const vector<3> &p) const {
++    portdump::Chan *pc = portdump::want(14);
++    double a = triangulation_angle_impl(p);
++    if (pc) {
++        portdump::u32(pc, (uint32_t)keypoint_map().size());
++        for (const auto &[frame, keypoint_index] : keypoint_map()) dump_obs(pc, frame, keypoint_index);
++        portdump::f64(pc, p.data(), 3);
++        portdump::f64(pc, a);
++    }
++    return a;
++}
++
++double Track::triangulation_angle_impl(const vector<3> &p) const {
+     vector<3> nref = (p - first_frame()->get_pose(first_frame()->camera).p)
+                          .stableNormalized();
+     double max_angle = 0;
+@@ -88,6 +117,18 @@
+ }
+ 
+ vector<3> Track::get_landmark_point() const {
++    portdump::Chan *pc = portdump::want(15);
++    vector<3> r = get_landmark_point_impl();
++    if (pc) {
++        const auto &[frame, keypoint_index] = first_keypoint();
++        dump_obs(pc, frame, keypoint_index);
++        portdump::f64(pc, landmark.inv_depth);
++        portdump::f64(pc, r.data(), 3);
++    }
++    return r;
++}
++
++vector<3> Track::get_landmark_point_impl() const {
+     const auto &[frame, keypoint_index] = first_keypoint();
+     auto camera = frame->get_pose(frame->camera);
+     return camera.q * frame->get_keypoint(keypoint_index) / landmark.inv_depth +
+@@ -95,6 +136,17 @@
+ }
+ 
+ void Track::set_landmark_point(const vector<3> &p) {
++    portdump::Chan *pc = portdump::want(16);
++    set_landmark_point_impl(p);
++    if (pc) {
++        const auto [frame, keypoint_index] = first_keypoint();
++        dump_obs(pc, frame, keypoint_index);
++        portdump::f64(pc, p.data(), 3);
++        portdump::f64(pc, landmark.inv_depth);
++    }
++}
++
++void Track::set_landmark_point_impl(const vector<3> &p) {
+     const auto [frame, keypoint_index] = first_keypoint();
+     auto camera = frame->get_pose(frame->camera);
+     landmark.inv_depth = 1.0 / (camera.q.conjugate() * (p - camera.p)).norm();

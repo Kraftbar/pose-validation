@@ -179,6 +179,7 @@ struct ok_vg {
     /* the initial-fixation PoseError of ViSlamBackend::optimiseRealtimeGraph */
     ok_pose_err* fix_term; uint64_t fix_rb;
     emap blkq;
+    int solver_type; double ftol;   /* ceres Solver::Options (linear_solver_type, function_tolerance) as ViGraph::optimise logs them */
 };
 
 static void* xmalloc(size_t n) { void* p = malloc(n ? n : 1); return p; }
@@ -247,6 +248,8 @@ ok_vg* ok_vg_new(void) {
     ok_vg* g = (ok_vg*)xcalloc(sizeof(ok_vg));
     ok_problem_init(&g->pb);
     g->covis_computed = 1;      /* "init with true since no observations in the beginning" */
+    g->solver_type = 2;         /* ViGraph ctor: SPARSE_NORMAL_CHOLESKY */
+    g->ftol = 1e-6;             /* ceres default */
     return g;
 }
 
@@ -517,6 +520,38 @@ int ok_vg_clean_unobserved_landmarks(ok_vg* g) {
     return ctr;
 }
 
+/* cleanUnobservedLandmarks(&removed): removed[lm] = {the single observation, if any}, ascending landmark id */
+int ok_vg_clean_unobserved_landmarks_ex(ok_vg* g, uint64_t** lms, ok_vg_kid** kids, int** has_kid, int* nrem) {
+    int ctr = 0, i = 0, cap = 0;
+    *lms = NULL; *kids = NULL; *has_kid = NULL; *nrem = 0;
+    while (i < g->landmarks.n) {
+        landmark* l = (landmark*)g->landmarks.a[i].p;
+        if (l->obs.n <= 1) {
+            if (*nrem == cap) {
+                cap = cap ? 2 * cap : 16;
+                *lms = (uint64_t*)realloc(*lms, sizeof(uint64_t) * (size_t)cap);
+                *kids = (ok_vg_kid*)realloc(*kids, sizeof(ok_vg_kid) * (size_t)cap);
+                *has_kid = (int*)realloc(*has_kid, sizeof(int) * (size_t)cap);
+            }
+            (*lms)[*nrem] = l->id; (*has_kid)[*nrem] = l->obs.n == 1;
+            memset(&(*kids)[*nrem], 0, sizeof(ok_vg_kid));
+            if (l->obs.n == 1) {
+                const ent e = l->obs.a[0];
+                (*kids)[*nrem] = kid_of(e.k0, e.k1);
+                ok_vg_remove_observation(g, kid_of(e.k0, e.k1));
+            }
+            (*nrem)++;
+            p_rm_param(g, l->hp);
+            emap_free(&l->obs);
+            memmove(&g->landmarks.a[i], &g->landmarks.a[i + 1], sizeof(ent) * (size_t)(g->landmarks.n - i - 1));
+            g->landmarks.n--;
+            free(l);
+            ctr++;
+        } else ++i;
+    }
+    return ctr;
+}
+
 int ok_vg_merge_landmark(ok_vg* g, uint64_t from, uint64_t into) {
     landmark* lf = lm_get(g, from);
     landmark* li = lm_get(g, into);
@@ -701,6 +736,12 @@ void ok_vg_imu_copy(ok_imu_error* dst, const ok_imu_error* src) {   /* ImuError:
     *dst = tmp;
 }
 
+static uint64_t g_elim_hash;
+int ok_vg_eliminate_state_by_imu_merge_h(ok_vg* g, uint64_t id, uint64_t ref, uint64_t* kf, double T_Sk_S7[7], double v_Sk_out[3], uint64_t* imu_hash) {
+    const int r = ok_vg_eliminate_state_by_imu_merge(g, id, ref, kf, T_Sk_S7, v_Sk_out);
+    if (imu_hash) *imu_hash = g_elim_hash;
+    return r;
+}
 int ok_vg_eliminate_state_by_imu_merge(ok_vg* g, uint64_t id, uint64_t ref, uint64_t* kf, double T_Sk_S7[7], double v_Sk_out[3]) {
     state* s = st_get(g, id);
     state *prev, *next, *other;
@@ -731,6 +772,7 @@ int ok_vg_eliminate_state_by_imu_merge(ok_vg* g, uint64_t id, uint64_t ref, uint
     p_rm_resid(g, L1);
     p_rm_param(g, s->pose);
     p_rm_param(g, s->sb);
+    { unsigned char* sn; const size_t n = ok_vg_imu_snapshot(L1->e, 0, 1, &sn); g_elim_hash = ok_vg_fnv(sn, n); free(sn); }
     /* re-add the appended IMU error term */
     b4[0] = prev->pose; b4[1] = prev->sb; b4[2] = next->pose; b4[3] = next->sb;
     p_add_resid(g, L1, RK_IMU, L1->e, T_IMU, 0, 4, b4);
@@ -1070,7 +1112,7 @@ int ok_vg_clone_two_pose_const(const ok_vg* g, uint64_t ref, uint64_t other, ok_
 void ok_vg_conv_result_free(ok_vg_conv_result* r) {
     int i;
     for (i = 0; i < r->nobs; ++i) free(r->err[i]);
-    free(r->kid); free(r->err); free(r->lm); free(r->lms); free(r->connected);
+    free(r->kid); free(r->err); free(r->lm); free(r->lms); free(r->connected); free(r->cauchy);
     memset(r, 0, sizeof *r);
 }
 
@@ -1117,6 +1159,8 @@ int ok_vg_convert_to_observations(ok_vg* g, uint64_t id, ok_vg_conv_result* out)
             out->kid = (ok_vg_kid*)realloc(out->kid, sizeof(ok_vg_kid) * (size_t)(out->nobs + 1));
             out->err = (ok_reproj_err**)realloc(out->err, sizeof(ok_reproj_err*) * (size_t)(out->nobs + 1));
             out->lm = (uint64_t*)realloc(out->lm, sizeof(uint64_t) * (size_t)(out->nobs + 1));
+            out->cauchy = (int*)realloc(out->cauchy, sizeof(int) * (size_t)(out->nobs + 1));
+            out->cauchy[out->nobs] = ob->loss != 0;
             out->kid[out->nobs] = kid; out->lm[out->nobs] = ob->hpoint_id;
             out->err[out->nobs] = (ok_reproj_err*)xmalloc(sizeof(ok_reproj_err)); *out->err[out->nobs] = ob->err;
             out->nobs++;
@@ -1342,4 +1386,94 @@ size_t ok_vg_tp_payload(const ok_tp_std* e, unsigned char** out) {
     w_u32(&w, e->is_computed ? 1u : 0u); w_f64n(&w, e->DeltaX, 6); w_f64n(&w, e->J, 36);
     tf_coeffs(&e->lin_T_S0S1, c); w_f64n(&w, c, 7);
     *out = w.p; return w.n;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * read access for ViSlamBackend (module M6)
+ * ---------------------------------------------------------------------------------------------------------------- */
+static void state_view(const state* s, ok_vg_state_view* v) {
+    v->id = s->id; v->is_kf = s->is_kf; v->pose_fixed = s->pose->fixed; v->sb_fixed = s->sb->fixed;
+    v->nobs = s->obs.n; v->ntp = s->tp.n; v->ntpc = s->tpc.n; v->nrel = s->rel.n; v->has_prev_imu = s->prev_imu != NULL; v->ts = s->ts;
+}
+int ok_vg_state_count(const ok_vg* g) { return g->states.n; }
+int ok_vg_state_at(const ok_vg* g, int idx, ok_vg_state_view* v) { if (idx < 0 || idx >= g->states.n) return 0; state_view((const state*)g->states.a[idx].p, v); return 1; }
+int ok_vg_state_find(const ok_vg* g, uint64_t id, ok_vg_state_view* v) { const state* s = st_get(g, id); if (!s) return 0; if (v) state_view(s, v); return 1; }
+int ok_vg_state_index(const ok_vg* g, uint64_t id) { int f, i = emap_search(&g->states, id, 0, &f); return f ? i : -1; }
+int ok_vg_state_obs(const ok_vg* g, uint64_t id, ok_vg_kid** kids, uint64_t** lms) {
+    const state* s = st_get(g, id);
+    int i, n;
+    *kids = NULL; *lms = NULL;
+    if (!s) return 0;
+    n = s->obs.n;
+    *kids = (ok_vg_kid*)xmalloc(sizeof(ok_vg_kid) * (size_t)n);
+    *lms = (uint64_t*)xmalloc(sizeof(uint64_t) * (size_t)n);
+    for (i = 0; i < n; ++i) { (*kids)[i] = kid_of(s->obs.a[i].k0, s->obs.a[i].k1); (*lms)[i] = ((const obs*)s->obs.a[i].p)->lm; }
+    return n;
+}
+int ok_vg_landmark_count(const ok_vg* g) { return g->landmarks.n; }
+uint64_t ok_vg_landmark_id_at(const ok_vg* g, int i) { return g->landmarks.a[i].k0; }
+int ok_vg_landmark_find(const ok_vg* g, uint64_t id, ok_vg_lm_view* v) {
+    const landmark* l = lm_get(g, id);
+    if (!l) return 0;
+    if (v) { v->id = id; memcpy(v->hp, l->hp->x, sizeof v->hp); v->initialised = l->hp->initialised; v->quality = l->quality; v->nobs = l->obs.n; }
+    return 1;
+}
+int ok_vg_landmark_obs(const ok_vg* g, uint64_t id, ok_vg_kid** kids) {
+    const landmark* l = lm_get(g, id);
+    int i, n;
+    *kids = NULL;
+    if (!l) return 0;
+    n = l->obs.n;
+    *kids = (ok_vg_kid*)xmalloc(sizeof(ok_vg_kid) * (size_t)(n ? n : 1));
+    for (i = 0; i < n; ++i) (*kids)[i] = kid_of(l->obs.a[i].k0, l->obs.a[i].k1);
+    return n;
+}
+int ok_vg_obs_find(const ok_vg* g, ok_vg_kid kid, uint64_t* lm, const ok_reproj_err** err, int* cauchy) {
+    const obs* o = ob_get(g, kid);
+    if (!o) return 0;
+    if (lm) *lm = o->lm;
+    if (err) *err = o->err;
+    if (cauchy) *cauchy = o->loss != 0;
+    return 1;
+}
+int ok_vg_anystate_get(const ok_vg* g, uint64_t id, uint64_t* kf, double T7[7], double v3[3]) {
+    const anystate* a = (const anystate*)emap_get(&g->anystates, id, 0);
+    if (!a) return 0;
+    if (kf) *kf = a->kf;
+    if (T7) { memcpy(T7, a->T_Sk_S.r, sizeof(double) * 3); T7[3] = a->T_Sk_S.q.x; T7[4] = a->T_Sk_S.q.y; T7[5] = a->T_Sk_S.q.z; T7[6] = a->T_Sk_S.q.w; }
+    if (v3) memcpy(v3, a->v_Sk, sizeof a->v_Sk);
+    return 1;
+}
+int ok_vg_imu_use(const ok_vg* g) { return g->imu.use; }
+int ok_vg_num_cameras(const ok_vg* g) { return g->ncam; }
+void ok_vg_set_solver_options(ok_vg* g, int linear_solver_type, double function_tolerance) { g->solver_type = linear_solver_type; g->ftol = function_tolerance; }
+int ok_vg_solver_type(const ok_vg* g) { return g->solver_type; }
+double ok_vg_function_tolerance(const ok_vg* g) { return g->ftol; }
+int ok_vg_pose_fixed(const ok_vg* g, uint64_t id) { const state* s = st_get(g, id); return s ? s->pose->fixed : -1; }
+int ok_vg_state_links(const ok_vg* g, uint64_t id, int kind, uint64_t (**pairs)[2]) {
+    const state* s = st_get(g, id);
+    const emap* m;
+    int i, n;
+    *pairs = NULL;
+    if (!s) return 0;
+    m = kind == 0 ? &s->rel : (kind == 1 ? &s->tp : &s->tpc);
+    n = m->n;
+    *pairs = (uint64_t(*)[2])xmalloc(sizeof(uint64_t) * 2 * (size_t)(n ? n : 1));
+    for (i = 0; i < n; ++i) {
+        if (kind == 0) { const rlink* l = (const rlink*)m->a[i].p; (*pairs)[i][0] = l->state0; (*pairs)[i][1] = l->state1; }
+        else if (kind == 1) { const tplink* l = (const tplink*)m->a[i].p; (*pairs)[i][0] = l->state0; (*pairs)[i][1] = l->state1; }
+        else { const tpclink* l = (const tpclink*)m->a[i].p; (*pairs)[i][0] = l->state0; (*pairs)[i][1] = l->state1; }
+    }
+    return n;
+}
+int ok_vg_rel_link_get(const ok_vg* g, uint64_t s0, uint64_t s1, double T7[7], double info[36]) {
+    const state* a = st_get(g, s0);
+    const rlink* l;
+    if (!a) return 0;
+    l = (const rlink*)emap_get(&a->rel, s1, 0);
+    if (!l) return 0;
+    memcpy(T7, l->term.T_AB.r, sizeof(double) * 3);
+    T7[3] = l->term.T_AB.q.x; T7[4] = l->term.T_AB.q.y; T7[5] = l->term.T_AB.q.z; T7[6] = l->term.T_AB.q.w;
+    memcpy(info, l->term.info, sizeof(double) * 36);
+    return 1;
 }

@@ -481,7 +481,7 @@ int main(int argc, char** argv) {
               revs_push(&s->ev, &e); }
             continue;
         }
-        if (r.tag < 32) continue;
+        if (r.tag < 32 || r.tag >= 128) continue;          /* >= 128: backend entry records (patch 0011, check_ok_vslam) */
         /* ------------------------------------------------ a graph mutation */
         {
             uint64_t gptr = cu64(&c);

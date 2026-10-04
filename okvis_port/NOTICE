@@ -34,6 +34,16 @@ priors, eliminateStateByImuMerge, freeze / unfreeze, convertToPoseGraphMst with 
 mergeLandmark, cleanUnobservedLandmarks, two-pose const links, computeCovisibilities) are OKVIS2-derived (BSD-3-Clause,
 same notices as above); the sorted-array / hash containers and the mutation-log harness are original. Patch
 0010-vigraph-mutation-log.patch only instruments the OKVIS2 tree under runs/ and is never distributed.
+Module 6 (ViSlamBackend): ok_vslam.{h,c} (strategy, eliminateImuFrames, applyStrategy, attemptLoopClosure,
+addLoopClosureFrame, synchroniseRealtimeAndFullGraph, optimise{Realtime,Full}Graph, cleanUnobservedLandmarks, landmark merging)
+and ok_vsolve.c (ViGraph::optimise on the C graph: the Ceres problem is built from the graph's Problem bookkeeping and solved
+with the module-4 solver) are OKVIS2-derived (BSD-3-Clause, same notices as above; ok_vsolve.c also Ceres-derived through the
+module-4 solver). ok_vsb_geom.c holds the keypoint-overlap rasterisation of ViSlamBackend::overlapFraction, which follows
+OpenCV 4.6 drawing.cpp `Circle` for a filled cv::circle (Copyright (c) 2000-2022 Intel Corporation, Willow Garage, OpenCV
+Foundation and the OpenCV contributors, BSD-3-Clause / Apache-2.0 since 4.5; the names of the copyright holders may not be used
+to endorse derived products), and the Eigen 3.4.0 AngleAxis / Quaternion / stableNorm evaluation order (MPL-2.0); the file is
+therefore dual-licensed BSD-3-Clause AND MPL-2.0. Patch 0011-backend-call-log.patch only instruments the OKVIS2 tree under
+runs/ and is never distributed.
 The reference build (runs/okvis_port/reference_build) links Ceres (BSD-3 + Apache-2.0 parts), glog, gflags, OpenCV,
 Boost, OpenBLAS and is never distributed. Dumps and datasets under runs/ are EuRoC-derived (non-commercial) and
 must never be committed. See docs/okvis2_license_audit.md.

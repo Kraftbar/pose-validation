@@ -23,7 +23,8 @@ The M4 harness (check_ok_solve) reads solve.bin (patch 0008, run_okvis_reference
 solve.bin (m4, s4) run just that harness, tags without one skip it. The M5 harnesses read graph.bin (check_ok_graph:
 TwoPose* terms, updateLandmarks) and problem.bin (check_ok_problem: ceres::Problem program order), both from
 patch 0009 / --graph-dump (m5, s5). check_ok_vigraph replays the ViGraph mutation log of patch 0010 that
-the same problem.bin carries from tag m6/s6 on (see okvis_port/c/ok_vigraph.h).
+the same problem.bin carries from tag m6/s6 on (see okvis_port/c/ok_vigraph.h). check_ok_vslam (module 6) replays the
+ViSlamBackend entry records of patch 0011 (tags m7/s7 on) through the C backend and compares every graph call it makes.
 
 --eigen-tests additionally builds okvis_port/reference_tools/eigen_*_test.cc against the real Eigen 3.4.0
 (external/vio/deps, flags -O2 -DNDEBUG -ffp-contract=off -fno-fast-math) and runs them (random-case,
@@ -100,6 +101,24 @@ def has_vigraph_log(dump_dir):
     return False
 
 
+def has_backend_log(dump_dir):
+    """True if problem.bin carries the ViSlamBackend entry records of patch 0011 (tags >= 128 within the first records)."""
+    path = dump_dir / "problem.bin"
+    if not path.exists():
+        return False
+    import struct
+    with open(path, "rb") as f:
+        for _ in range(200):
+            h = f.read(12)
+            if len(h) < 12:
+                return False
+            tag, ln = struct.unpack("<IQ", h)
+            if tag >= 128:
+                return True
+            f.seek(ln, 1)
+    return False
+
+
 def eigen_tests():
     """Build+run the C++ cross-checks against real Eigen / the real OKVIS2 classes. Returns list of (name, ok)."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,7 +172,10 @@ def main():
     ap.add_argument("--tag", default="run1", help="comma-separated run tags")
     ap.add_argument("--max", type=int, default=-1)
     ap.add_argument("--eigen-tests", action="store_true")
-    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*,check_ok_vigraph*",
+    ap.add_argument("--native-solve", type=int, default=0, metavar="N",
+                    help="check_ok_vslam: solve every Nth graph optimise() natively on the C graph (ok_sv_solve) instead of "
+                         "applying the logged solver output, and compare the result with the log (1 = every solve)")
+    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*,check_ok_vigraph*,check_ok_vslam*",
                     help="comma-separated globs of okvis_port/c/ harnesses that consume the reference dumps "
                          "(other modules, e.g. check_ok_brisk*, have their own dump trees/runners)")
     args = ap.parse_args()
@@ -192,10 +214,15 @@ def main():
                 continue  # tag without the M5 Problem log (patch 0009, --graph-dump)
             if name.startswith("check_ok_vigraph") and not has_vigraph_log(dump_dir):
                 continue  # tag recorded before patch 0010 (no ViGraph mutation records in problem.bin)
-            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem", "check_ok_vigraph")) and not list(dump_dir.glob("imu_*.bin")):
+            if name.startswith("check_ok_vslam") and not has_backend_log(dump_dir):
+                continue  # tag recorded before patch 0011 (no backend entry records in problem.bin)
+            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem", "check_ok_vigraph", "check_ok_vslam")) and not list(dump_dir.glob("imu_*.bin")):
                 continue  # solver/graph-only tag (m4/s4/m5/s5): no M1-M3 dumps
             cmd = [str(exe), seq, "-", str(dump_dir)] + ([str(args.max)] if args.max > 0 else [])
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            env = dict(os.environ)
+            if name.startswith("check_ok_vslam") and args.native_solve > 0:
+                env["OK_NATIVE_SOLVE"] = str(args.native_solve)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
             lines = proc.stdout.rstrip().splitlines()
             last = lines[-1] if lines else ""
             m = re.match(r".*:\s*(\d+)/(\d+)\s*$", last)
