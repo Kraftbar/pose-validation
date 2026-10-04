@@ -269,3 +269,92 @@ Defaults unchanged: `rframe=0`, `merge=0` (plus all earlier defaults). Window to
 - R-frames cannot rescue a turn into a textureless view or a blank without an IMU (the vision chain dies at once, as in the default).
 - Merge: the second map's drift is dumped into the pose graph / loop BA as for any loop; no scale-drift-aware (Sim3 pose graph with per-map scale freedom beyond g2o Sim3) treatment of the very long second map; the deterministic port's mapper pause after an ordinary loop still applies (only a merge resumes it).
 - Parameters were tuned on the complex bursts (overlapping windows); the TUM and Outdoor-1 results say nothing about the tuned values since those sequences hardly enter R-mode.
+
+## PoseLib-style blocks: `init_refine`, `init_lo`, `pnp_lo` (2026-10-04)
+
+Own C99 code in `c/sv_poselib.{c,h}` following the ideas of PoseLib (BSD-3, notice in `NOTICE` and `LICENSES/poselib-BSD-3-Clause.txt`; nothing copied: Grunert P3P, central-difference Jacobians). All three are **opt-in**, defaults unchanged.
+
+| switch | what |
+|---|---|
+| `--set init_refine=1` | after the initializer has selected its hypothesis: Cauchy-weighted LM on the Sampson error (5 DoF: rotation + translation direction, scale of t kept) over the model inliers, inliers re-selected at 2 px under the refined pose, LM again, re-triangulate, then the unchanged acceptance tests |
+| `--set init_lo=1` (`init_lo_thr` px, default 2) | 5-point LO-RANSAC (existing `sv_essential_5pt`, MSAC, LO = cheirality pick + LM refine + re-score on every new best, <= 600 iterations, adaptive, min 100) tried first; its E goes through the unchanged 4-hypothesis selection / acceptance; if it fails the old H/F path runs |
+| `--set pnp_lo=1` | P3P (Grunert quartic) LO-RANSAC + LM pose refinement (reprojection, Cauchy) instead of `sv_pnp_ransac` in the relocalizer and in the loop-candidate PnP; same cosine thresholds / cost / validity rule, <= 1000 iterations, adaptive |
+
+**Unit test** `c/check_sv_poselib.c` (`make check_sv_poselib`; the 600 pairs of `runs/blocks/poselib/pairs.txt`, same success rules as `tools/blocks/blocks_eval.cpp`; PoseLib column = `runs/blocks/poselib/report.md`). P3P on 2000 exact synthetic instances: true pose among the solutions in 1996 (mean 2.1 solutions).
+
+| init (accepted / success = accepted and rot < 2 deg and dir < 20 deg) | accepted | success | median rot err | ms |
+|---|---|---|---|---|
+| stella, seeds=1 | 44.5% | 9.3% | 1.76 | 3.6 |
+| stella, seeds=4 (blocks: 20%) | 65.7% | 20.2% | 1.55 | 14.2 |
+| seeds=4 + `init_refine` (blocks harness with PoseLib's own refine: 44%) | 66.2% | **51.3%** | 0.55 | 19.7 |
+| `init_lo` (PoseLib 5pt LO-RANSAC: 78% / 66%, 0.55, 8.8 ms; different acceptance re-implementation there) | 76.0% | **54.7%** | 0.72 | 8.8 |
+| `init_lo` + `init_refine` | 74.5% | 56.0% | 0.65 | 10.7 |
+
+| PnP success (rot < 2 deg and centre < 5 cm), injected outliers | +0% | +30% | +50% | +70% | +85% | ms (0% / 85%) |
+|---|---|---|---|---|---|---|
+| `sv_pnp_ransac` 30 it (what the loop PnP uses) | 90.3 | 78.8 | 48.2 | 9.0 | 0.7 | 1.4 / 1.4 |
+| `sv_pnp_ransac` 100 it | 92.0 | 88.5 | 79.3 | 28.3 | 1.2 | 4.6 / 4.6 |
+| `pnp_lo` (<= 1000 it) | **92.8** | **92.2** | **92.0** | **88.8** | **80.8** | 3.6 / 9.0 |
+| PoseLib p3p (blocks report) | 92 | 93 | 91 | 89 | 71 | 2.2 / 3.8 |
+
+The solver-level gains of the building-blocks note are reproduced (init success 20% -> 51-56%, PnP at 70% outliers 9-28% -> 89%). ASan/UBSan clean (the harness itself leaks its pair list; a fr1_xyz run with all three switches and a 22-frame blank is clean).
+
+**End to end** (`--imu` for complex / mh01 / Outdoor-1 as in the earlier tables; all numbers re-run today with the unmodified HEAD binary next to the new ones). Whole-run ATE [m] on the TUM sequences:
+
+| config | fr1_xyz | fr1_desk | fr1_floor | fr2_xyz | fr3_long_office |
+|---|---|---|---|---|---|
+| default (HEAD binary = new binary, trajectories byte-identical) | 0.011 | 0.019 | 0.024 | 0.012 | 0.022 |
+| `init_refine=1` | 0.011 | 0.021 | 0.019 | **0.004** | 0.019 |
+| `init_lo=1` | 0.011 | **0.032** | 0.019 | 0.006 | 0.028 |
+| `init_lo=1 init_refine=1` | 0.011 | 0.023 | 0.019 | 0.004 | 0.019 |
+| `pnp_lo=1` | 0.011 | 0.019 | 0.024 | 0.012 | 0.022 |
+| all three | 0.011 | 0.023 | 0.019 | 0.004 | 0.019 |
+| `init_lo=1 init_lo_thr=1 / 1.5 / 3` | desk 0.029 / 0.024 / 0.019 | | floor 0.020 / 0.023 / 0.025 | 0.004 / 0.011 / 0.009 | 0.017 / 0.021 / 0.024 |
+
+Other sequences (single-alignment ATE / per-60 s-window pooled / median / first-60 s / Lost frames / maps; default first):
+
+| config | complex | mh01 | Outdoor-1 |
+|---|---|---|---|
+| default | 2.73 / 0.290 / 0.251 / 0.124 / 43 / 2 | 0.036 / 0.031 / 0.023 / 0.016 / 0 / 1 | 45.7 / 3.41 / 1.89 / 2.09 / 3 / 1 |
+| `init_refine` | 3.57 / 0.258 / 0.234 / 0.087 / 43 / 2 | 0.031 / 0.019 / 0.020 / 0.014 / 0 / 1 | 2.53 (2 maps) / 0.878 / 0.611 / 0.525 / 35 / 2 |
+| `init_lo` | 3.97 / 0.347 / 0.300 / 0.091 / 43 / 2 | 0.032 / 0.026 / 0.026 / 0.026 / 0 / 1 | 38.1 / 3.78 / 1.12 / 1.12 / 14 / 1 |
+| `init_lo init_refine` | 3.97 / 0.347 / 0.300 / 0.107 / 42 / 2 | 0.034 / 0.022 / 0.020 / 0.019 / 0 / 1 | 38.1 / 3.78 / 1.12 / 1.12 / 14 / 1 |
+| `pnp_lo` | identical to default | identical | identical to 3 decimals (trajectory differs after a reloc) |
+| all three | 3.97 / 0.347 / 0.300 / 0.107 / 42 / 2 | 0.034 / 0.022 / 0.020 / 0.019 / 0 / 1 | 51.6 / 5.57 / 1.36 / 1.36 / 48 / 1 |
+| `init_lo init_lo_thr=3` | not run (fixtures gone; TUM/mh01 already fail) | **1.387** (bad init, first-60 s 0.486) | 2.86 (2 maps) / 1.11 / 1.03 / 0.535 / 34 / 2 |
+
+Multi-start windows (same protocol as above: TUM 300-frame windows, ATE < 0.05 m; complex 600 frames ATE < 1 m; mh01 600 frames < 1 m; Outdoor-1 450 frames < 2 m; coverage >= 60%):
+
+| config | TUM /75 | mh01 /11 | complex /28 | Outdoor-1 /37 | total /151 |
+|---|---|---|---|---|---|
+| default | 71 | 10 | 28 | 33 | **142** |
+| `init_refine` | 68 | 10 | 26 | 32 | 136 |
+| `init_lo` | 72 | 10 | 28 | 35 | **145** |
+| `init_lo init_refine` | 69 | 10 | 27 | 34 | 140 |
+| `pnp_lo` | 71 | 10 | 28 | 33 | 142 |
+| all three | 69 | 10 | 27 | 34 | 140 |
+| `init_lo_thr=3` | 70 | 10 | - | 35 | - |
+| `init_refine` + `init_parallax` 1.5 / 2 / 3 (TUM only) | 69 / 69 / 60 | | | | |
+| `init_lo` / `init_lo init_refine` + `init_parallax=2` (TUM only) | 70 / 69 | | | | |
+| default + `init_parallax=2` (TUM only) | 66 | | | | |
+
+TUM window ATE (75 windows, median / mean over windows with a pose): default 0.0101 / 0.0146, `init_refine` 0.0093 / 0.0171, `init_lo` 0.0081 / 0.0124, `init_lo init_refine` 0.0086 / 0.0155 (typical windows get slightly better, the tails are chaotic).
+
+Relocalization stress (`tools/reloc_study.py`: 5 TUM sequences x 4 places x blank of 8 / 20 / 45 frames = 60 cells, default vs `pnp_lo=1`): mean ATE 0.0192 vs 0.0193, mean coverage 90.76% vs 90.73%, Lost frames 2854 vs 2889, cells with a second map 24 vs 24. The relocalizer succeeds on its first attempt after the blank in both (checked with a debug trace: BoW candidate, 92 PnP points, 77 inliers), so the PnP RANSAC is not the bottleneck on these sequences; the outlier-injection gain does not show up end to end.
+
+### Verdicts
+
+| feature | verdict | why |
+|---|---|---|
+| `init_refine` | **accepted as opt-in, NOT promoted** | solver level +31 points of init success; whole-run ATE better on 4 of 5 TUM (fr2_xyz 0.012 -> 0.004, fr1_floor 0.024 -> 0.019, fr3 0.022 -> 0.019; fr1_desk +0.002), mh01 0.036 -> 0.031, Outdoor-1 first-60 s 2.09 -> 0.53 and window pooled 3.41 -> 0.88 (but 35 Lost frames, a reset and a second map, so the 2.5 m single ATE is per-map-aligned and not comparable with 45.7). Against: windows fall 142 -> 136 (TUM 71 -> 68, complex 28 -> 26). Cause (fr1_xyz start 200): the refined hypothesis passes the unchanged acceptance tests earlier (map starts 18 frames earlier at a smaller baseline) and the first map is then weaker; raising `init_parallax` to 1.5-3 does not recover it (69 / 69 / 60) and costs the default config the same way (66) |
+| `init_lo` | **accepted as opt-in, NOT promoted** | windows 142 -> 145 (Outdoor-1 33 -> 35, TUM 71 -> 72, complex / mh01 equal) and Outdoor-1 first-60 s 2.09 -> 1.12, but fr1_desk whole-run 0.019 -> 0.032 (+0.013 > the 0.01 m gate) and fr3 +0.006. Threshold 3 px passes the TUM gate (all within +0.002) but mh01 collapses (1.39 m) and the TUM windows go to 70: the result moves with the threshold as chaotically as with the seeds |
+| `pnp_lo` | **accepted as opt-in, NOT promoted** | the solver is far better (PnP at 70% outliers 9% / 28% -> 89%, 85%: 1% -> 81%, 3.6 ms) and ASan clean, but no end-to-end sequence changes beyond 3 decimals (byte-identical on 5 of 8; fr1_floor, fr3, Outdoor-1 differ after a reloc with the same ATE) and the reloc stress ties; no window count moves |
+
+Defaults unchanged: `init_refine=0`, `init_lo=0`, `pnp_lo=0`. Exact-port check (`--no-snap --set reinit_sec=0 --set init_max_level=0 --set init_confirm=1` on fr1_xyz): `trajectory.tum` is `cmp`-identical to `stella_port`'s sv_run (787 poses). The default binary's trajectories are byte-identical to the HEAD binary on all 5 TUM sequences, complex, Outdoor-1 and mh01 (same score tables above).
+
+### Open issues
+- The windows are decided by the first accepted pair; any change that moves the acceptance frame (all three init switches) re-rolls that dice for every window (+/- 3 windows of 75 is within the noise of `init_seeds` too). An acceptance rule that looks at the quality of the pose (refined residual, inlier ratio, triangulated depth spread) instead of the number of valid points and 50th-point parallax would be the next hypothesis; the better solvers are a precondition, not the fix.
+- `init_lo` + fr1_desk: not diagnosed beyond "different first pair, 0.032".
+- `pnp_lo` untested on a dataset where the relocalizer actually fails first (kidnapped camera / large displacement); the reloc stress here always succeeds on the first attempt.
+- MAGSAC-style sigma-consensus scoring (the note's follow-up) not tried: the MSAC / cosine-threshold cost is used as is.
+- The Outdoor-1 / complex / mh01 fixtures were regenerated for this run (fetched again, deleted afterwards).

@@ -14,6 +14,7 @@ odometry flags from the SLAM output:                      new map id            
                                                            new segment (bridge)  -> GF_ODOM_GAP | GF_ODOM_LOOSE
                                                            R-frame sample        -> GF_ODOM_LOOSE (link sigma x loose_k = 5: position is extrapolated)
                                                            tracking gap > 2 s    -> automatic gap; GNSS-only nodes (one per fix) keep the output continuous
+        --> (section 14, `run.py georef`) gait-only stream + gnss_fusion/c/gf_georef_run: ONE slowly varying similarity from the fixes, the live output beats GNSS alone on all three outdoor sequences
         --> batch (whole-graph smoother) and causal (sliding window; `causal.live` = what an online consumer sees) trajectories, metric, in the ENU frame of the fixes when fixes exist
 ```
 
@@ -27,6 +28,8 @@ $PY phone_pipeline/run.py stages outdoor1 --stream <fetch_dir>/outdoor1         
 $PY phone_pipeline/score.py outdoor1                                              # scores.json (ATE SE3 / Sim3 / scale / coverage, batch + causal)
 $PY phone_pipeline/report.py > runs/phone_pipeline/tables.md                      # all tables
 phone_pipeline/check_baselines.sh <tmpdir>                                        # exact-port + gnss_fusion regression checks
+$PY phone_pipeline/run.py georef outdoor1 --variants default,rm,full,fullcal      # section 14: fuse_<variant>_georef/ from fuse_<variant>_gait + fixes (needs the gait stage); then score.py / report.py
+$PY phone_pipeline/fuse_eval.py "label|key=val ..." "georef|G: scale_sigma=0.15"   # fusion-stage-only experiments on the saved inputs (scratch dir, no stella_vio); prints batch / causal vs GNSS alone
 ```
 `run.py sv|fuse|gait|stages <seq>`: `--variants default,rm,full,fullcal`, `--fuse gait,gnss,both`, `--stream DIR`. Output of one run: `sv_<variant>/` (SLAM outputs), `speed.txt`, `fuse_<variant>_<gait|gnss|both>/`
 (`odom.txt fix.txt batch.out causal.out causal.live *.nodes run.json`). Fusion needs only `trajectory_maps.tum`, `trajectory_gz.tum`, the IMU csv and the fixes; the same four
@@ -86,5 +89,7 @@ One deterministic run per row (the front end is chaotic: only >2x differences ar
 | Outdoor-2 | 6737 | 449 (67) | 457 (68) | 1.4 | 0.04 | 0.31 (46) |
 | ADVIO-15 | 1553 | 58 (37) | 56 (36) | 4.7 | 0.01 | 0.02 (11) |
 | ADVIO-20 | 9076 | 615 (68) | 619 (68) | 1.4 | 0.05 | 0.22 (24) |
+
+Section 14 (opt-in `georef` rows, the default fusion rows above are unchanged): geo-referencing the fix-free gait stream with one slowly varying similarity gives batch / causal live 5.36 / 4.71 (Outdoor-1), 4.81 / 11.34 (Outdoor-2), 11.76 / 11.79 (ADVIO-20) against GNSS alone 5.73 / 14.66 / 12.00: the causal output now beats GNSS alone on all three (-18 / -23 / -2 %) and batch is not hurt. Smoother-internal remedies (longer window, smaller yaw random walk, trust off, grow) all failed on at least one sequence (`docs/gnss_vio_benchmark_20261001.md` section 14, `docs/rejected_trials.md`).
 
 Short version: ahead of XRSLAM / RD-VIO on Indoor-2, ADVIO-15, Outdoor-2, ADVIO-20 (their scale collapses on 3 of those), level on Outdoor-1, behind on Indoor-1 (full config; the default config is level). Against GNSS alone: batch 2-9 % better on the three outdoor sequences, causal 3-24 % worse (the gait-only stream without fixes is better than GNSS alone in causal mode but not geo-referenced).

@@ -17,6 +17,8 @@ int sv_pnp_ransac(const double *bearings,const double *points,const int *octaves
                   const float *scales,unsigned levels,unsigned min_inliers,unsigned iterations,
                   unsigned gn_iterations,int recompute,sv_mt19937 *rng,
                   sv_pnp_result *result,unsigned char *mask,sv_pnp_trace_fn trace,void *user);
+float sv_pnp_radial_threshold(float scale);
+unsigned sv_pnp_check_inliers(const double *b,const double *p,const float *threshold,unsigned n,const double *r,const double *t,unsigned char *mask,double *cost);
 #ifdef __cplusplus
 }
 #endif

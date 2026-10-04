@@ -27,6 +27,7 @@
 
 /* stella_vslam e445b545 module/relocalizer.cc and its projection paths. */
 #include "sv_relocalizer.h"
+#include "sv_poselib.h"
 #include "sv_match_bow.h"
 #include "sv_solve_essential_ransac.h"
 #include "sv_linalg.h"
@@ -183,7 +184,8 @@ static int by_candidate(const sv_reloc_config*c,const sv_tr_config*cfg,const sv_
   indices[nv]=i;octaves[nv]=f->obs->kp[i].octave;memcpy(b+3*nv,f->obs->bearings+3*i,24);memcpy(p+3*nv,lm->pos_w,24);nv++;
  }
  sv_pnp_result result;
- if(sv_pnp_ransac(b,p,octaves,nv,cfg->scale_factors,cfg->num_levels,10,c->max_ransac_iters,10,0,NULL,&result,inlier,tr->fn,tr->user))goto done;
+ if(c->pnp_lo){if(sv_pnp_lo_ransac(b,p,octaves,nv,cfg->scale_factors,cfg->num_levels,10,1000,NULL,&result,inlier))goto done;}
+ else if(sv_pnp_ransac(b,p,octaves,nv,cfg->scale_factors,cfg->num_levels,10,c->max_ransac_iters,10,0,NULL,&result,inlier,tr->fn,tr->user))goto done;
  if(!result.valid)goto pnp_failed;
  double pose[16]={0};for(int j=0;j<3;j++)for(int i=0;i<3;i++)pose[i+4*j]=result.rotation[i+3*j];for(int i=0;i<3;i++)pose[12+i]=result.translation[i];pose[15]=1;
  sv_tr_frame_set_pose_cw(f,pose);scalar(tr,"pnp_ok",1);frame_trace(tr,"pnp",f);

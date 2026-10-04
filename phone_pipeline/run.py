@@ -18,7 +18,7 @@ usage:
 --stream: the images are JPEGs in JPEG_DIR (cam0/data + cam0/data.csv of the fetch layout); gray PGMs are produced just in time, shared by all
 variants and deleted behind the slowest one (peak disk ~1.5 GB instead of 5-8 GB per sequence). Without it, <out>/_fx/<seq>/*.pgm must exist.
 """
-import sys, os, re, json, time, subprocess, argparse, threading, resource
+import sys, os, re, json, time, subprocess, argparse, threading, resource, shutil
 from pathlib import Path
 import numpy as np
 
@@ -224,9 +224,32 @@ def run_fuse(seq, variant, mode, extra=(), tag=None, loose=True, fix_sigma_k=1.0
     return res
 
 
+GEOREF_RUN = ROOT / 'gnss_fusion/c/gf_georef_run'
+
+
+def run_georef(seq, variant, extra=(), tag='georef'):
+    """section 14: the fix-free (gait only) stream of fuse_<variant>_gait is geo-referenced by ONE slowly varying similarity from the fixes (gf_georef_run);
+    causal = live stream of the gait run + the fixes up to now, batch = batch stream + one fit over all fixes. Needs fuse_<variant>_gait."""
+    c = cfg_of(seq); src = OUT / seq / f'fuse_{variant}_gait'
+    d = OUT / seq / f'fuse_{variant}_{tag}'; d.mkdir(parents=True, exist_ok=True)
+    nfix = read_fixes(rp(c['fixes']), d / 'fix.txt')
+    shutil.copy(src / 'odom.txt', d / 'odom.txt')
+    res = dict(n_fix=nfix, runs={}, init_wait_s=30.0)
+    for md, sf, of in (('batch', 'batch.out', 'batch.out'), ('causal', 'causal.live', 'causal.live')):
+        t0 = time.time()
+        r = subprocess.run([str(GEOREF_RUN), '--stream', str(src / sf), '--fix', str(d / 'fix.txt'), '--out', str(d / of), '--mode', md] + list(extra), capture_output=True, text=True)
+        wall = time.time() - t0
+        if r.returncode: raise RuntimeError(r.stderr + r.stdout)
+        (d / f'{md}.stdout').write_text(r.stdout)
+        res['runs'][md] = dict(wall_s=wall, stdout=r.stdout.strip().splitlines())
+    shutil.copy(d / 'causal.live', d / 'causal.out')
+    (d / 'run.json').write_text(json.dumps(res))
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('stage', choices=['stages', 'sv', 'fuse', 'gait'])
+    ap.add_argument('stage', choices=['stages', 'sv', 'fuse', 'gait', 'georef'])
     ap.add_argument('seq'); ap.add_argument('--variants', default='default,rm,full,fullcal'); ap.add_argument('--fuse', default='gait,gnss,both')
     ap.add_argument('--stream'); ap.add_argument('--ahead', type=int, default=1000)
     a = ap.parse_args()
@@ -234,10 +257,13 @@ def main():
     if a.stage in ('stages', 'sv'): run_sv(a.seq, vs, stream=a.stream, ahead=a.ahead)
     if a.stage in ('stages', 'gait', 'fuse'):
         g = run_gait(a.seq, OUT / a.seq); (OUT / a.seq / 'gait.json').write_text(json.dumps(g))
+    if a.stage == 'georef':
+        for v in vs: run_georef(a.seq, v)
     if a.stage in ('stages', 'fuse'):
         for v in vs:
             for m in fm:
                 if m == 'gait' or cfg_of(a.seq)['fixes']: run_fuse(a.seq, v, m)
+            if cfg_of(a.seq)['fixes'] and 'gait' in fm: run_georef(a.seq, v)
 
 
 if __name__ == '__main__':

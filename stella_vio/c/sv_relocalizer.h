@@ -9,6 +9,7 @@ typedef struct {
  float bow_ratio,projection_ratio,robust_ratio,common_words_ratio;
  unsigned min_bow_matches,min_valid_obs,neighbors,max_ransac_iters,max_local_keyframes;
  int search_neighbor;
+ int pnp_lo; /* stella_vio: 0 = sv_pnp_ransac (exact); 1 = P3P LO-RANSAC (sv_poselib.h), up to 1000 iterations */
 } sv_reloc_config;
 void sv_reloc_config_init(sv_reloc_config *cfg);
 /* Candidate traversal order is supplied explicitly. The database wrapper

@@ -23,6 +23,7 @@ cmp "$T/a/trajectory.tum" "$T/b/trajectory.tum" && echo "stella_vio vs stella_po
 make -C gnss_fusion/c >/dev/null
 cd gnss_fusion
 $PY tools/test_geo.py
+$PY tools/test_georef.py   # new opt-in georef module (section 14)
 $PY tools/compare_py.py complex_rtk complex_sim complex_rtk_blk complex_sim_blk o1_okvis o2_okvis o1_orb3mono o2_orb3mono
 $PY tools/gf_table.py > "$T/gf_table.log" 2>&1
 $PY tools/gf_gait_study.py fusion --workers 4 > "$T/gf_gait.log" 2>&1

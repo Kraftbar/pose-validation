@@ -878,8 +878,102 @@ pose stream was not written (needs the map labels at the time of the frame), and
 stella_vio fr1_xyz (`--set reinit_sec=0 init_max_level=0 init_confirm=1`, built per `tools/run_stella_port_replay.py`) `trajectory.tum` `cmp`-identical to stella_port's sv_run (787 poses) with the new `--wait-fixtures` option present; gnss_fusion: `gf_table.py` 893 numbers and `gf_gait_study.py fusion` 1578 numbers identical to the section-11 / 12 values saved before the change, `compare_py.py` (8 cases) and `test_geo.py` PASS.
 
 ### 13.6 Open issues
-* Causal is worse than GNSS alone on all three outdoor sequences (+3 .. +24 %). The gait-only stream is better, so the weakness is how the 14 m fixes (correlated, biased) enter the 30 s window; a rigid-only (yaw + translation) geo-referencing of a gait-scaled stream, or a bias state per fix source, is the next experiment (not done here).
+* Causal is worse than GNSS alone on all three outdoor sequences (+3 .. +24 %). The gait-only stream is better, so the weakness is how the 14 m fixes (correlated, biased) enter the 30 s window; a rigid-only (yaw + translation) geo-referencing of a gait-scaled stream, or a bias state per fix source, is the next experiment (not done here). **Done in section 14: a slowly varying similarity geo-referencing (`gf_georef`) makes the causal output 2-23 % better than GNSS alone on all three (rigid-only is not enough, the scale ridge is what wins).**
 * The first 30 s of a causal run with fixes (12 s without) are unaligned (88-93 % of all frames covered; ADVIO-15 66 %); no pose before the first stella initialisation (about 4 s on ADVIO-15 -> batch coverage 93 %); pure PDR bridging of those stretches is not wired in.
 * Scale is only as good as the gait constant: ADVIO-20 0.84 (a longer step person), ADVIO-15 outside the model; running / stairs / non-walking not covered (OTHER state gives no measurement). Long monocular maps keep their Sim3 shape error (Outdoor-1 5.4 m, ADVIO-20 4.4-5 m).
 * The odometry is the final stella_vio trajectory (not a per-frame live stream), stella_vio at full resolution is about real time at 15 fps only, and the fusion treats a merge or loop correction as ordinary odometry.
 * Single run per row, chaotic front end; everything is on six sequences of two datasets (ADVIO is CC BY-NC 4.0: internal benchmark only).
+
+## 14. Live (causal) fusion that beats GNSS alone: slowly varying geo-referencing of the gait stream (2026-10-04)
+
+Question (open issue 13.6): the section-13 causal output is 3-24 % worse than GNSS alone on Outdoor-1 / Outdoor-2 / ADVIO-20 while the fix-free gait stream is better. Why, and what fixes it without hurting batch or the other cases?
+Only the fusion stage was re-run, on the saved pipeline inputs (`runs/phone_pipeline/<seq>/fuse_full_*/{odom,fix}.txt`, `speed.txt`; stella_vio was not re-run). Harness: `phone_pipeline/fuse_eval.py` (gf_run / gf_georef_run in a scratch dir, scored by `score.py`, the same code as the section-13 tables).
+
+### 14.1 What the phone fixes are (measured, GT only used for this diagnosis)
+
+Fix error after the best rigid fit to the GT (horizontal rms 5.6 / 13.9 / 8.6 m on Outdoor-1 / Outdoor-2 / ADVIO-20): a 5 s moving average removes nothing of it (low-pass rms 5.4 / 13.9 / 8.6 m, high-pass 0.35-0.45 m), lag-1 autocorrelation 0.99, lag 30 s 0.39-0.58, lag 60 s -0.02 .. 0.23.
+So the fixes are a slowly varying common error (correlation time about 40 s) plus 0.3-0.5 m of white noise; the reported sigma is no use (Mobile-GVIO: constant 14.25 m; ADVIO-20: reported 5 m -> 8.6 m rms error, reported 10 m -> 8.4 m, i.e. uninformative).
+The smoother's causal 30 s window therefore re-estimates yaw / scale / offset from fixes whose errors are common to the whole window: the causal yaw state differs from the batch yaw by -7 .. +9 deg (Outdoor-1), up to 30 deg (Outdoor-2), 10 deg (ADVIO-20) over the run (`*.nodes`), which bends the shape that the gait-scaled odometry had right.
+Information bound: with the yaw taken from the full run (oracle) and only a causal translation offset from the fixes (exponentially weighted mean, time constants 30 s .. infinity) the SE3 error is 6.1 .. 5.6 / 13.7 .. 12.3 / 12.0 .. 11.8 m, i.e. at best level with GNSS alone: an offset taken from correlated fixes cannot beat the fixes. What does beat them is the long baseline: **yaw and scale** of the metric gait stream are determined by hundreds of metres of path and the offset error stays at the level of the fix bias, while the shape comes from the gait stream.
+
+### 14.2 What was built (opt-in; `gnss_fusion/c/gf_georef.{h,c}`, driver `gf_georef_run.c`, MIT, C99, `<stdint.h> <math.h> <stdlib.h> <string.h> <limits.h>` only)
+
+Two stages: (A) the existing smoother runs **without the fixes** (gait speed prior only: `fuse_<variant>_gait`, causal live + batch), (B) `gf_georef` maps that stream into ENU with ONE similarity (yaw psi, scale s, 2-D translation, vertical offset) estimated from all (stream position at the fix time, fix) pairs seen so far (causal) or all pairs (batch). Fixes never bend the shape.
+`psi` = 2-D Procrustes angle (Huber re-weighted, threshold 2.5 x a median-based residual scale), `s = (S_cr/k + lam) / (S_aa/k + lam)` with `lam = sigma_res^2 / sigma_s^2`: the scale is shrunk towards 1 (gait stream is metric to ~15 %, `sigma_s = 0.15`), `sigma_res` = residual rms of the fit (online noise calibration; the reported sigmas are not used, `use_sigma=0`), `k = corr_s x fix rate = 40` fixes per independent sample (coloured-noise correction of the information in S_aa). A pair is only formed when the stream is continuous around the fix time (`max_gap_s = 2.5`), the fit starts with 8 pairs and a 30 m extent. Causal: the pose at each stream sample is mapped with the fit that exists at that moment (no revision of old output); `test_georef.py` checks that the first half of the causal output is byte-identical when the second half of stream and fixes is removed.
+Use: `phone_pipeline/run.py georef <seq>` (writes `fuse_<variant>_georef/`), `gf_georef_run --stream live.txt --fix fixes.txt --out out.txt --mode causal|batch [key=value]`.
+
+### 14.3 Result (ATE SE3 [m], batch / causal live; causal scored from +30 s as in section 13; one deterministic run each)
+
+| configuration | Outdoor-1 | Outdoor-2 | ADVIO-20 | mean vs GNSS alone, batch / causal |
+|---|---|---|---|---|
+| GNSS alone | 5.73 | 14.66 | 12.00 | |
+| full, gait only (no fixes, not geo-referenced) | 6.37 / 5.16 | 13.93 / 13.68 | 11.83 / 11.76 | +1.6 % / -6.2 % |
+| full + gait + GNSS in the smoother (section 13 default, unchanged) | 5.50 / 7.10 | 13.28 / 15.10 | 11.76 / 12.32 | -5.1 % / +9.8 % |
+| **full, gait stream + georef (this section, defaults)** | **5.36 / 4.71** | **4.81 / 11.34** | **11.76 / 11.79** | **-25.2 % / -14.1 %** |
+| vs GNSS alone per sequence | -6.5 % / -17.8 % | -67 % / -22.6 % | -2.0 % / -1.8 % | |
+
+**Causal now beats GNSS alone on all three outdoor sequences, and batch is not hurt** (5.36 / 4.81 / 11.76 vs the unchanged smoother's 5.50 / 13.28 / 11.76; the smoother batch stays available and unchanged). Sim3 of the georef rows 5.35 / 1.92 / 4.37 batch, 4.60 / 9.98 / 4.72 causal; rms distance to the fixes 7.3 / 15.6 / 6.0 m (batch), 8.2 / 16.7 / 6.0 m (causal): the output lives in the ENU frame of the fixes. Coverage 99.6-100 % batch, 98-99.7 % causal (scored from +30 s; the first aligned output is at 31 / 37 / 33 s, 92 / 92 / 89 % of all frames).
+Honest reading: ADVIO-20's 2 % is within the run-to-run noise of the front end (the output scale is the 0.84 gait scale of that person, the fixes do not correct it: free scale gives the same 11.75); Outdoor-1's gain is the shape of the gait stream + averaged geo-reference; Outdoor-2's gain is mostly the scale: the gait constant of that user is 14 % short (13.9 m of gait-only SE3), the 450 fixes over 587 m recover it (scale 0.96 vs true, Sim3 1.92 m batch).
+The result depends on the stream: the other stella_vio variants of the same pipeline (same table in `runs/phone_pipeline/tables.md`): default + georef 4.71 / 4.99, 37.03 / 17.81, 13.70 / 13.14 (the default config splits Outdoor-2 / ADVIO-20 into two maps and the gait-only stream is already bad: 37.5 m), rm + georef 4.96 / 5.45, 13.36 / 13.56, 13.68 / 13.16, fullcal + georef 13.43 / 10.35, 4.78 / 11.38, 11.76 / 11.79 (Outdoor-1 fullcal is the chaotic 8.13 / 12.26 case of section 13 for the gait-only stream as well).
+
+Variants of the georef itself (same table layout; sweep `phone_pipeline/fuse_eval.py "label|G: key=val"`, log in `runs/phone_pipeline/` is not kept, numbers reproducible):
+
+| variant | Outdoor-1 | Outdoor-2 | ADVIO-20 | mean batch / causal vs GNSS |
+|---|---|---|---|---|
+| default | 5.36 / 4.71 | 4.81 / 11.34 | 11.76 / 11.79 | -25.2 % / -14.1 % |
+| rigid (scale = 1, `scale_sigma=0`) | 6.37 / 5.40 | 13.93 / 13.94 | 11.83 / 12.27 | +1.6 % / -2.8 % |
+| free scale (`scale_sigma=100`) | 5.37 / 4.57 | 3.34 / 11.12 | 11.75 / 11.75 | -28.5 % / -15.5 % |
+| weights 1/sigma_reported^2 | 5.36 / 4.71 | 4.81 / 11.34 | 12.00 / 11.93 | -24.6 % / -13.6 % |
+| no Huber | 5.36 / 4.70 | 4.81 / 11.21 | 11.64 / 11.81 | -25.5 % / -14.4 % |
+| forgetting 600 / 300 / 120 s | 5.37 / 4.89, 5.38 / 5.06, 5.41 / 5.43 | 5.49 / 11.60, 6.46 / 11.93, 9.68 / 13.18 | 11.83 / 11.84, 11.86 / 11.89, 11.73 / 11.95 | -23.4 / -12.3, -21.0 / -10.4, -13.9 / -5.2 % |
+| min_extent 15 / 60 m (60 m: first output later) | 5.36 / 4.73, 5.36 / 4.24 | 4.81 / 11.38, 4.81 / 10.60 | 11.76 / 11.76, 11.76 / 11.78 | -25.2 / -14.0, -25.2 / -18.5 % |
+
+### 14.4 The four ideas
+
+1. **Rigid geo-referencing of the gait-scaled stream with a slowly varying offset: accepted in a modified form.** Rigid (yaw + translation, scale 1) is only -2.8 % causal and +1.6 % batch (it cannot correct the gait scale, Outdoor-2 13.9 m); a similarity whose scale is shrunk towards 1 (`sigma_s = 0.15`) is what wins. Long memory (no forgetting) is best on these walks (10 min); forgetting 120-600 s costs 2-9 points (a drifting odometry would want it: the knob exists, default off).
+2. **GNSS bias state / coloured noise: not implemented as a state, tested two ways, rejected.** (a) The georef treats the fixes as white but lowers the weight of the scale information by the number of fixes per correlation time (`corr_s`, 1..80 s sweep: 12.2-14.6 % causal for all, i.e. insensitive; `corr_s=1` is even slightly better). (b) Exact generalised least squares with AR(1) fix errors (whitening by `z_i - phi_i z_{i-1}`, tau_c 40 / 80 s; python prototype `gnss_fusion/tools/georef_gls_proto.py`, run on the same gait stream): 10.36 / 10.46 / 11.22 and 13.83 / 10.95 / 11.58 vs white 5.02 / 11.06 / 11.51 (Outdoor-1 / -2 / ADVIO-20): worse, the whitened rows lose the long-baseline information (differences of nearly collinear rows) and the fix error is not a stationary AR(1). A Gauss-Markov bias state inside the 5-state smoother would need 7-state blocks (2.7x solver cost) and the measurements above say that the offset it would absorb is exactly what the long-memory fit averages anyway.
+3. **Longer causal window / marginalisation in the smoother: rejected** (`gf_run`, section-13 inputs, SE3 batch / causal): window 60 / 120 / 240 s 5.50 / 6.69, 6.31, 6.30 (Outdoor-1), 13.28 / 17.85, 17.27, 17.30 (Outdoor-2), 11.76 / 12.15, 12.14, 12.13 (ADVIO-20) vs 7.10 / 15.10 / 12.32: Outdoor-1 -11 %, Outdoor-2 +14-18 %. yaw_rw 0.1 / 0.02 deg/sqrt(s): causal 6.09 / 21.58 / 12.64 and 6.01 / 22.58 / 12.31 (a wrong first alignment is frozen). Window 120 + yaw_rw 0.1: 6.70 / 14.17 / 13.01; window 240 + yaw_rw 0.02: 6.42 / 14.55 / 13.14; + trust=0: 6.10 / 16.45 / 12.16 and 6.13 / 13.83 / 12.92 (batch 4.82 / 7.90 / 11.92 for window 240 + yaw_rw 0.1 + trust=0, i.e. -21 % batch, but +3 % causal); `grow_s_mono=120` 7.30 / 13.83 / 12.36, + yaw_rw 0.1 9.33 / 11.22 / 14.85. No setting is better than GNSS alone on all three in the smoother (best mean +3.0 % causal), and every one trades one sequence against another (full list in `docs/rejected_trials.md`). The causal mean of the best smoother setting stays 17 points above the georef.
+4. **Fix weighting, online sigma calibration, gating: partly accepted.** Reported sigma weights 1/sigma^2: no help (ADVIO-20 12.00 / 11.93 vs 11.76 / 11.79) because the reported sigmas are uninformative (14.1); the residual rms of the fit is the calibrated noise (it also sets the scale ridge). Gating against the odometry-predicted position = Huber re-weighting on the fit residual (threshold 2.5 x median-based sigma): neutral on the phones (no outlier bursts there, 4.70 vs 4.71), clearly helps on a synthetic 30 s burst of 60 m outliers (max error 1.83 vs 4.24 m, `test_georef.py`), kept as default. In the smoother: `gate_chi2=4` 7.10 / 15.28 / 12.35, `loss_k=1` 7.10 / 15.54 / 12.37 (vs 7.10 / 15.10 / 12.32): no help.
+
+### 14.5 Settings, calibration honesty, leave-one-sequence-out
+
+Physically set (not tuned on these runs): `sigma_s = 0.15` (gait scale uncertainty, section 12: 8-14 % per user), Huber 2.5 (same as the fix loss), `max_gap_s = 2.5` (the scorer's bracket), equal weights (14.1). **Measured on these three sequences:** `corr_s = 40` (autocorrelation, 14.1), `min_extent = 30` m and `min_fixes = 8` (a-priori round values; 15 and 60 m tried above). The fix-error statistics of 14.1 use the GT.
+Leave-one-sequence-out over the grid `corr_s {1, 20, 40, 80} x sigma_s {0.1, 0.15, 0.3} x Huber {0, 2.5}` (24 settings, final code): **every one of the 24 settings beats GNSS alone causally on every sequence** (worst per-sequence causal ratio 0.989, batch 0.980); the setting picked on the other two sequences scores on the held-out one (causal / batch vs GNSS alone): Outdoor-1 4.76 (-17.0 %) / 5.37 (-6.3 %), Outdoor-2 11.17 (-23.8 %) / 6.21 (-57.6 %), ADVIO-20 11.80 (-1.7 %) / 11.75 (-2.0 %). The conclusion does not depend on a setting; the size of the Outdoor-2 batch gain does (3.3 .. 7.9 m, scale prior).
+The stream itself carries the section-13.4 calibration remarks (sequence-fitted camera-IMU extrinsic / time offset / gyro bias, per-user gait constant fitted on the other Mobile sequences). Three sequences, two datasets, one front-end run each: a 2 % gain (ADVIO-20) is not a ranking.
+
+### 14.6 Earlier case list (`gnss_fusion/tools/gf_georef_table.py`; stream = raw odometry of the case, metric: sigma_s 0.15, monocular: free scale; ATE SE3 [m]; smoother = `gf_table` robust preset batch / causal30 / live)
+
+| case | GNSS alone | smoother batch / causal30 / live | georef batch / causal (coverage) |
+|---|---|---|---|
+| complex_rtk | 0.00 | 0.08 / 0.09 / 0.10 | 2.69 / 2.16 (100%) |
+| complex_sim | 4.18 | 2.04 / 2.16 / 2.15 | 2.70 / 2.56 (100%) |
+| complex_rtk_blk | 0.00 | 0.26 / 0.67 / 0.67 | 2.70 / 1.78 (100%) |
+| complex_sim_blk | 4.33 | 1.88 / 2.17 / 2.16 | 2.69 / 2.01 (100%) |
+| o1_okvis | 5.73 | 6.14 / 7.39 / 7.40 | 46.71 / 42.16 (99%) |
+| o2_okvis | 14.66 | 14.41 / 16.68 / 16.70 | 7296.49 / 7322.62 (96%) |
+| a15_okvis | 1.56 | 1.65 / 1.37 / 1.36 | - / - (0%) |
+| a20_okvis | 12.00 | 11.93 / 12.13 / 12.13 | 58.72 / 11.91 (20%) |
+| o1_orb3mono | 5.73 | 1.61 / 2.95 / 2.98 | 2.88 / 3.04 (100%) |
+| o2_orb3mono | 14.66 | 2.64 / 2.58 / 2.52 | 1.37 / 4.30 (100%) |
+| a15_orb3mono | 1.56 | 1.25 / 0.98 / 0.96 | - / - (0%) |
+| a20_orb3mono | 12.00 | 12.12 / 12.51 / 12.46 | 12.58 / 14.77 (100%) |
+| o1_stella | 5.73 | 5.02 / 6.94 / 6.94 | 16.34 / 5.51 (98%) |
+| o2_stella | 14.66 | 14.56 / 17.66 / 17.67 | 50.56 / 41.38 (99%) |
+| m14_okvis | 1.37 | 1.46 / 1.72 / 1.72 | 1.60 / 2.13 (72%) |
+| o1d_okvis | 2.20 | 1.47 / 1.43 / 1.43 | 1.61 / 2.16 (39%) |
+| o1_xrslam | 5.73 | 5.17 / 6.10 / 6.11 | 6.15 / 4.03 (100%) |
+| o2_xrslam | 14.66 | 14.55 / 16.99 / 17.01 | 202593.75 / 142417.79 (100%) |
+| a20_xrslam | 12.00 | 11.99 / 12.14 / 12.15 | 122356.12 / 80496.62 (100%) |
+
+(coverage = share of the odometry sample times from +30 s that got a georef pose; a15 cases: 38 indoor fixes, no fit.) With `scale_sigma=100` for the metric-but-collapsing XRSLAM streams (Outdoor-2 / ADVIO-20) the errors are still 97 / 86 and 274 / 142 m. **The georef is not a general replacement**: one global similarity cannot follow a drifting or re-initialising odometry (OKVIS2 Outdoor-1 47 / 42 m against the smoother's 6.1 / 7.4, complex_rtk 2.7 / 2.2 m against 0.08 / 0.09 with cm-accurate RTK fixes, o1_stella 16.3 / 5.5 against 5.0 / 6.9, XRSLAM collapse); it is the right tool only where the stream's shape is better than the fixes' low-frequency error, which is what the gait-scaled stella_vio stream on the phone sequences is. Where the stream is good it also helps the earlier list (o1_xrslam causal 4.03 vs 6.10 / live 6.11 for the smoother, o2_orb3mono batch 1.37 vs 2.64, m14_okvis free scale 1.46 / 1.40 vs 1.46 / 1.72) but those are single cases. The smoother default for all these cases is unchanged (switches off = byte-identical outputs, 14.7). A switch between smoother and georef by the ratio of the georef residual rms to the reported fix sigma is conceivable (phones 0.45 / 1.3 / 0.5-0.9, failures 2.3-9363, o1_xrslam 0.59 where the georef is fine, o2_orb3mono 2.3 where it is fine too) but is not clean enough to adopt.
+
+### 14.7 Baseline checks (new code is opt-in: `gf_georef*` are new files, `gf_fusion.c` / `gf_gait.c` / `gf_run.c` untouched; `phone_pipeline/check_baselines.sh` minus its stella_vio exact-port part, which was skipped because stella_vio is being changed by another agent)
+
+`gf_table.py` 893 numbers and `gf_gait_study.py fusion` 1578 numbers identical to `gnss_fusion/work/pre13/*.json` (0 differ), `compare_py.py` (8 cases) numbers identical to the saved `pre13/compare_py.json` (only wall-clock fields differ), `test_geo.py` PASS, new `test_georef.py` PASS (5 checks). `scores.json` of the three outdoor sequences: all 331 earlier numbers per sequence unchanged after adding the georef rows (only the timing strings differ).
+
+### 14.8 Open issues
+* Causal gain on ADVIO-20 is small (-1.8 %; the 0.84 gait scale of that person is not corrected by the fixes) and one run per row on a chaotic front end; Outdoor-1 / -2 are -18 / -23 %.
+* The georef is a global similarity: no drift model (forgetting costs accuracy on these 10-minute walks but would be needed for long VIO runs), no re-initialisation handling (new maps of the stream must already be metric-continuous, as the gait pipeline makes them), stationary starts only enter when the track spans 30 m. First aligned output at 31-37 s, as for the smoother.
+* The two stages run the smoother without the fixes, so tracking-loss stretches are bridged by the gait speed (PDR-like) and fixes in holes longer than 2.5 s are not used; the old GNSS-only nodes of the fix-in-smoother path are not in the georef path.
+* The fix statistics (40 s correlation, white part 0.3 m) come from two phone models / two datasets; other receivers or a better phone GNSS (dual frequency) will change `corr_s` and may favour the smoother again (complex_rtk: 0.08 m with the smoother). No automatic switch between the two.
+* Python GLS prototype only for the coloured-noise variant; no Gauss-Markov bias state in the C smoother.

@@ -110,6 +110,26 @@ def main():
                 tb = r.get('batch_tracked', {}); tc = r.get('causal30_tracked', {})
                 geo = f"{f(b.get('fix_rms'))} / {f(c.get('fix_rms'))}" if s in HAS_FIX and m != 'gait' else '-'
                 P(f"| {NAME[s]} | {v}+{m} | {f(b.get('se3'))} / {f(c.get('se3'))} | {f(b.get('sim3'))} / {f(c.get('sim3'))} | {f(b.get('scale'))} / {f(c.get('scale'))} | {b.get('coverage', 0) * 100:.0f}% / {c.get('coverage', 0) * 100:.0f}% | {f(tb.get('se3'))} / {f(tc.get('se3'))} | {geo} |")
+    # ---------------------------------------------------------------- section 14: slowly varying geo-referencing of the gait stream
+    P('\n### Live (causal) fusion against GNSS alone, outdoor sequences: ATE SE3 [m] batch / causal (section 14; `georef` = fix-free gait stream + one slowly varying similarity from all fixes so far, gf_georef)\n')
+    outs = [s for s in SEQS if s in sc and s in HAS_FIX]
+    P('| configuration | ' + ' | '.join(NAME[s] for s in outs) + ' | mean vs GNSS alone batch / causal |'); P('|---|' + '---|' * (len(outs) + 1))
+    def rel(key):
+        rb, rc = [], []
+        for s in outs:
+            if key not in sc[s]: return '-'
+            g_ = sc[s]['gnss_alone']['se3']; rb.append(sc[s][key]['batch']['se3'] / g_); rc.append(sc[s][key]['causal']['se3'] / g_)
+        return f"{(sum(rb) / len(rb) - 1) * 100:+.1f}% / {(sum(rc) / len(rc) - 1) * 100:+.1f}%"
+    P('| GNSS alone | ' + ' | '.join(f(sc[s]['gnss_alone']['se3']) for s in outs) + ' | |')
+    for lab, key in (('full, gait only (no fixes; not geo-referenced)', 'full|gait'), ('full + gait + GNSS (section 13 default: fixes in the smoother)', 'full|both'),
+                     ('**full, gait stream + georef (section 14)**', 'full|georef'), ('default + georef', 'default|georef'), ('rm + georef', 'rm|georef'), ('fullcal + georef', 'fullcal|georef')):
+        P(f'| {lab} | ' + ' | '.join(bc(key, sc[s], s) for s in outs) + f' | {rel(key)} |')
+    P('\nSim3 / scale / coverage / distance to the fixes of the georef rows (full):\n')
+    P('| sequence | SE3 b/c | Sim3 b/c | scale b/c | coverage b/c | rms distance to the fixes b/c |'); P('|---|---|---|---|---|---|')
+    for s in outs:
+        if 'full|georef' not in sc[s]: continue
+        r = sc[s]['full|georef']; b, c = r['batch'], r['causal']
+        P(f"| {NAME[s]} | {f(b.get('se3'))} / {f(c.get('se3'))} | {f(b.get('sim3'))} / {f(c.get('sim3'))} | {f(b.get('scale'))} / {f(c.get('scale'))} | {b.get('coverage', 0) * 100:.0f}% / {c.get('coverage', 0) * 100:.0f}% | {f(b.get('fix_rms'))} / {f(c.get('fix_rms'))} |")
     # ---------------------------------------------------------------- timing
     P('\n### Timing (CPU seconds, shared machine; sv_run = whole stella_vio run incl. ORB extraction at full resolution, single thread)\n')
     P('| sequence | frames | sv_run default CPU s (ms/frame) | sv_run full CPU s (ms/frame) | gait us/IMU sample | gf_run batch s | gf_run causal s (us/frame) |'); P('|---|---|---|---|---|---|---|')

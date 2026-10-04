@@ -82,6 +82,15 @@ in LICENSES/opengv-BSD-3-Clause.txt, alongside stella's BSD-2 notice.
 LICENSES/opengv-provenance.txt records the fetched notice hashes, URLs
 and OpenGV's acknowledgment of the original EPFL EPnP authors.
 
+PoseLib (stella_vio only)
+------------------------
+Source: https://github.com/PoseLib/PoseLib (read as reference; BSD-3-Clause, Copyright (c) 2020, Viktor Larsson),
+license text LICENSES/poselib-BSD-3-Clause.txt. c/sv_poselib.{c,h} are own C99 code that follows PoseLib's ideas: LO-RANSAC with
+MSAC scoring and local optimisation, Sampson-error relative-pose refinement and reprojection pose refinement with a Cauchy loss and
+Levenberg-Marquardt damping, P3P absolute pose. The minimal solver is Grunert's distance formulation and the Jacobians are central
+differences, so no PoseLib source is copied; the BSD-3 notice is kept because the structure follows PoseLib. The files are used only
+by opt-in switches (init_refine, init_lo, pnp_lo) and are not part of the exact port (stella_port/).
+
 Vocabulary data
 ---------------
 vocab/own_orb_v1.fbow is separately licensed CC-BY-4.0. Preserve its

@@ -44,6 +44,10 @@ typedef struct sv_system_params {
     float init_parallax_deg;           /* initializer parallax threshold, deg (port: 1.0) */
     unsigned int init_min_tri;         /* initializer min triangulated points (port: 50) */
     unsigned int init_seeds;           /* init RANSAC seeds tried, best kept by valid points (port: 1 = seed 5489 only) */
+    int init_refine;                   /* 1 = Sampson LM refinement of the initializer pose (PoseLib idea), default 0 */
+    int init_lo;                       /* 1 = 5pt LO-RANSAC initializer tried first, default 0 */
+    float init_lo_thr;                 /* init_lo inlier threshold, Sampson distance [px]; 0 = 2.0 */
+    int pnp_lo;                        /* 1 = P3P LO-RANSAC for relocalization and loop-candidate PnP, default 0 */
     float init_par_frac;               /* 0 = parallax of the 50th point (port); else at this fraction of the valid points */
     unsigned int init_hamm;            /* initializer matcher: max Hamming distance (port: 50) */
     float init_ratio;                  /* initializer matcher: Lowe ratio (port: 0.9) */

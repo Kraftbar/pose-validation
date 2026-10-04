@@ -10,10 +10,13 @@ c/gf_geo.{h,c}      WGS-84 LLA <-> ECEF <-> local ENU
 c/gf_fusion.{h,c}   fix + odometry input, causal sliding-window and batch smoother, robust loss, gating, consistency test, segments
 c/gf_math.h         internal helpers (3x3, quaternion, 5x5 block Cholesky / block-Thomas)
 c/gf_gait.{h,c}     gait (step cadence) speed prior from a phone IMU: step detector, cadence, speed model, still detector, online GNSS calibration
+c/gf_georef.{h,c}   slowly varying geo-referencing of a metric pose stream by ONE similarity from all fixes (section 14, opt-in)
+c/gf_georef_run.c   driver for gf_georef: stream + fixes in, geo-referenced stream out (causal = live, or batch)
 c/gf_run.c          command line driver (stdio, timers): text files in, TUM trajectory out, per-call timing
 c/gf_gait_run.c     driver for gf_gait: IMU csv in, per-epoch cadence / speed / state out
 c/Makefile          cc -std=c99 -O2 -Wall -Wextra -pedantic (no warnings)
-tools/              python validation: compare_py.py (C vs python), gf_table.py, gf_studies.py, test_geo.py, gf_cases.py, run_all.sh;
+tools/              python validation: compare_py.py (C vs python), gf_table.py, gf_studies.py, test_geo.py, test_georef.py, gf_georef_table.py (georef vs the gf_table case list),
+                    georef_gls_proto.py (rejected coloured-noise variant), gf_cases.py, run_all.sh;
                     gait.py (python prototype of gf_gait), check_gait.py (C vs python), gf_gait_study.py + gf_gait_report.py (section 12)
 ```
 
@@ -86,6 +89,17 @@ else if (e.state == GF_GAIT_STATIONARY) gf_add_speed(g, e.t, 0.0, e.sigma, e.win
 Config keys: `speed speed_k speed_sigma_scale speed_link_sigma zupt_sigma speed_align speed_scale_rw_rel speed_scale_lim speed_scale_rw`.
 Limits (section 12.8): walking only (cadence 1.0-2.8 Hz), step length is person dependent (ADVIO-20 person 8 % above the population constant), scale only (no
 yaw), scale that decays continuously or whole-map collapses are only partly rescued, causal zero-velocity limited by the measurement cadence.
+
+## Geo-referencing instead of fusing (section 14 of the study; opt-in, `gf_georef`)
+
+For streams whose shape is better than the low-frequency error of the fixes (phone fixes: a common error with a ~40 s correlation time, 5-14 m, reported sigma uninformative), bending the stream with a 30 s window makes the causal output WORSE than the raw fixes (section 13). `gf_georef` takes a metric,
+continuous stream (the fix-free output of `gf_run` with the gait prior, a VIO) and maps it with ONE similarity (yaw, scale shrunk towards 1 with `scale_sigma = 0.15`, translation) fitted to all (stream at the fix time, fix) pairs seen so far, Huber re-weighted, equal weights, white noise with the scale information divided by the fixes per correlation time (`corr_s = 40`).
+Phone pipeline outdoor sequences, ATE SE3 batch / causal live (GNSS alone 5.73 / 14.66 / 12.00): smoother with fixes 5.50 / 7.10, 13.28 / 15.10, 11.76 / 12.32; georef 5.36 / 4.71, 4.81 / 11.34, 11.76 / 11.79.
+```
+gnss_fusion/c/gf_run --odom odom.txt --fix none.txt ... --out-live stream.live     # stage A: no fixes (empty fix file), gait speed prior
+gnss_fusion/c/gf_georef_run --stream stream.live --fix fixes.txt --out geo.txt --mode causal     # stage B  (keys: min_fixes min_extent scale_sigma corr_s forget_s huber_k use_sigma max_gap_s ...)
+```
+Library: `gf_georef_create / add_pose / add_fix / map / solve / fit` (`c/gf_georef.h`). It is NOT a replacement of the smoother: a global similarity cannot follow a drifting or re-initialising odometry (earlier case list: far worse for OKVIS2 phone cases, complex with RTK fixes, collapsing XRSLAM; `tools/gf_georef_table.py`).
 
 ## API (see `c/gf_fusion.h`)
 

@@ -28,6 +28,9 @@ typedef struct sv_init_params {
     float reproj_err_thr; /* default 4.0 */
     unsigned int num_seeds; /* stella_vio: RANSAC seeds tried, best kept (1 = exact port: seed 5489) */
     float par_frac; /* stella_vio: 0 (default) = parallax of the 50th point; > 0 = of the point at this fraction of the valid points */
+    int refine; /* stella_vio (PoseLib idea, sv_poselib.h): 0 = off (exact); 1 = Sampson LM refinement of the selected hypothesis, inliers re-selected, re-triangulated */
+    int lo; /* stella_vio (PoseLib idea): 0 = off (exact); 1 = 5pt LO-RANSAC essential matrix tried first (fallback: the H/F path) */
+    float lo_thr_px; /* LO-RANSAC inlier threshold on the Sampson distance [px]; 0 = 2.0 */
 } sv_init_params;
 
 typedef enum sv_init_verdict {

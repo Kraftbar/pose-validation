@@ -1,4 +1,4 @@
-/* SV_PORT_SOURCES: sv_run.c sv_imu.c sv_imu_gyro.c sv_rot.c sv_system.c sv_loop.c sv_bow_db.c sv_g2o_sim3.c sv_sim3.c sv_eigen_lu3.c sv_map_match.c sv_eigen_svd.c sv_eigen_qr.c sv_rbtree.c sv_bundle_adjuster.c sv_g2o_ba.c sv_umap_order.c sv_eigen_amd.c sv_track_frame.c sv_frame_tracker.c sv_local_map.c sv_tracking.c sv_kf_insert.c sv_landmark_descriptor.c sv_match_robust.c sv_frame.c sv_undistort.c sv_bow.c sv_match_bow.c sv_eigen_mat4.c sv_linalg.c sv_eigen_quaternion.c sv_g2o_se3.c sv_g2o_edge.c sv_g2o_pose_optimizer.c sv_eigen_llt.c sv_solve_essential_5pt.c sv_solve_essential_ransac.c sv_eigen_fullpivlu.c sv_eigen_eigensolver.c sv_rng.c sv_relocalizer.c sv_pnp.c sv_eigen_pnp.c sv_extract.c sv_fast.c sv_image.c sv_init.c sv_map.c sv_match_area.c sv_solve_homography.c sv_solve_fundamental.c sv_solve_essential.c sv_solve_common.c sv_triangulate.c
+/* SV_PORT_SOURCES: sv_run.c sv_imu.c sv_imu_gyro.c sv_rot.c sv_system.c sv_loop.c sv_bow_db.c sv_g2o_sim3.c sv_sim3.c sv_eigen_lu3.c sv_map_match.c sv_eigen_svd.c sv_eigen_qr.c sv_rbtree.c sv_bundle_adjuster.c sv_g2o_ba.c sv_umap_order.c sv_eigen_amd.c sv_track_frame.c sv_frame_tracker.c sv_local_map.c sv_tracking.c sv_kf_insert.c sv_landmark_descriptor.c sv_match_robust.c sv_frame.c sv_undistort.c sv_bow.c sv_match_bow.c sv_eigen_mat4.c sv_linalg.c sv_eigen_quaternion.c sv_g2o_se3.c sv_g2o_edge.c sv_g2o_pose_optimizer.c sv_eigen_llt.c sv_solve_essential_5pt.c sv_solve_essential_ransac.c sv_eigen_fullpivlu.c sv_eigen_eigensolver.c sv_rng.c sv_relocalizer.c sv_pnp.c sv_poselib.c sv_eigen_pnp.c sv_extract.c sv_fast.c sv_image.c sv_init.c sv_map.c sv_match_area.c sv_solve_homography.c sv_solve_fundamental.c sv_solve_essential.c sv_solve_common.c sv_triangulate.c
  * SPDX-License-Identifier: BSD-2-Clause AND MIT
  *
  * sv_run: driver of the pure-C stella_vslam port (sv_system). The ONLY file of the port that uses stdio.
@@ -316,6 +316,18 @@ static int apply_set(sv_system_params* p, const char* kv) {
     }
     else if (!strcmp(key, "dr_sec")) {
         p->dr_max_sec = v;
+    }
+    else if (!strcmp(key, "init_refine")) {
+        p->init_refine = (int)v;
+    }
+    else if (!strcmp(key, "init_lo")) {
+        p->init_lo = (int)v;
+    }
+    else if (!strcmp(key, "init_lo_thr")) {
+        p->init_lo_thr = (float)v;
+    }
+    else if (!strcmp(key, "pnp_lo")) {
+        p->pnp_lo = (int)v;
     }
     else if (!strcmp(key, "init_seeds")) {
         p->init_seeds = (unsigned int)v;

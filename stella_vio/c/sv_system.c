@@ -40,6 +40,7 @@
 #include "sv_map.h"
 #include "sv_match_area.h"
 #include "sv_pnp.h"
+#include "sv_poselib.h"
 #include "sv_rot.h"
 #include "sv_triangulate.h"
 #include <math.h>
@@ -281,6 +282,10 @@ void sv_system_params_default(sv_system_params* p, const sv_bow_vocab* vocab) {
     p->init_max_level = 3;          /* stella_vio default (0 = exact port) */
     p->init_min_valid = 50;
     p->init_par_frac = 0.0f;
+    p->init_refine = 0;
+    p->init_lo = 0;
+    p->init_lo_thr = 0.0f;
+    p->pnp_lo = 0;
     p->init_seeds = 1;              /* opt-in: see RESULTS.md */
     p->imu = NULL;
     p->gyro_mode = 0;
@@ -602,7 +607,12 @@ static int hook_pnp(void* user, const double* b, const double* p, const int* oct
         s->pnp_inl = (unsigned int*)realloc(s->pnp_inl, s->pnp_cap * sizeof(unsigned int));
     }
     memset(&r, 0, sizeof(r));
-    rc = sv_pnp_ransac(b, p, oct, n, s->cfg.scale_factors, s->cfg.num_levels, 10, 30, 10, 0, NULL, &r, s->pnp_mask, NULL, NULL);
+    if (s->p.pnp_lo) {
+        rc = sv_pnp_lo_ransac(b, p, oct, n, s->cfg.scale_factors, s->cfg.num_levels, 10, 1000, NULL, &r, s->pnp_mask);
+    }
+    else {
+        rc = sv_pnp_ransac(b, p, oct, n, s->cfg.scale_factors, s->cfg.num_levels, 10, 30, 10, 0, NULL, &r, s->pnp_mask, NULL, NULL);
+    }
     if (rc != 0) {
         return -1;
     }
@@ -720,6 +730,7 @@ sv_system* sv_system_create(const sv_system_params* p) {
     s->trk.lost_max_sec = p->dr_max_sec;
     s->trk.keep_good = p->rframe;
     sv_reloc_config_init(&s->rcfg);
+    s->rcfg.pnp_lo = p->pnp_lo;
     s->db = sv_bow_db_create();
     s->tmp_kp = (sv_keypoint*)malloc(SV_SYS_MAX_KP * sizeof(sv_keypoint));
     s->tmp_desc = (uint8_t*)malloc((size_t)SV_SYS_MAX_KP * 32);
@@ -1541,6 +1552,9 @@ static int initialize(sv_system* s, sv_sys_fd* fd, sv_frame_result* res) {
     ip.reproj_err_thr = 4.0f;
     ip.par_frac = s->p.init_par_frac;
     ip.num_seeds = s->p.init_seeds;
+    ip.refine = s->p.init_refine;
+    ip.lo = s->p.init_lo;
+    ip.lo_thr_px = s->p.init_lo_thr;
     cam_matrix[0] = s->cfg.fx; cam_matrix[1] = 0; cam_matrix[2] = 0;
     cam_matrix[3] = 0; cam_matrix[4] = s->cfg.fy; cam_matrix[5] = 0;
     cam_matrix[6] = s->cfg.cx; cam_matrix[7] = s->cfg.cy; cam_matrix[8] = 1;

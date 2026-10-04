@@ -4,6 +4,8 @@
 #include "sv_solve_homography.h"
 #include "sv_solve_fundamental.h"
 #include "sv_linalg.h"
+#include "sv_poselib.h"
+#include "sv_solve_essential.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,6 +169,7 @@ static unsigned int sv_base_triangulate(
 }
 
 static void init_attempt(
+    int lo_mode, /* stella_vio init_lo: essential matrix by 5pt LO-RANSAC instead of the H/F RANSAC pair */
     uint32_t seed,
     const sv_keypoint* ref_keypts, unsigned int num_kp_ref, const double* ref_bearings,
     const sv_keypoint* cur_keypts, unsigned int num_kp_cur, const double* cur_bearings,
@@ -215,7 +218,28 @@ static void init_attempt(
         }
     }
 
-    {
+    double E_lo[9];
+    if (lo_mode) {
+        double* bb1 = (double*)malloc(sizeof(double) * 6 * num_matches);
+        double* bb2 = bb1 + 3 * num_matches;
+        unsigned int ninl = 0, k;
+        double thr = (params->lo_thr_px > 0.0f ? params->lo_thr_px : 2.0f) / ref_cam_matrix[0];
+        sv_mt19937 el;
+        for (k = 0; k < num_matches; ++k) {
+            memcpy(bb1 + 3 * k, ref_bearings + 3 * midx_ref[k], 3 * sizeof(double));
+            memcpy(bb2 + 3 * k, cur_bearings + 3 * midx_cur[k], 3 * sizeof(double));
+        }
+        sv_mt19937_seed(&el, seed);
+        sv_relpose_lo_ransac(bb1, bb2, num_matches, thr, 600, 100, &el, E_lo, out->inlier_f, &ninl);
+        free(bb1);
+        out->h_valid = 0;
+        out->f_valid = ninl >= 8;
+        out->cost_h = out->cost_f = 0.0f;
+        out->rel_cost_h = 1.0f;
+        memset(out->best_H21, 0, sizeof(out->best_H21));
+        memset(out->best_F21, 0, sizeof(out->best_F21));
+    }
+    else {
         sv_mt19937 eh, ef;
         sv_homography_ransac_result hres;
         sv_fundamental_ransac_result fres;
@@ -260,7 +284,12 @@ static void init_attempt(
         }
         else if (out->f_valid) {
             double rots4[4][9], transes4[4][3];
-            sv_solve_fundamental_decompose(out->best_F21, ref_cam_matrix, cur_cam_matrix, rots4, transes4);
+            if (lo_mode) {
+                sv_solve_essential_decompose(E_lo, rots4, transes4);
+            }
+            else {
+                sv_solve_fundamental_decompose(out->best_F21, ref_cam_matrix, cur_cam_matrix, rots4, transes4);
+            }
             memcpy(rots, rots4, sizeof(rots4));
             memcpy(transes, transes4, sizeof(transes4));
             out->model_chosen = SV_INIT_MODEL_F;
@@ -301,6 +330,44 @@ static void init_attempt(
             }
 
             out->selected_hyp = max_idx;
+
+            if (params->refine && nums_valid[max_idx] >= params->min_num_valid_pts) {
+                /* stella_vio init_refine: Sampson LM on the model inliers, inliers re-selected under the refined pose, LM again, re-triangulate */
+                double* bb1 = (double*)malloc(sizeof(double) * 6 * num_matches);
+                double* bb2 = bb1 + 3 * num_matches;
+                unsigned char* m2 = (unsigned char*)malloc(num_matches);
+                const double f = ref_cam_matrix[0];
+                double R[9], t[3], E[9];
+                unsigned int k;
+                memcpy(R, rots[max_idx], sizeof(R));
+                memcpy(t, transes[max_idx], sizeof(t));
+                for (k = 0; k < num_matches; ++k) {
+                    memcpy(bb1 + 3 * k, ref_bearings + 3 * midx_ref[k], 3 * sizeof(double));
+                    memcpy(bb2 + 3 * k, cur_bearings + 3 * midx_cur[k], 3 * sizeof(double));
+                }
+                if (sv_relpose_refine(bb1, bb2, num_matches, is_inlier_for_tri, 1.5 / f, 15, R, t) > 0) {
+                    sv_essential_from_pose(R, t, E);
+                    for (k = 0; k < num_matches; ++k) {
+                        m2[k] = fabs(sv_sampson(E, bb1 + 3 * k, bb2 + 3 * k)) < 2.0 / f;
+                    }
+                    sv_relpose_refine(bb1, bb2, num_matches, m2, 1.5 / f, 10, R, t);
+                    sv_essential_from_pose(R, t, E);
+                    for (k = 0; k < num_matches; ++k) {
+                        m2[k] = fabs(sv_sampson(E, bb1 + 3 * k, bb2 + 3 * k)) < 2.0 / f;
+                    }
+                    memcpy(rots[max_idx], R, sizeof(R));
+                    memcpy(transes[max_idx], t, sizeof(t));
+                    memcpy(out->hyps[max_idx].rot, R, sizeof(R));
+                    memcpy(out->hyps[max_idx].trans, t, sizeof(t));
+                    nums_valid[max_idx] = sv_base_triangulate(R, t, m2, midx_ref, midx_cur, num_matches, ref_keypts, num_kp_ref, ref_bearings,
+                                                              cur_keypts, cur_bearings, ref_cam, cur_cam, params->reproj_err_thr,
+                                                              hyp_tri[max_idx], hyp_istri[max_idx],
+                                                              &out->hyps[max_idx].num_triangulated_pts, &out->hyps[max_idx].parallax_cos);
+                    out->hyps[max_idx].num_valid_pts = nums_valid[max_idx];
+                }
+                free(bb1);
+                free(m2);
+            }
 
             if (nums_valid[max_idx] < params->min_num_valid_pts) {
                 pose_found = 0;
@@ -365,7 +432,14 @@ void sv_init_try_monocular(
     unsigned int nm = 0, i, best_score = 0;
     sv_init_attempt_result tmp;
     int have_best = 0;
-    init_attempt(seed_list[0], ref_keypts, num_kp_ref, ref_bearings, cur_keypts, num_kp_cur, cur_bearings, ref_matched_2_in_1,
+    if (params->lo) {
+        init_attempt(1, seed_list[0], ref_keypts, num_kp_ref, ref_bearings, cur_keypts, num_kp_cur, cur_bearings, ref_matched_2_in_1,
+                     ref_cam, cur_cam, ref_cam_matrix, cur_cam_matrix, params, out);
+        if (out->verdict == SV_INIT_SUCCESS) {
+            return;
+        }
+    }
+    init_attempt(0, seed_list[0], ref_keypts, num_kp_ref, ref_bearings, cur_keypts, num_kp_cur, cur_bearings, ref_matched_2_in_1,
                  ref_cam, cur_cam, ref_cam_matrix, cur_cam_matrix, params, out);
     if (n_seeds == 1) {
         return;
@@ -385,7 +459,7 @@ void sv_init_try_monocular(
     tmp.is_triangulated = (unsigned char*)malloc(num_kp_ref ? num_kp_ref : 1);
     for (k = 1; k < n_seeds; ++k) {
         memset(tmp.is_triangulated, 0, num_kp_ref ? num_kp_ref : 1);
-        init_attempt(seed_list[k], ref_keypts, num_kp_ref, ref_bearings, cur_keypts, num_kp_cur, cur_bearings, ref_matched_2_in_1,
+        init_attempt(0, seed_list[k], ref_keypts, num_kp_ref, ref_bearings, cur_keypts, num_kp_cur, cur_bearings, ref_matched_2_in_1,
                      ref_cam, cur_cam, ref_cam_matrix, cur_cam_matrix, params, &tmp);
         if (tmp.verdict == SV_INIT_SUCCESS && (!have_best || tmp.hyps[tmp.selected_hyp].num_valid_pts > best_score)) {
             int* m2 = out->matched_2_in_1;

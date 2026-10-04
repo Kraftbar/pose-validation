@@ -611,6 +611,21 @@
       "file": "reference_reloc/c/sv_eigen_pnp.h",
       "spdx": "MPL-2.0",
       "provenance": "Eigen algorithms/evaluation kernels; upstream paths in file comments and LICENSES/eigen-notices.txt"
+    },
+    {
+      "file": "c/sv_poselib.c",
+      "spdx": "BSD-3-Clause",
+      "provenance": "own C99 code following PoseLib ideas (LO-RANSAC/MSAC, Sampson and reprojection LM refinement with Cauchy loss, P3P); Copyright (c) 2020 Viktor Larsson, BSD-3-Clause, LICENSES/poselib-BSD-3-Clause.txt; no source copied"
+    },
+    {
+      "file": "c/sv_poselib.h",
+      "spdx": "BSD-3-Clause",
+      "provenance": "as c/sv_poselib.c"
+    },
+    {
+      "file": "c/check_sv_poselib.c",
+      "spdx": "MIT",
+      "provenance": "Project-authored harness for sv_poselib.c"
     }
   ]
 }

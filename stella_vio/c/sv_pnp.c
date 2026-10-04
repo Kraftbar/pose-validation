@@ -219,3 +219,9 @@ int sv_pnp_ransac(const double *b,const double *p,const int *octaves,unsigned n,
     }
     free(threshold);free(temp);free(x);free(y);return rc;
 }
+
+/* Exported views of the two static helpers above for sv_poselib.c (pnp_lo); unchanged behaviour of sv_pnp_ransac. */
+float sv_pnp_radial_threshold(float scale){return radial_threshold(scale);}
+unsigned sv_pnp_check_inliers(const double *b,const double *p,const float *threshold,unsigned n,const double *r,const double *t,unsigned char *mask,double *cost){
+    return check_inliers(b,p,threshold,n,r,t,mask,cost);
+}
