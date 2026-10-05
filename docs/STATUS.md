@@ -1,0 +1,77 @@
+# Status (2026-10-05)
+
+Entry point for new sessions. Short on purpose; details live in the linked files.
+
+## What this repo is
+
+A hands-on SLAM/VO/VIO survey and lab:
+
+- Benchmark systems.
+- Port the best permissive ones to bit-exact C99, to read how they really reach their numbers.
+- Build our own phone/drone stack from the best pieces.
+
+Learned methods are out of scope. GPL code may be read for understanding, but never translated into permissive folders.
+
+## Parts
+
+| Folder | What | State | Read first |
+|---|---|---|---|
+| `stella_port/` | stella_vslam mono, bit-exact | complete | `stella_port/HANDOVER.md` (top) |
+| `okvis_port/` | OKVIS2 (drone winner), bit-exact | M1–M7d done; backend, solver, frontend, RANSAC and place recognition native | `okvis_port/HANDOVER.md`, `PLAN.md` |
+| `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | M1–M5 done; window solve fully native | `rdvio_port/HANDOVER.md`, `PLAN.md` |
+| `stella_vio/` | our modified copy of stella_port | re-init, IMU, R-frames, merge, PoseLib-style solvers, gait scale servo (all opt-in beyond defaults) | `stella_vio/README.md`, `RESULTS.md` |
+| `gnss_fusion/` | our C GNSS fusion | smoother, gait speed prior, georef, auto switch, gait regularity gate | `gnss_fusion/README.md` |
+| `phone_pipeline/` | stella_vio → gait → fusion, live | beats GNSS alone outdoors (live 4.31 / 11.33 / 11.82 vs 5.73 / 14.66 / 12.00 m); indoor 0.6–0.8 m with servo | `phone_pipeline/README.md` |
+| `orb_port/` | ORB-SLAM2 port (GPL) | private, never committed | `docs/orb_port_handover.md` |
+
+## Benchmarks and survey
+
+- **VIO candidates and EuRoC:** `docs/vio_candidates_20261001.md`, about 30 systems surveyed and 17 run.
+  - Stereo: OKVIS2 0.023 m.
+  - Mono+IMU: ORB-SLAM3 0.053 (GPL), OKVIS2 0.064.
+- **Phones and GNSS:** `docs/gnss_vio_benchmark_20261001.md`. Sections 8–17 cover the phone studies, gnss_fusion, the pipeline, live mode and gait.
+- **Drones:** `docs/drone_benchmark_20261002.md`. OKVIS2 is best, and OKVIS2-X has a yaw-init failure.
+- **Diagnosis and planning:**
+  - Phone scale: `docs/phone_scale_diagnosis_20261003.md` (errors-in-variables bias).
+  - Roadmap: `docs/roadmap_research_20261003.md`.
+  - Building blocks: `docs/building_blocks_20261003.md`.
+- **Repo's own 30 s benchmark:** `runs/benchmark/`. The README matrix is stale against the regenerated numbers; it has not been updated.
+
+## How to verify (all must pass before committing)
+
+- `python3 tools/check_stella_port.py`: 56/56 PASS.
+- `python3 tools/check_okvis_port.py --tag m8,s8 --native-solve 1 --eigen-tests`: all PASS. The dumps live in `runs/okvis_port/reference_runs/MH_01_easy/{m8,s8}`.
+- `python3 tools/check_rdvio_port.py --modules m4,m5 --oracle --seeds 1,2,3 --tag4 m5 --tag5 m5`.
+  - The m1 row uses tag `m1`.
+  - m2/m3 need the `m23` dump regenerated (about 2 min).
+- `bash phone_pipeline/check_baselines.sh <tmpdir>`: the stella_vio exact port must be cmp-identical, and the fusion tables must show 0 differences.
+- `gnss_fusion/tools/test_auto.py`: 6/6 PASS.
+- Use `external/gnss/venv/bin/python` for any numpy script.
+
+## Rules that bit before
+
+- Never commit:
+  - `orb_port/`
+  - `simple_slam_c_plus.c` and `simple_slam_c_plus_config.h` (they include a GPL header)
+  - `run_orbslam_benchmark.py`
+  - the ORB row in `docs/rejected_trials.md`
+  - binaries, data, dumps, `gnss_fusion/*.whl`
+  - the large `.fbow`
+  - `tools/*/gpl_glue`
+
+  `.git/info/exclude` covers most of these.
+- A global `Makefile` ignore rule exists. New Makefiles need `git add -f`.
+- Agents must use their own image directories and never delete data they did not create. Disk is tight; keep about 20 GB free.
+- The `$5` monthly spend cap kills agents mid-task. Resume them with SendMessage.
+
+## Open decisions and next steps
+
+1. **Push blocked:** local commit `a2dc6c8` (OKVIS2 M7c–M7d) contains `okvis_port/c/ok_dbow.*`, a DBoW2 source port. DBoW2's licence requires notifying the author on redistribution, and the repo is public. Choose one: notify the author and then push, push without `ok_dbow`, or push and notify afterwards.
+2. **OKVIS2:** hook up Codex's BRISK (`ok_fe_add_frame`), then the system driver, giving a full C run.
+3. **RD-VIO:**
+   - M7: OpenCV CLAHE, LK and GFTT. This is the biggest risk.
+   - Then M6 map, M8 frontend, M9 initializer, M10 tracker and M11 handler.
+4. **Phone stack:**
+   - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
+   - Indoor-2 live error is still twice the final error.
+5. **Optional:** a Basalt port (BSD, fast stereo); your own Android recordings with raw GNSS and RTK ground truth.
