@@ -44,6 +44,14 @@ Foundation and the OpenCV contributors, BSD-3-Clause / Apache-2.0 since 4.5; the
 to endorse derived products), and the Eigen 3.4.0 AngleAxis / Quaternion / stableNorm evaluation order (MPL-2.0); the file is
 therefore dual-licensed BSD-3-Clause AND MPL-2.0. Patch 0011-backend-call-log.patch only instruments the OKVIS2 tree under
 runs/ and is never distributed.
+Module 7b (frontend data association): ok_frontend.{h,c} (Frontend::dataAssociationAndInitialization without place recognition:
+matchToMap with its per-segment matcher, matchMotionStereo, matchStereo, removeOutliers, doWeNeedANewKeyframe, the correspondence
+lists of OpenGV's FrameNoncentralAbsoluteAdapter / FrameRelativeAdapter as OKVIS2 wrote them) and ok_triangulate.c (okvis
+triangulation::triangulateFast) are OKVIS2-derived (BSD-3-Clause, same notices as above) with Eigen 3.4.0 evaluation-order models
+(MPL-2.0) and the OpenCV 4.6 filled cv::circle rasteriser of ok_vsb_geom.c; the files are dual-licensed BSD-3-Clause AND MPL-2.0.
+The OpenGV algorithms themselves (GP3P, Stewenius 5-point, rotation-only; BSD-3-Clause, Laurent Kneip / ANU, with the OKVIS2
+adapters) are not ported yet: the harness answers them from the reference log. Patch 0012-frontend-input-log.patch only
+instruments the OKVIS2 tree under runs/ and is never distributed.
 The reference build (runs/okvis_port/reference_build) links Ceres (BSD-3 + Apache-2.0 parts), glog, gflags, OpenCV,
 Boost, OpenBLAS and is never distributed. Dumps and datasets under runs/ are EuRoC-derived (non-commercial) and
 must never be committed. See docs/okvis2_license_audit.md.

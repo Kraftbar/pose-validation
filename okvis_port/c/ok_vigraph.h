@@ -176,6 +176,7 @@ int ok_vg_set_pose(ok_vg* g, uint64_t id, const double T7[7]);
 int ok_vg_set_speed_and_bias(ok_vg* g, uint64_t id, const double sb[9]);
 int ok_vg_set_extrinsics(ok_vg* g, uint64_t id, int cam, const double T7[7]);
 int ok_vg_pose_values(const ok_vg* g, uint64_t id, double out7[7]);
+int ok_vg_extrinsics_values(const ok_vg* g, uint64_t id, int cam, double out7[7]);
 int ok_vg_sb_values(const ok_vg* g, uint64_t id, double out9[9]);
 
 /* estimator */

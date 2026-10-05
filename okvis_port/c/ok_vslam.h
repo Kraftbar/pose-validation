@@ -46,6 +46,7 @@
  *   148 SETPOSE u64 id, T7   149 SETSB u64 id, f64 sb[9]   150 SETEXTR u64 id, u32 cam, T7   151 CLEAR
  *   153 FINALBA u32 numIter, f64 extrinsicsPositionUncertainty, f64 extrinsicsOrientationUncertainty
  *   160 ML       u64 frame, u32 cam, u32 kp, u64 landmark id       (every MultiFrame::setLandmarkId, whoever calls it)
+ *   161 DESC / 162 RANSAC (patch 0012, the frontend's inputs; layouts in ok_frontend.h) are not backend calls: skipped here
  */
 #ifndef OK_VSLAM_H
 #define OK_VSLAM_H
@@ -56,7 +57,7 @@
 enum { OK_B_ADDCAM = 128, OK_B_ADDIMU, OK_B_ADDSTATES, OK_B_SETKF, OK_B_ADDLM_ID, OK_B_ADDLM_NEW, OK_B_SETLM, OK_B_SETCLASS,
        OK_B_ADDOBS, OK_B_RMOBS, OK_B_SETOBSINFO, OK_B_MERGELMS, OK_B_MERGELM, OK_B_APPLYSTRATEGY, OK_B_OPTRT, OK_B_OPTFULL,
        OK_B_SYNC, OK_B_CLEANLM, OK_B_LCATTEMPT, OK_B_ADDLCFRAME, OK_B_SETPOSE, OK_B_SETSB, OK_B_SETEXTR, OK_B_CLEAR,
-       OK_B_DETRADIUS, OK_B_FINALBA, OK_B_ML = 160, OK_B_RESULT = 0x100 };
+       OK_B_DETRADIUS, OK_B_FINALBA, OK_B_ML = 160, OK_B_DESC = 161, OK_B_RANSAC = 162, OK_B_RESULT = 0x100 };
 
 #define OK_VSB_MAXCAM 4
 
@@ -65,6 +66,7 @@ typedef struct ok_vsb ok_vsb;
 /* the keypoint data of a multiframe as the overlap computation needs it */
 typedef struct ok_vsb_cam_view {
     int rows, cols, nkp, images_cleared;      /* images_cleared: MultiFrame::clearAllImages() was called (image(i).empty()) */
+    double T_SC[7];                           /* MultiFrame::T_SC(i) (set by addStates; the NCameraSystem extrinsics) */
     float* kp;                                /* nkp x {x, y, size} */
     uint64_t* lm;                             /* landmark id per keypoint */
 } ok_vsb_cam_view;
@@ -150,6 +152,13 @@ const ok_idset* ok_vsb_loop_closure_frames(const ok_vsb* b);
 uint64_t ok_vsb_current_state_id(const ok_vsb* b);
 uint64_t ok_vsb_most_overlapped_state_id(const ok_vsb* b, uint64_t frame, int consider_loop_closure_frames);
 double ok_vsb_overlap_fraction(const ok_vsb* b, uint64_t frame_a, uint64_t frame_b);
+
+/* read access for the frontend (module 7b): the multiframe of a state (NULL if absent), the number of multiframes
+ * (ViSlamBackend::numFrames), the camera model of camera `cam` (as logged by addStates), isInImuWindow */
+const ok_vsb_frame_view* ok_vsb_frame(const ok_vsb* b, uint64_t id);
+int ok_vsb_num_frames(const ok_vsb* b);
+const ok_cam* ok_vsb_camera(const ok_vsb* b, int cam);
+int ok_vsb_is_in_imu_window(const ok_vsb* b, uint64_t id);
 
 /* ViGraph::optimise on the C graph (ok_vsolve.c): builds the Ceres problem from the graph's Problem bookkeeping in program
  * order, runs the module-4 solver and writes the changes back (parameter blocks in place, IMU re-integration state);

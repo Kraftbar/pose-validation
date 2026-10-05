@@ -694,6 +694,7 @@ int ok_vg_set_pose(ok_vg* g, uint64_t id, const double T7[7]) { state* s = st_ge
 int ok_vg_set_speed_and_bias(ok_vg* g, uint64_t id, const double sb[9]) { state* s = st_get(g, id); if (!s) return 0; memcpy(s->sb->x, sb, sizeof(double) * 9); return 1; }
 int ok_vg_set_extrinsics(ok_vg* g, uint64_t id, int cam, const double T7[7]) { state* s = st_get(g, id); if (!s) return 0; memcpy(s->extr[cam]->x, T7, sizeof(double) * 7); return 1; }
 int ok_vg_pose_values(const ok_vg* g, uint64_t id, double out7[7]) { state* s = st_get(g, id); if (!s) return 0; memcpy(out7, s->pose->x, sizeof(double) * 7); return 1; }
+int ok_vg_extrinsics_values(const ok_vg* g, uint64_t id, int cam, double out7[7]) { state* s = st_get(g, id); if (!s || cam < 0 || cam >= MAXCAM || !s->extr[cam]) return 0; memcpy(out7, s->extr[cam]->x, sizeof(double) * 7); return 1; }
 int ok_vg_sb_values(const ok_vg* g, uint64_t id, double out9[9]) { state* s = st_get(g, id); if (!s) return 0; memcpy(out9, s->sb->x, sizeof(double) * 9); return 1; }
 
 /* ------------------------------------------------------------------------------------------------------------------

@@ -399,6 +399,7 @@ int ok_vsb_add_states(ok_vsb* b, ok_time t, const ok_imu_meas* meas, size_t n, i
     f->alive = 1; f->ncam = ncam; b->nframes_alive++;
     for (c = 0; c < ncam; ++c) {
         f->cam[c].rows = cams[c].rows; f->cam[c].cols = cams[c].cols; f->cam[c].nkp = cams[c].nkp;
+        memcpy(f->cam[c].T_SC, cams[c].T_SC, sizeof(double) * 7);
         f->cam[c].kp = (float*)malloc(sizeof(float) * 3 * (size_t)(cams[c].nkp ? cams[c].nkp : 1));
         if (cams[c].nkp) memcpy(f->cam[c].kp, cams[c].kp, sizeof(float) * 3 * (size_t)cams[c].nkp);
         f->cam[c].lm = (uint64_t*)calloc((size_t)(cams[c].nkp ? cams[c].nkp : 1), sizeof(uint64_t));
@@ -608,6 +609,11 @@ double ok_vsb_overlap_fraction(const ok_vsb* b, uint64_t ida, uint64_t idb) {
     if (!fa || !fb) return 0.0;
     return ok_vsb_overlap(fa, fb, b->kptradius);
 }
+
+const ok_vsb_frame_view* ok_vsb_frame(const ok_vsb* b, uint64_t id) { return (id < (uint64_t)b->nframes_alloc && b->frames[id].alive) ? &b->frames[id] : NULL; }
+int ok_vsb_num_frames(const ok_vsb* b) { return b->nframes_alive; }
+const ok_cam* ok_vsb_camera(const ok_vsb* b, int cam) { return (cam >= 0 && cam < OK_VSB_MAXCAM && b->cam_header[cam]) ? &b->cam_model[cam] : NULL; }
+int ok_vsb_is_in_imu_window(const ok_vsb* b, uint64_t id) { return (id < (uint64_t)b->naux_alloc && b->aux[id].alive) ? b->aux[id].is_imu : 0; }
 
 uint64_t ok_vsb_current_state_id(const ok_vsb* b) { return cur_state((ok_vsb*)b); }
 const ok_idset* ok_vsb_key_frames(const ok_vsb* b) { return &b->key_frames; }

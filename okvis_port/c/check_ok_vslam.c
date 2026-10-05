@@ -18,6 +18,9 @@
 #define main check_vigraph_unused_main
 #include "check_ok_vigraph.c"
 #undef main
+#ifdef OK_VSLAM_AS_LIB                 /* included by check_ok_frontend.c: keep this harness' main out of the way */
+#define main check_vslam_unused_main
+#endif
 #include "ok_vslam.h"
 
 static FILE* V_f;
@@ -77,22 +80,46 @@ static void handle_problem_rec(const rec* r) {
       revs_push(&s->ev, &e); }
 }
 
-/* the next record with tag >= 32 (Problem records are consumed on the way); pushed-back record support */
-static int G_peeked; static lrec G_peek;
+/* the next record with tag >= 32 (Problem records are consumed on the way); look-ahead queue (unget / peek).
+ * Records 161 (descriptors) and 162 (RANSAC) of patch 0012 are passed to G_aux_hook (check_ok_frontend) or skipped. */
+static void (*G_aux_hook)(uint32_t tag, const unsigned char* p, size_t len);
+static void (*G_setkf_hook)(uint64_t id, int flag);
+static lrec* G_q; static int G_qn, G_qcap;
 static int read_rec(lrec* out) {
     rec r;
     for (;;) {
         if (!rd_rec(V_f, &r, &V_buf, &V_cap)) return 0;
         if (r.tag >= 1 && r.tag <= 10) { handle_problem_rec(&r); continue; }
         if (r.tag < 32) continue;
+        if (r.tag == 161 || r.tag == 162) { if (G_aux_hook) G_aux_hook(r.tag, r.p, (size_t)r.len); continue; }
         out->tag = r.tag; out->len = (size_t)r.len;
         out->p = (unsigned char*)malloc(out->len ? out->len : 1);
         if (out->len) memcpy(out->p, r.p, out->len);
         return 1;
     }
 }
-static int get_rec(lrec* out) { if (G_peeked) { *out = G_peek; G_peeked = 0; return 1; } return read_rec(out); }
-static void unget_rec(const lrec* r) { G_peek = *r; G_peeked = 1; }
+static void q_push_front(const lrec* r) {
+    if (G_qn == G_qcap) { G_qcap = G_qcap ? 2 * G_qcap : 8; G_q = (lrec*)realloc(G_q, sizeof(lrec) * (size_t)G_qcap); }
+    memmove(G_q + 1, G_q, sizeof(lrec) * (size_t)G_qn); G_q[0] = *r; G_qn++;
+}
+static void q_push_back(const lrec* r) {
+    if (G_qn == G_qcap) { G_qcap = G_qcap ? 2 * G_qcap : 8; G_q = (lrec*)realloc(G_q, sizeof(lrec) * (size_t)G_qcap); }
+    G_q[G_qn++] = *r;
+}
+static int get_rec(lrec* out) {
+    if (G_qn > 0) { *out = G_q[0]; memmove(G_q, G_q + 1, sizeof(lrec) * (size_t)(G_qn - 1)); G_qn--; return 1; }
+    return read_rec(out);
+}
+static void unget_rec(const lrec* r) { q_push_front(r); }
+/* make sure the queue holds at least one record (reads at most ONE record ahead: an entry record, which precedes the Problem
+ * records of its own mutations, so the events of the C side and the log stay in step) */
+#ifdef OK_VSLAM_AS_LIB
+static int peek_rec(lrec* out) {
+    if (G_qn == 0) { lrec r; if (!read_rec(&r)) return 0; q_push_back(&r); }
+    *out = G_q[0];
+    return 1;
+}
+#endif
 
 /* zero the pointer fields of a logged record so that it can be compared with the C bytes (which carry zeros there) */
 static void mask_ptrs(int op, int is_res, unsigned char* p, size_t n) {
@@ -283,6 +310,7 @@ static void expect_result(int tag, const obuf* mine) {
     cmp_bytes(&C_bres, tag, 1, mine->p, mine->n, lr.p, lr.len);
     lrec_free(&lr);
 }
+static int G_lc_ret; static uint64_t* G_lc_lms; static int G_lc_nl;     /* last LCATTEMPT verdict / ADDLCFRAME landmarks (check_ok_frontend) */
 static void res_ids(int tag, const uint64_t* ids, int n) {
     obuf o; int i; memset(&o, 0, sizeof o);
     ob_u32(&o, (uint32_t)n);
@@ -335,7 +363,7 @@ static void handle_b(const lrec* r) {
             free(m);
             break;
         }
-        case OK_B_SETKF: { uint64_t id = cu64(&a); ok_vsb_set_keyframe(V_b, id, (int)cu32(&a)); break; }
+        case OK_B_SETKF: { uint64_t id = cu64(&a); int fl = (int)cu32(&a); if (G_setkf_hook) G_setkf_hook(id, fl); ok_vsb_set_keyframe(V_b, id, fl); break; }
         case OK_B_ADDLM_ID: { uint64_t id = cu64(&a); double hp[4]; int in; cf64n(&a, hp, 4); in = (int)cu32(&a); ok_vsb_add_landmark_id(V_b, id, hp, in); break; }
         case OK_B_ADDLM_NEW: { double hp[4]; int in; cf64n(&a, hp, 4); in = (int)cu32(&a); ok_vsb_add_landmark(V_b, hp, in); break; }
         case OK_B_SETLM: { uint64_t id = cu64(&a); double hp[4]; cf64n(&a, hp, 4); ok_vsb_set_landmark(V_b, id, hp, (int)cu32(&a)); break; }
@@ -373,6 +401,7 @@ static void handle_b(const lrec* r) {
             uint64_t pi = cu64(&a), pj = cu64(&a); double T[7], info[36], drift; int skip = 0, ret; obuf o;
             cf64n(&a, T, 7); cf64n(&a, info, 36); drift = cf64(&a);
             ret = ok_vsb_attempt_loop_closure(V_b, pi, pj, T, info, drift, &skip);
+            G_lc_ret = ret;
             memset(&o, 0, sizeof o); ob_u32(&o, ret ? 1u : 0u); ob_u32(&o, skip ? 1u : 0u);
             expect_result(OK_B_LCATTEMPT, &o); free(o.p);
             break;
@@ -380,7 +409,8 @@ static void handle_b(const lrec* r) {
         case OK_B_ADDLCFRAME: {
             uint64_t id = cu64(&a); int skip = (int)cu32(&a); uint64_t* lm; int nl;
             ok_vsb_add_loop_closure_frame(V_b, id, skip, &lm, &nl);
-            res_ids(OK_B_ADDLCFRAME, lm, nl); free(lm);
+            res_ids(OK_B_ADDLCFRAME, lm, nl);
+            free(G_lc_lms); G_lc_lms = lm; G_lc_nl = nl;
             break;
         }
         case OK_B_SETPOSE: { uint64_t id = cu64(&a); double T[7]; cf64n(&a, T, 7); ok_vsb_set_pose(V_b, id, T); break; }

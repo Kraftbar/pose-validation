@@ -25,6 +25,8 @@ TwoPose* terms, updateLandmarks) and problem.bin (check_ok_problem: ceres::Probl
 patch 0009 / --graph-dump (m5, s5). check_ok_vigraph replays the ViGraph mutation log of patch 0010 that
 the same problem.bin carries from tag m6/s6 on (see okvis_port/c/ok_vigraph.h). check_ok_vslam (module 6) replays the
 ViSlamBackend entry records of patch 0011 (tags m7/s7 on) through the C backend and compares every graph call it makes.
+check_ok_frontend (module 7b) additionally runs the C frontend on the logged descriptors of patch 0012 (tags m8/s8 on, the
+consolidated run: tools/run_okvis_reference.py --consolidated) and compares every backend call the frontend makes.
 
 --eigen-tests additionally builds okvis_port/reference_tools/eigen_*_test.cc against the real Eigen 3.4.0
 (external/vio/deps, flags -O2 -DNDEBUG -ffp-contract=off -fno-fast-math) and runs them (random-case,
@@ -119,6 +121,24 @@ def has_backend_log(dump_dir):
     return False
 
 
+def has_frontend_log(dump_dir):
+    """True if problem.bin carries the frontend inputs of patch 0012 (record 161: the BRISK descriptors of a multiframe)."""
+    path = dump_dir / "problem.bin"
+    if not path.exists():
+        return False
+    import struct
+    with open(path, "rb") as f:
+        for _ in range(400):
+            h = f.read(12)
+            if len(h) < 12:
+                return False
+            tag, ln = struct.unpack("<IQ", h)
+            if tag == 161:
+                return True
+            f.seek(ln, 1)
+    return False
+
+
 def eigen_tests():
     """Build+run the C++ cross-checks against real Eigen / the real OKVIS2 classes. Returns list of (name, ok)."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -175,7 +195,7 @@ def main():
     ap.add_argument("--native-solve", type=int, default=0, metavar="N",
                     help="check_ok_vslam: solve every Nth graph optimise() natively on the C graph (ok_sv_solve) instead of "
                          "applying the logged solver output, and compare the result with the log (1 = every solve)")
-    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*,check_ok_vigraph*,check_ok_vslam*",
+    ap.add_argument("--harness", default="check_ok_imu*,check_ok_kin*,check_ok_cam*,check_ok_param*,check_ok_err*,check_ok_solve*,check_ok_graph*,check_ok_problem*,check_ok_vigraph*,check_ok_vslam*,check_ok_frontend*",
                     help="comma-separated globs of okvis_port/c/ harnesses that consume the reference dumps "
                          "(other modules, e.g. check_ok_brisk*, have their own dump trees/runners)")
     args = ap.parse_args()
@@ -216,11 +236,13 @@ def main():
                 continue  # tag recorded before patch 0010 (no ViGraph mutation records in problem.bin)
             if name.startswith("check_ok_vslam") and not has_backend_log(dump_dir):
                 continue  # tag recorded before patch 0011 (no backend entry records in problem.bin)
-            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem", "check_ok_vigraph", "check_ok_vslam")) and not list(dump_dir.glob("imu_*.bin")):
+            if name.startswith("check_ok_frontend") and not has_frontend_log(dump_dir):
+                continue  # tag recorded before patch 0012 (no descriptor records in problem.bin)
+            if not name.startswith(("check_ok_solve", "check_ok_graph", "check_ok_problem", "check_ok_vigraph", "check_ok_vslam", "check_ok_frontend")) and not list(dump_dir.glob("imu_*.bin")):
                 continue  # solver/graph-only tag (m4/s4/m5/s5): no M1-M3 dumps
             cmd = [str(exe), seq, "-", str(dump_dir)] + ([str(args.max)] if args.max > 0 else [])
             env = dict(os.environ)
-            if name.startswith("check_ok_vslam") and args.native_solve > 0:
+            if name.startswith(("check_ok_vslam", "check_ok_frontend")) and args.native_solve > 0:
                 env["OK_NATIVE_SOLVE"] = str(args.native_solve)
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
             lines = proc.stdout.rstrip().splitlines()

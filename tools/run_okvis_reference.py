@@ -4,7 +4,9 @@
     python3 tools/run_okvis_reference.py MH_01_easy --tag run1 [--dump] [--dump-every eval=50]
            [--solve-dump --solve-every 20 --solve-full-every 4]   (M4 solver dump, patch 0008)
            [--graph-dump [--graph-lm-every 2 --graph-lm-sub 8 --graph-tpeval-every 50]]   (M5 graph dump, patch 0009;
-            from patch 0010 on problem.bin also carries the ViGraph mutation log of module M5d)
+            from patch 0010 on problem.bin also carries the ViGraph mutation log of module M5d, from 0011 the backend entry
+            records, from 0012 the frontend descriptors / RANSAC runs)
+           [--consolidated]   (all of the above in one run with the sampling of tags m8 / s8)
 
 Dataset: external/vio/data/<seq>/mav0 (tools/vio_harness/fetch_seq_stream.py). Outputs go to
 runs/okvis_port/reference_runs/<seq>/<tag>/ : final.csv (final trajectory), causal.csv (causal
@@ -18,6 +20,11 @@ REPO = Path(__file__).resolve().parent.parent
 V = REPO / "external/vio"
 BUILD = REPO / "runs/okvis_port/reference_build/build"
 CONFIG = REPO / "okvis_port/reference/configs/okvis_mono_euroc_deterministic.yaml"
+# sampling of the consolidated run (tags m8 mono / s8 stereo; patches 0003-0012 all active, problem.bin carries every record kind)
+CONSOLIDATED = dict(dump_every="prop=4,preint=4,append=20,eval=1000", kin_every="all=3000",
+                    err_every="all=1000,reproj=3000,llt=20,pplus=20,pplusj=40,pminusj=2000,hplus=300,hplusj=400,pose=10,sab=10,relpose=1,ctor=1",
+                    solve_every="100", solve_full_every="3", solve_sparse_full_every="4", graph_tpeval_every="200",
+                    graph_lm_every="8", graph_lm_sub="16", graph_problem_full_every="200")
 
 
 def main():
@@ -45,6 +52,9 @@ def main():
     ap.add_argument("--graph-lm-every", default=None, help="OKVIS_PORT_GRAPH_LM_EVERY: every Nth updateLandmarks call (default 2)")
     ap.add_argument("--graph-lm-sub", default=None, help="OKVIS_PORT_GRAPH_LM_SUB: every Kth landmark of a recorded call (default 8)")
     ap.add_argument("--graph-problem-full-every", default=None, help="OKVIS_PORT_GRAPH_PROBLEM_FULL_EVERY: full program order every Nth Solve (default 50)")
+    ap.add_argument("--consolidated", action="store_true", help="the one-run dump set of tags m8 / s8 (every dump kind the "
+                    "okvis_port harnesses need, sampled to ~2.5 GB mono / ~4 GB stereo): --dump --solve-dump --graph-dump with the "
+                    "sampling in CONSOLIDATED below; explicitly given sampling options win")
     ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--data-dir", default=None, help="dataset dir name under external/vio/data (default: seq); lets "
                     "several runs go in parallel on symlinked copies, outputs are written next to the dataset")
@@ -52,6 +62,11 @@ def main():
     ap.add_argument("--no-aslr", action="store_true", help="run under `setarch -R` (determinism stress test)")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VAL (e.g. MALLOC_PERTURB_=165)")
     args = ap.parse_args()
+    if args.consolidated:
+        args.dump = args.solve_dump = args.graph_dump = True
+        for k, v in CONSOLIDATED.items():
+            if getattr(args, k) is None:
+                setattr(args, k, v)
 
     root = V / "deps/root/usr"
     ocv = V / "deps/opencv"
