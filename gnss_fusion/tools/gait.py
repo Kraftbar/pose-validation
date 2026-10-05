@@ -48,6 +48,13 @@ class Config:
     on_sigma_max = 20.0
     on_prior_m = 150.0      # prior pseudo-distance [m] at k = 1
     k_min, k_max = 0.6, 1.6
+    # regularity gate (detector v2, section 17; reg = 0: the section-12 detector): a window whose step intervals / step amplitudes vary too much (coefficient of variation)
+    # or whose median amplitude is too small is OTHER, no speed
+    reg = 0
+    reg_iv_cv = 0.15
+    reg_amp_cv = 0.40
+    reg_amp_min = 0.0
+    reg_sigma_k = 3.0       # reg = 2: irregular windows stay WALK with sigma x this and regular = 0 (a consumer that needs a trustworthy speed skips them)
 
 
 class Gait:
@@ -141,8 +148,9 @@ class Gait:
     def estimate(self, t, window=None):
         c = self.c
         W = c.window_s if window is None else window
-        st = [s[0] for s in self.steps if t - W < s[0] <= t]
-        out = dict(t=t, window=W, n_steps=len(st), cadence=0.0, state=STATE_OTHER, speed=0.0, sigma=1.0)
+        sw = [s for s in self.steps if t - W < s[0] <= t]
+        st = [s[0] for s in sw]
+        out = dict(t=t, window=W, n_steps=len(st), cadence=0.0, state=STATE_OTHER, speed=0.0, sigma=1.0, regular=1)
         if self.n < 2: return out
         stationary = (math.sqrt(self.hp2) < c.stat_hp_rms and self.gn < c.stat_gyro and
                       (len(st) < 2 or t - st[-1] > 2.0))
@@ -152,12 +160,22 @@ class Gait:
         if len(st) >= c.min_steps and t - st[-1] <= c.max_last_age and st[-1] > st[0]:
             cad = (len(st) - 1) / (st[-1] - st[0])
             out['cadence'] = cad
-            if c.cad_min <= cad <= c.cad_max:
+            regular = True
+            if c.reg and len(sw) >= 3:
+                n = len(sw); sa = sa2 = si = si2 = 0.0; ni = 0
+                for i, (ts, am) in enumerate(sw):
+                    sa += am; sa2 += am * am
+                    if i > 0: iv = ts - sw[i - 1][0]; si += iv; si2 += iv * iv; ni += 1
+                ma = sa / n; va = max(sa2 / n - ma * ma, 0.0); mi = si / ni; vi = max(si2 / ni - mi * mi, 0.0)
+                if math.sqrt(vi) > c.reg_iv_cv * mi or math.sqrt(va) > c.reg_amp_cv * ma or ma < c.reg_amp_min: regular = False
+            if not regular and c.reg == 2: regular = True; out['regular'] = 0
+            if c.cad_min <= cad <= c.cad_max and regular:
                 v = self.model_speed(cad)
                 if v > 0.0:
                     out['state'] = STATE_WALK; out['speed'] = v; out['base'] = v / self.k
                     rel = self.rel
                     out['sigma'] = math.sqrt((rel * v) ** 2 + c.abs_sigma ** 2)
+                    if not out['regular']: out['sigma'] *= c.reg_sigma_k
         return out
 
     # --- online calibration (GNSS) -----------------------------------------------

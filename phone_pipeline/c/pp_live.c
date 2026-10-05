@@ -20,6 +20,7 @@
  *                           replayable with gnss_fusion/c/gf_auto_run) and PREFIX.timing (CPU seconds per stage)
  *   --pp-speed-out F        the gait speed measurements "t v sigma window flags" (for replays)
  *   --pp-fix F              fixes csv of the dataset (ns,E,N,U,hErr1,hErr2,vErr); without it nothing is geo-referenced (gait-scaled, arbitrary frame)
+ *   --pp-gait-set KEY=VAL   gait detector setting (gf_gait_config_set; repeatable), e.g. reg=2 = regularity gate v2 (section 17)
  *   --pp-gait-c C           per-user gait constant (default: generic 0.389)
  *   --pp-set key=value      gf_auto key (gf_auto_cfg.h); defaults = the phone pipeline of section 13/14 with the switch in AUTO
  *   --pp-lazy               process IMU / fixes only at tracked frames (reproduces the order of the offline file pipeline)
@@ -45,6 +46,7 @@ typedef struct {
     double g_t0, g_nxt;
     spd *sp; int nsp, spcap;
     int lazy, up_freeze, up_min, jump;
+    double hold_v, hold_t;                           /* last regular gait speed (servo hold, detector v2) */
     double servo_noise; unsigned long long rng;     /* --pp-servo-noise S: log-normal noise of sigma S on the speeds the servo sees (robustness test; the fusion keeps the clean speeds) */
     int have_prev, prev_map, prev_seg; double last_t;
     unsigned char *frozen; double (*Rg)[9]; int fcap;     /* per map id */
@@ -102,19 +104,24 @@ static void gz_pose(const double Rg[9], const double wc[16], double pz[3], doubl
     q[0] = qx; q[1] = qy; q[2] = qz; q[3] = qw;
 }
 
-static void push_speed(pp_t *P, double t, double v, double sg, double w, unsigned fl)
+static void push_speed(pp_t *P, double t, double v, double sg, double w, unsigned fl, int servo_ok)
 {
     if (P->nsp == P->spcap) { P->spcap = P->spcap ? P->spcap * 2 : 256; P->sp = (spd *)realloc(P->sp, sizeof(spd) * (size_t)P->spcap); }
     P->sp[P->nsp].t = t; P->sp[P->nsp].v = v; P->sp[P->nsp].sg = sg; P->sp[P->nsp].w = w; P->sp[P->nsp].fl = fl; ++P->nsp;
     if (P->fspd) fprintf(P->fspd, "%.9f %.6f %.6f %.3f %u\n", t, v, sg, w, fl);
-    if (P->sys) {      /* stella_vio gait scale servo (--set servo=G; ignored while off) */
+    if (P->sys) {      /* stella_vio gait scale servo (--set servo=G; ignored while off). Detector v2 (--pp-gait-set reg=2): an irregular epoch (servo_ok = 0) does not reach the
+                        * servo with its own speed; it gets the last regular speed (held up to 20 s, none before the first regular epoch) so that the servo's windows stay contiguous */
         double vs = v;
+        if (servo_ok == 1) { P->hold_v = v; P->hold_t = t; }
+        else if (servo_ok == 2) { }      /* stationary epoch: own speed (0), the hold is not touched */
+        else if (P->hold_t > -1e29 && t - P->hold_t <= 20.0) vs = P->hold_v;
+        else return;
         if (P->servo_noise > 0.0) {      /* Box-Muller from an LCG: deterministic */
             double u1, u2, z;
             P->rng = P->rng * 6364136223846793005ULL + 1442695040888963407ULL; u1 = ((double)(P->rng >> 11) + 1.0) / 9007199254740993.0;
             P->rng = P->rng * 6364136223846793005ULL + 1442695040888963407ULL; u2 = (double)(P->rng >> 11) / 9007199254740992.0;
             z = sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
-            vs = v * exp(P->servo_noise * z);
+            vs = vs * exp(P->servo_noise * z);
         }
         sv_system_push_speed(P->sys, t, vs);
     }
@@ -141,8 +148,8 @@ static void frame_hook(void *user, unsigned int frame, double ts, const sv_frame
         if (s->t >= P->g_nxt) {
             gf_gait_est e;
             gf_gait_estimate(P->gait, s->t, 6.0, &e);
-            if (e.state == GF_GAIT_WALK) push_speed(P, s->t, e.speed, e.sigma, e.window_s, 0);
-            else if (e.state == GF_GAIT_STATIONARY) push_speed(P, s->t, 0.0, e.sigma, e.window_s, GF_SPEED_STATIONARY);
+            if (e.state == GF_GAIT_WALK) push_speed(P, s->t, e.speed, e.sigma, e.window_s, 0, e.regular);
+            else if (e.state == GF_GAIT_STATIONARY) push_speed(P, s->t, 0.0, e.sigma, e.window_s, GF_SPEED_STATIONARY, 2);
             P->g_nxt += 3.0;
         }
     }
@@ -219,14 +226,15 @@ int main(int argc, char **argv)
     double gait_c = -1.0;
     char *av[256]; int nav = 0;
     gf_auto_config cfg;
-    const char *sets[32]; int nsets = 0;
+    const char *sets[32]; int nsets = 0; const char *gsets[16]; int ngsets = 0;
     memset(&PP, 0, sizeof PP);
-    PP.up_freeze = 150; PP.up_min = 5; PP.jump = 0; PP.g_t0 = -1.0;
+    PP.up_freeze = 150; PP.up_min = 5; PP.jump = 0; PP.g_t0 = -1.0; PP.hold_t = -1e30;
     for (int i = 0; i < argc && nav < 255; ++i) {
         if (!strcmp(argv[i], "--pp-out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--pp-speed-out") && i + 1 < argc) spout = argv[++i];
         else if (!strcmp(argv[i], "--pp-fix") && i + 1 < argc) fixp = argv[++i];
         else if (!strcmp(argv[i], "--pp-gait-c") && i + 1 < argc) gait_c = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--pp-gait-set") && i + 1 < argc && ngsets < 16) gsets[ngsets++] = argv[++i];
         else if (!strcmp(argv[i], "--pp-set") && i + 1 < argc && nsets < 32) sets[nsets++] = argv[++i];
         else if (!strcmp(argv[i], "--pp-lazy")) PP.lazy = 1;
         else if (!strcmp(argv[i], "--pp-up-freeze") && i + 1 < argc) PP.up_freeze = atoi(argv[++i]);
@@ -277,7 +285,16 @@ int main(int argc, char **argv)
         for (int i = 0; i < nsets; ++i) if (gf_auto_set(&cfg, sets[i])) { fprintf(stderr, "pp_live: bad --pp-set %s\n", sets[i]); return 2; }
     }
     PP.au = gf_auto_create(&cfg);
-    PP.gait = gf_gait_create(NULL);
+    {
+        gf_gait_config gc; gf_gait_config_default(&gc);
+        for (int i = 0; i < ngsets; ++i) {
+            const char *e = strchr(gsets[i], '='); char key[64];
+            if (!e || e - gsets[i] > 60) { fprintf(stderr, "pp_live: bad --pp-gait-set %s\n", gsets[i]); return 2; }
+            memcpy(key, gsets[i], (size_t)(e - gsets[i])); key[e - gsets[i]] = 0;
+            if (!gf_gait_config_set(&gc, key, atof(e + 1))) { fprintf(stderr, "pp_live: unknown gait key %s\n", key); return 2; }
+        }
+        PP.gait = gf_gait_create(&gc);
+    }
     if (!PP.au || !PP.gait) return 1;
     if (gait_c > 0) gf_gait_set_model(PP.gait, gait_c);
     gf_auto_set_clock(PP.au, cpu_now);

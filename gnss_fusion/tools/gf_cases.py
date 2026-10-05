@@ -10,7 +10,8 @@ import numpy as np
 REPO = Path('/home/nybo/github/pose-validation')
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-WORK = ROOT / 'work'
+import os
+WORK = Path(os.environ['GF_WORK']) if os.environ.get('GF_WORK') else ROOT / 'work'     # GF_WORK: scratch dir of an experiment (section 17), the canonical work/ is not touched
 GF_RUN = ROOT / 'c' / 'gf_run'
 sys.path.insert(0, str(REPO / 'tools')); sys.path.insert(0, str(REPO / 'tools' / 'gnss_harness')); sys.path.insert(0, str(REPO))
 import gnss_loose_fusion as lf  # noqa: E402  (the python reference, own code)
@@ -143,7 +144,7 @@ def write_fixes(path, gps):
 def run_c(case, mode, cfg=(), tag='', odom_tr=None, lookahead=None, timing=False, up_raw=False, speed_file=None):
     """run gf_run on a case. Returns dict(out=array Nx8, live=array or None, wall=s, stdout=str). odom_tr overrides the prepared trajectory.
     up_raw: pass the raw (un-rotated) trajectory with the gravity direction to the library instead of pre-rotating (exercises gf_set_gravity)."""
-    WORK.mkdir(exist_ok=True)
+    WORK.mkdir(parents=True, exist_ok=True)
     base = WORK / f'{case.name}{tag}_{mode}'
     if up_raw and case.up is not None:
         tr = case.traj if odom_tr is None else odom_tr

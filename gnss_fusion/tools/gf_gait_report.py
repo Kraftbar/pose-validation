@@ -3,7 +3,8 @@
 """markdown tables for section 12 from work/gait_*.json (run gf_gait_study.py first) -> work/gait_study.md"""
 import json, sys
 from pathlib import Path
-WORK = Path(__file__).resolve().parent.parent / 'work'
+import os
+WORK = Path(os.environ['GF_WORK']) if os.environ.get('GF_WORK') else Path(__file__).resolve().parent.parent / 'work'
 L = lambda n: json.loads((WORK / n).read_text())
 
 

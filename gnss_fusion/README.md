@@ -71,7 +71,7 @@ since the last accepted fix), not a marginal covariance.
 
 `gf_gait` turns the phone accelerometer + gyro into a walking-speed measurement per 3 s epoch (6 s window): `v = k c cad^2`, `c = 0.389` generic
 (0.70 m step at 1.8 Hz), a per-user `c` from a held-out sequence (`gf_gait_set_model`), or `k` from the GNSS fixes (`gf_gait_gnss_fix`, did not help
-with phone fixes). States WALK / STATIONARY / OTHER (shuffling, running: no measurement). `gf_add_speed()` feeds the measurement to the smoother
+with phone fixes). States WALK / STATIONARY / OTHER (shuffling, running: no measurement). Opt-in regularity gate (section 17, `reg` 0 = off): a window whose step intervals / amplitudes vary too much (CV > `reg_iv_cv` 0.15 / `reg_amp_cv` 0.40) is OTHER (`reg=1`) or WALK with `regular = 0` and sigma x `reg_sigma_k` (`reg=2`); `gf_gait_config_set()`, `gf_gait_run --cfg key=val`, `tools/gait_diag.py` (false-walk / missed-walk seconds vs GT), `check_gait.py --cfg=reg=2` (C == python). `gf_add_speed()` feeds the measurement to the smoother
 (`cfg.speed_on = 1`, `speed=1` in `gf_run`): a factor `s_k * (horizontal odometry path / duration) = v` on the per-node scale state (also across distrusted links),
 a horizontal-displacement form on bridged / GNSS-only links, a zero-velocity factor for STATIONARY, and with `speed_align=1` the alignment of a frame
 without fixes from the speed alone (indoors, no GNSS: metric trajectories from mono VO; Indoor-1/2 SE3 11 m -> 0.3-0.7 m).

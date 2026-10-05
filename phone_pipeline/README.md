@@ -60,6 +60,9 @@ $PY phone_pipeline/auto_eval.py --seqs indoor1,indoor2,advio15 --src both       
 ```
 The servo needs the speeds that `pp_live` pushes into the mapping (`--pp-servo-noise S` adds log-normal noise on what it sees, robustness test). Result: Indoor-1 live 1.21 -> 0.64 (final 1.02), Indoor-2 1.10 -> 0.67 (final 0.31), ADVIO-15 0.85 -> 0.85; outdoor rows unchanged (servo off). `docs/gnss_vio_benchmark_20261001.md` section 16.
 
+## Gait detector v2 and the servo question (section 17)
+`gnss_fusion/c/gf_gait` has an opt-in step-regularity gate (`reg`, off by default; `reg=2 reg_sigma_k=1` = flag only, fusion bit-identical). `pp_live --pp-gait-set reg=2 [--pp-gait-set key=val ...]` turns it on; the servo then sees only regular epochs (an irregular epoch gets the last regular speed, up to 20 s). Result: the detector removes the false walking at the start of Outdoor-1 (15 s -> 0) but the servo's Outdoor-1 harm remains (6.04 vs 4.61 m), Indoor-1 keeps the servo gain (0.77), Indoor-2 loses most of it (0.92 vs 0.61): servo policy unchanged (GNSS-free only, detector off). `live_study.py` needs `--keep-fx` if the pre-made fixtures are to be reused; `python gnss_fusion/tools/gait_diag.py [--cfg reg=2]` prints the false-walk / missed-walk seconds per sequence. `docs/gnss_vio_benchmark_20261001.md` section 17.
+
 ## Configs (`configs/<seq>.json`, one per dataset)
 Camera intrinsics (dataset calibration, `tools/gnss_harness/robust_cfg/<seq>/port_camera.txt`), IMU csv, camera-IMU extrinsic (`imu_ext`: sequence-fitted rotation from `stella_vio/tools/ext_fit.py`; `imu_ext_cal`: dataset calibration),
 camera-IMU time offset `imu_toff` (same fit; ADVIO -0.31 / -0.32 s: its video clock lags the IMU clock), gyro bias `imu_bg` (first <= 60 s visual fit, `runs/stella_vio/imu/gyro_pred.md`, only used by `gyro=1`), fixes file,

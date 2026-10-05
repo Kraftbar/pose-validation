@@ -41,6 +41,10 @@ typedef struct gf_gait_config {
     double user_rel_sigma;                /* relative sigma after a per-user calibration (0.10) */
     int    online;                        /* 1: online calibration from gf_gait_gnss_fix() */
     double on_win, on_edge, on_min_dist, on_max_turn, on_eval_dt, on_sigma_max, on_prior_m, k_min, k_max;
+    /* regularity gate (detector v2, section 17; reg = 0: off, exactly the section-12 detector). A window whose steps are irregular is reported as OTHER
+       (no speed; reg = 2: still WALK with the speed, sigma x reg_sigma_k and regular = 0, for consumers that can use a weak speed, e.g. alignment without any other scale source): coefficient of variation of the step intervals > reg_iv_cv, or of the step amplitudes > reg_amp_cv, or median amplitude < reg_amp_min */
+    int    reg;
+    double reg_iv_cv, reg_amp_cv, reg_amp_min, reg_sigma_k;
 } gf_gait_config;
 
 typedef struct gf_gait_est {
@@ -49,11 +53,14 @@ typedef struct gf_gait_est {
     double cadence;                       /* [Hz], 0 if unknown */
     int    state;                         /* GF_GAIT_* */
     double speed, sigma;                  /* [m/s]: valid for WALK (model) and STATIONARY (0, 0.05) */
+    int    regular;                       /* 1 unless reg = 2 and the steps of the window are irregular (WALK with an inflated sigma): consumers needing a trustworthy speed (the mapping servo) skip regular = 0 */
 } gf_gait_est;
 
 typedef struct gf_gait gf_gait;
 
 void      gf_gait_config_default(gf_gait_config *c);
+/* set one field by name ("reg", "reg_iv_cv", "cad_max", ... any double / int member listed above); returns 1 if the key is known (command lines, studies) */
+int       gf_gait_config_set(gf_gait_config *c, const char *key, double val);
 gf_gait  *gf_gait_create(const gf_gait_config *c);   /* NULL = defaults; NULL on allocation failure */
 void      gf_gait_destroy(gf_gait *g);
 /* per-user model constant c (v = c cad^p); also makes the relative sigma user_rel_sigma */

@@ -39,6 +39,19 @@ void gf_gait_config_default(gf_gait_config *c)
     c->model_c = 0.389; c->model_p = 2.0; c->rel_sigma = 0.20; c->abs_sigma = 0.10; c->user_rel_sigma = 0.10;
     c->online = 0; c->on_win = 30.0; c->on_edge = 8.0; c->on_min_dist = 15.0; c->on_max_turn = 20.0 * 3.14159265358979323846 / 180.0;
     c->on_eval_dt = 5.0; c->on_sigma_max = 20.0; c->on_prior_m = 150.0; c->k_min = 0.6; c->k_max = 1.6;
+    c->reg = 0; c->reg_iv_cv = 0.15; c->reg_amp_cv = 0.40; c->reg_amp_min = 0.0; c->reg_sigma_k = 3.0;
+}
+
+int gf_gait_config_set(gf_gait_config *c, const char *key, double v)
+{
+#define D(f) if (!strcmp(key, #f)) { c->f = v; return 1; }
+#define I(f) if (!strcmp(key, #f)) { c->f = (int)v; return 1; }
+    D(tau_slow) D(tau_sm) D(tau_std) D(std_k) D(thr_floor) D(min_step_dt) D(window_s) I(min_steps) D(max_last_age) D(cad_min) D(cad_max)
+    D(tau_stat) D(stat_hp_rms) D(stat_gyro) D(tau_grav) D(model_c) D(model_p) D(rel_sigma) D(abs_sigma) D(user_rel_sigma)
+    I(reg) D(reg_iv_cv) D(reg_amp_cv) D(reg_amp_min) D(reg_sigma_k)
+#undef D
+#undef I
+    return 0;
 }
 
 static void reset(gf_gait *g)
@@ -82,24 +95,41 @@ int gf_gait_estimate(const gf_gait *g, double t, double window_s, gf_gait_est *o
     const gf_gait_config *c = &g->c;
     double W = window_s > 0 ? window_s : c->window_s;
     double first = 0, last = 0; int n = 0;
+    double sa = 0, sa2 = 0, si = 0, si2 = 0, prev = 0; int ni = 0;
     for (int i = 0; i < g->nsteps; ++i) {
         double ts = g->steps[i].t;
-        if (t - W < ts && ts <= t) { if (n == 0) first = ts; last = ts; ++n; }
+        if (t - W < ts && ts <= t) {
+            double am = g->steps[i].amp;
+            sa += am; sa2 += am * am;
+            if (n > 0) { double iv = ts - prev; si += iv; si2 += iv * iv; ++ni; }
+            prev = ts;
+            if (n == 0) { first = ts; }
+            last = ts; ++n;
+        }
     }
     memset(out, 0, sizeof *out);
-    out->t = t; out->window_s = W; out->n_steps = n; out->cadence = 0.0; out->state = GF_GAIT_OTHER; out->speed = 0.0; out->sigma = 1.0;
+    out->t = t; out->window_s = W; out->n_steps = n; out->cadence = 0.0; out->state = GF_GAIT_OTHER; out->speed = 0.0; out->sigma = 1.0; out->regular = 1;
     if (g->n < 2) return 0;
     int stationary = sqrt(g->hp2) < c->stat_hp_rms && g->gn < c->stat_gyro && (n < 2 || t - last > 2.0);
     if (stationary) { out->state = GF_GAIT_STATIONARY; out->speed = 0.0; out->sigma = 0.05; return 0; }
     if (n >= c->min_steps && t - last <= c->max_last_age && last > first) {
         double cad = (double)(n - 1) / (last - first);
         out->cadence = cad;
-        if (c->cad_min <= cad && cad <= c->cad_max) {
+        int regular = 1;
+        if (c->reg && n >= 3) {
+            double ma = sa / n, va = sa2 / n - ma * ma, mi = si / ni, vi = si2 / ni - mi * mi;
+            if (va < 0) { va = 0; }
+            if (vi < 0) { vi = 0; }
+            if (sqrt(vi) > c->reg_iv_cv * mi || sqrt(va) > c->reg_amp_cv * ma || ma < c->reg_amp_min) regular = 0;
+        }
+        if (!regular && c->reg == 2) { regular = 1; out->regular = 0; }
+        if (c->cad_min <= cad && cad <= c->cad_max && regular) {
             double v = g->k * g->mc * pow(cad, c->model_p);
             if (v > 0.0) {
                 out->state = GF_GAIT_WALK; out->speed = v;
                 double r = g->rel * v;
                 out->sigma = sqrt(r * r + c->abs_sigma * c->abs_sigma);
+                if (!out->regular) out->sigma *= c->reg_sigma_k;
             }
         }
     }

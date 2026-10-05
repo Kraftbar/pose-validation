@@ -1149,3 +1149,102 @@ With the servo off: `trajectory.tum` of the new binaries (pp_live and sv_run) is
 * Indoor-2 still has twice the final error: the fusion's start-up scale (first alignment from 2-3 speed epochs at 12 s, +15-20 % for 10 s) and the last 20 s before the loop closes.
 * Settings were tuned on the three indoor sequences themselves; there is no held-out indoor set (the outdoor runs are a harm check, not a validation).
 * Disk: images re-fetched with the section-9.2 scripts (peak about 5 GB of JPEG + 1.4 GB fixtures, deleted afterwards); results of this section ~100 MB in `runs/phone_pipeline/*/study16/` (logs, servo traces, `results.json`).
+
+## 17. Gait detector v2 (step regularity) and the Outdoor-1 servo question (2026-10-05)
+
+Question: the gait scale servo of section 16 hurt Outdoor-1 (+36 %), and the servo trace pointed at false 'walking' at the start of the run (0.8-1.3 m/s reported while the GT chord speed is 0.03-0.45 m/s). Can a better gait detector fix that, so that the servo becomes usable with GNSS? Own code only (`gnss_fusion/c/gf_gait.{h,c}`, `tools/gait.py`, `check_gait.py`, `gait_diag.py`, `phone_pipeline/c/pp_live.c`); no GPL code read, no learned method. **Result: the detector diagnosis and fix work (false-walk seconds on Outdoor-1 15 -> 0, relative rms error of the walking speed 0.15 -> 0.06), but the servo's Outdoor-1 harm does NOT go away (6.04 vs 4.61 m with the new detector): the false walking explains a 38 % shift of the servo reference, not the harm. The servo stays off with fixes, and indoors it keeps the old detector.**
+
+### 17.1 Diagnosis: what the IMU does at the false-walk stretches
+
+`tools/gait_diag.py` (3 s epochs, 6 s window, GT = 0.5 s smoothed path speed and the 6 s chord speed over the same window; drone IMUs of `external/drone/ins_o1`, `ins_m14` included as a negative control: a drone is never 'walking'). Seconds per sequence, detector as of section 12 (generic constant):
+
+| sequence | epochs with GT | GT walking s (chord > 0.8) | detected WALK s | false-walk s (WALK, v > 0.6, GT chord < 0.5) | over-speed s (WALK, v > 1.35 x GT path) | missed-walk s (GT chord > 0.8, not WALK) | false-stationary s |
+|---|---|---|---|---|---|---|---|
+| Outdoor-1 | 130 | 360 | 384 | **15** | **15** | 0 | 0 |
+| Outdoor-2 | 149 | 435 | 447 | 9 | 6 | 0 | 0 |
+| Indoor-1 | 38 | 99 | 111 | 6 | 6 | 0 | 0 |
+| Indoor-2 | 30 | 75 | 87 | 0 | 0 | 0 | 0 |
+| ADVIO-15 | 16 | 0 (shuffle 0.35-0.5 m/s) | 21 | 6 | 6 | 0 | 0 |
+| ADVIO-20 | 99 | 282 | 291 | 0 | 15 | 3 | 0 |
+| drone ins_o1 | 32 | 36 | 12 | 3 | 6 | 33 (flight, not walking) | 0 |
+| drone ins_m14 | 59 | 93 | 102 | 9 | 18 | 3 | 0 |
+
+There is no false-stationary stretch anywhere (the still detector is fine) and no relevant missed walking (the 33 / 3 s of the drones are flight). What the false-walk stretches are, from the raw IMU and GT:
+
+* **Outdoor-1, 0-15 s (and the same pattern at 12-15 s of Outdoor-2, 15 s of Indoor-1, 45 s of Indoor-2, the starts / stops of ADVIO-20):** the person paces: GT x/y shows +-2 m back and forth along a line (net 0.0-1.9 m in 1 s steps, chord speed 0.02-0.43 m/s, path speed 0.3-0.8 m/s) with an ordinary step cadence of 1.5-1.9 Hz. The gait model sees cadence 1.5-1.9 Hz and reports 0.8-1.4 m/s (1.2-1.8x the path speed, 3-50x the chord speed). It is not phone handling, fidgeting, swaying or a stationary-with-noise case: gyro mean |w| is 0.28 rad/s in the bad epochs vs 0.32 in good walking, no rotation burst, and the cadence is inside the plausible band.
+* What distinguishes it is the **regularity of the steps**: step intervals vary (coefficient of variation 0.13-0.24 vs 0.04-0.08 in steady walking) and step amplitudes vary and are small (amplitude CV 0.24-0.58 vs 0.11-0.20; median peak amplitude 1.2 vs 2.4 m/s^2 on the same phone; std of the vertical acceleration 1.0 vs 1.9).
+
+Features tried as an 'is this walking' test, AUC for separating the 18 bad walking epochs (v > 1.35 x GT path, or v > 0.6 with chord < 0.5) from the 429 good ones of the six phone sequences (pooled, test data):
+
+| feature | AUC | comment |
+|---|---|---|
+| step amplitude CV in the window | 0.84 | scale free, **used** |
+| step interval CV in the window | 0.82 | scale free, **used** |
+| vertical / horizontal energy ratio | 0.88 | phone / person dependent (good-epoch median 1.1 on ADVIO-20, 1.3-1.6 on the Mobile phone, 0.44-0.6 on the ADVIO-15 shuffle): not used |
+| absolute amplitude / vertical std | 0.87 / 0.89 | same dependence, not used |
+| gyro mean / std, cadence, steps in window, horizontal std | 0.45 / 0.45 / 0.34 (cad), 0.28, 0.50 | no information (cadence band 1.0-2.8 Hz is already in) |
+
+### 17.2 Detector v2 (regularity gate; `reg`, off by default)
+
+`gf_gait_config`: `reg` (0 = exactly the section-12 detector, 1 = irregular window is OTHER, no speed, 2 = still WALK with the speed but `regular = 0` and sigma x `reg_sigma_k` (3)), `reg_iv_cv` 0.15, `reg_amp_cv` 0.40, `reg_amp_min` 0 (off). A window is irregular if the coefficient of variation (population std / mean over the steps of the 6 s window, >= 3 steps) of the step intervals exceeds `reg_iv_cv` or that of the step amplitudes exceeds `reg_amp_cv` or the median amplitude is below `reg_amp_min`. New: `gf_gait_est.regular`, `gf_gait_config_set(cfg, "key", v)` (`gf_gait_run --cfg key=val`, `pp_live --pp-gait-set key=val`, env `GF_GAIT_DET=reg=2,...` for the study scripts, `GF_WORK=dir` for a scratch work dir so the canonical `gnss_fusion/work/` is untouched), `gait.py` has the same keys, `check_gait.py [--cfg=reg=2 ...]` C == python (max abs difference 5e-10 over cadence, speed, sigma, state, regular, k, heading, odometer, 6 sequences x 3 calibration modes, for reg = 0 / 1 / 2 and with other thresholds). ASan + UBSan clean. With `reg = 0` nothing changes (checks in 17.6). The thresholds (0.15, 0.40) were read off the Outdoor-1 start, i.e. on test data; leave-one-sequence-out selection of the two thresholds on a grid (cost = bad walking epochs kept + 0.5 x good epochs dropped, selected on the other five phone sequences) picks (0.2, 0.5-0.6) with held-out totals bad 12 / dropped 15 epochs (undetected: bad 18 / dropped 0; the fixed (0.15, 0.40): bad 8 / dropped 19), i.e. the gate is a modest gain and only the strict setting removes the Outdoor-1 start entirely.
+
+Gait accuracy (section-12 style, 3 s epochs, 6 s window; walking = GT path speed > 0.5 m/s; before = `reg=0`, after = `reg=1` i.e. only regular windows get a speed; per-user constants refitted by the same held-out rule: 0.3795 / 0.3637 / 0.3775 / 0.3768 -> 0.3816 / 0.3676 / 0.3806 / 0.3791):
+
+| sequence, calibration | WALK epochs / GT walking | median ratio | distance ratio | rms rel. error |
+|---|---|---|---|---|
+| Outdoor-1 generic | 127 / 128 -> 123 / 128 | 1.04 -> 1.04 | 1.06 -> 1.04 | **0.15 -> 0.06** |
+| Outdoor-1 per-user | 127 -> 123 | 1.01 -> 1.02 | 1.03 -> 1.03 | 0.13 -> 0.05 |
+| Outdoor-1 online GNSS | 127 -> 123 | 0.95 -> 0.99 | 0.95 -> 0.99 | 0.15 -> 0.05 |
+| Outdoor-2 generic | 149 / 149 -> 144 / 149 | 0.98 -> 0.98 | 1.00 -> 0.99 | 0.08 -> 0.08 |
+| Indoor-1 generic | 37 / 37 -> 34 / 37 | 1.09 -> 1.09 | 1.10 -> 1.09 | 0.15 -> 0.13 |
+| Indoor-2 generic | 29 / 29 -> 21 / 29 | 1.09 -> 1.08 | 1.10 -> 1.09 | 0.13 -> 0.10 |
+| ADVIO-15 generic | 3 / 4 -> 1 / 4 | 1.07 -> 1.07 | 1.17 -> 1.07 | 0.39 -> 0.07 |
+| ADVIO-20 generic | 97 / 98 -> 95 / 98 | 0.91 -> 0.91 | 0.93 -> 0.92 | 0.20 -> 0.20 |
+
+Seconds table with the detector on (trusted walking = WALK and regular): `reg=2` (0.15 / 0.40): false-walk s Outdoor-1 15 -> 0, Outdoor-2 9 -> 6, Indoor-1 6 -> 0, ADVIO-15 6 -> 0, ADVIO-20 0 -> 0, drone m14 9 -> 0, drone o1 3 -> 3; missed-walk s (the price: real walking that is irregular) Outdoor-2 0 -> 12, Indoor-2 0 -> 15, ADVIO-20 3 -> 6; the drone m14 flight is no longer 'walking' at all (102 s -> 0). With (0.17, 0.5): Outdoor-1 15 -> 3, Indoor-2 missed 3, Outdoor-2 missed 6.
+
+### 17.3 Fusion (gait study, `gf_gait_study.py fusion` with `GF_GAIT_DET=reg=...`, 12 cases x batch / causal, GNSS runs and GNSS-free columns; section-12 values = reg off)
+
+| detector | cells better / worse / neutral (0.05 m) vs reg off, generic constant | mean change | comment |
+|---|---|---|---|
+| reg=1 (irregular -> OTHER) | 6 / 8 / 28 of 42 | dominated by ADVIO-15 XRSLAM 12.5 -> 602 (no speed at all left, its scale collapses) | rejected for fusion |
+| reg=2, sigma x 3 | 7 / 8 / 31 of 46 | +0.18 m (i2_okvis 15.95 -> 18.79, a15_xrslam 12.47 -> 15.48; Outdoor-1 stella causal GNSS-free 9.38 -> 9.38, Outdoor-1 XRSLAM GNSS-free batch 6.25 -> 5.97, Indoor-2 stella 0.38 -> 0.25 batch but per-user 0.27 -> 0.39) | neutral to slightly worse |
+| reg=2, `reg_sigma_k` 1 | identical to reg off (the speeds and sigmas of WALK epochs are unchanged; `regular` is only a flag) | 0 | the setting for pipelines that only want the flag |
+
+The GNSS fusion cases (Outdoor-1 / -2, ADVIO-20 with fixes) move by <= 0.1 m everywhere (their error is GNSS-limited); Outdoor-1 stella causal with per-user constant 7.27 -> 7.07 / 7.24, Outdoor-2 ORB-SLAM3 batch 0.81 -> 0.77 / 0.78. So the detector change is accuracy-neutral for the loose fusion, no promotion on that account.
+
+### 17.4 Live pipeline with the servo on (`live_study.py`, paired by start, causal AUTO ATE SE3 [m] mean over starts; 'off' = `b17`, 'servo' = `s17` = the section-16 setting `servo=0.5 servo_clip=0.2 servo_win=6 servo_dmin=2`; b17 and s17 reproduce the section-16 `base` / `sv05` runs bit for bit on all four sequences, so the old numbers reproduce with the detector off)
+
+A detector-aware servo was built for these runs: `pp_live` pushes to the servo only epochs with `regular = 1`; an irregular epoch gets the last regular speed (held up to 20 s, nothing before the first regular epoch) so that the servo's contiguous 6 s windows stay valid ('hold'; a plain drop breaks the windows: Indoor-2 0.85).
+
+| sequence (starts) | servo off | servo, detector off (sec. 16) | detector v2 servo off | detector v2 + servo (hold) |
+|---|---|---|---|---|
+| Indoor-1 (6) | 1.20 | 0.79 | 1.20 (`reg_sigma_k` 1) | **0.77-0.78** (6 of 6 better than off) |
+| Indoor-2 (6) | 1.06 | **0.61** | 1.04 (sigma x 3) / 1.06 (k 1) | 0.92-0.95; gain 2 clip 0.3 0.73, gain 1 0.88, drop instead of hold 0.85 |
+| ADVIO-15 (6) | 0.89 | 0.84 | 1.00 (sigma x 3, 6 of 6 worse) / 0.89 (k 1) | 0.89 / 1.00 (all epochs irregular: the servo gets nothing) |
+| Outdoor-1 (10; 9 without the duplicate start 90) | 4.61-4.72 | 6.28-6.32 (worse in 9 of 10) | 4.61 / 4.70 | **6.04 / 6.68 with servo gate 0.5** (worse in 9 of 10 / 8 of 9); detector off + gate 0.5: 5.67 |
+
+Not run (images not fetchable within the disk budget of this task: ADVIO-20 2.4 GB zip, Outdoor-2 450 s over a 0.3 MB/s link): ADVIO-20 and Outdoor-2 live; their gait accuracy / fusion rows are in 17.2 / 17.3.
+
+What the Outdoor-1 traces say (`runs/phone_pipeline/outdoor1/study16/{v2h,v2hg,sv05}_s*/servo.log`, start 30):
+* The false walking does poison the reference, more than section 16 estimated: ratio of the first window (metres per map unit) 3.58 with the old detector against 2.60 with the new one (the steady walking ratio is 2.5-3.0), i.e. 38 % instead of 8 %. With the clean reference the servo is quiet before the blow-up (ln f +-0.05).
+* The harm is independent of that: around 200-260 s of the run the map unit blows up in every configuration, servo on or off (GT metres per map unit 3.0 -> 0.8 without the servo, start 15; 3.4 -> 0.13 with it) and without the servo the map recovers within 60 s (0.8 -> 3.0) whereas with it, even when the gate switches the servo off at the blow-up (`servo_gate` 0.5: ln f = 0 afterwards), the map stays at 0.13-0.25 m per unit until the end (raw live-map Sim3 ATE 21.9 vs 34.8 for the no-servo run of start 0, 41.0 / 8.5 for start 15 etc.: the servo run is better on some starts and much worse on others, mean 18.0 vs 15.7). Resets / lost frames are the same in all configurations (starts 30 and 900 only), so it is not a tracking reset. The few-percent scale corrections applied earlier in the run change the later state of the map in a way that the blow-up then does not recover from; why, I did not establish (candidates: `scale_section` scaling the newest keyframe about its predecessor leaves the low-parallax landmarks of the running track slightly inconsistent; the front end is chaotic, 3.7-8.1 m spread between starts without the servo).
+* Indoor-2 is the opposite: its servo gain partly comes from an over-large first reference (ratio 12.9 at the first window against the steady 8-9; section 16.1: true 8.8 falling to 3.7 while the map unit grows), which makes the servo saturate its clip (-0.2) at nearly every keyframe and so counter the drift of the map unit; with the clean reference (8.4, the irregular first epochs are skipped) the same gain 0.5 under-corrects (0.92-0.95), gain 2 gets 0.73. The indoor gain of the servo is therefore a controller-strength effect more than a reference effect.
+
+### 17.5 Verdict and policy
+
+* Target 'Outdoor-1 servo-on no worse than servo-off, keeping the indoor gains' is **not achieved**: with detector v2 Outdoor-1 servo-on is 31 % worse than off (6.04 vs 4.61), Indoor-2 loses most of its gain, Indoor-1 keeps it.
+* The servo therefore stays **off with fixes** (and the policy of section 16 stands: on only GNSS-free, with the section-12 detector, `reg` off). Making it usable in GNSS runs needs a fix for the blow-up recovery (open issue below), not a better gait detector.
+* Detector v2 ships as opt-in (`reg`, off by default). It is a better walking-speed estimator on its trusted epochs (rms rel. error 0.15 -> 0.06 on Outdoor-1, 0.39 -> 0.07 on ADVIO-15) and removes the drone false-walking, but it costs real walking seconds (irregular but correct turns), so the recommended use is the flag only (`reg=2 reg_sigma_k=1`: the fusion is bit-identical to reg off, consumers that need a trustworthy speed read `regular`). Candidate for the next study, not done: a servo that is gated by the map-unit blow-up (ratio of the 6 s windows jumping by > 3x within one epoch) and restarts its reference afterwards instead of pushing against the broken map.
+
+### 17.6 Baseline checks
+
+`phone_pipeline/check_baselines.sh` after all changes: stella exact-port cmp CMP-IDENTICAL (787 poses), `gf_table.py` 893 numbers, `gf_gait_study.py fusion` 1578 numbers, `gf_georef_table.py` 140 numbers: 0 differ (`reg` off everywhere); `test_auto.py` 6 of 6 PASS; `compare_py.py` 8 cases, `test_geo.py`, `test_georef.py` pass; `pp_live` with the detector off reproduces the section-16 live runs bit for bit (b17 = base, s17 = sv05 on Indoor-1, Indoor-2, ADVIO-15). `check_gait.py` C == python for reg 0 / 1 / 2.
+
+### 17.7 Open issues
+
+* Outdoor-1 map-unit blow-up at 200-260 s of the run (unrelated to the servo's presence, but made unrecoverable by it); the servo is only usable GNSS-free until this is understood.
+* Indoor-2: the servo with the clean reference needs more gain; not tuned further (tuning on three test sequences is not evidence).
+* ADVIO-20 / Outdoor-2 live runs with detector v2 are missing (no images, see 17.4).
+* Thresholds (0.15, 0.40) were chosen by eye on Outdoor-1; the LOSO choice (0.2, 0.5-0.6) is weaker. The AUCs above are on 18 bad epochs.
+* Disk: images fetched into `runs/phone_pipeline/_fetch17/` (about 2 GB, deleted afterwards), results of this section in `runs/phone_pipeline/*/study16/` (tags `b17 s17 v2 v2h v2hg v1g v2k v2kh w2h w2g2 v2h_g1 v2h_g2 v2h_g1d5`), `gnss_fusion/work_v2/`, `work_v2b/` (json only), logs `runs/phone_pipeline/*_study17*.log`.
