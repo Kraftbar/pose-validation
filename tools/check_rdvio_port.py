@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the rdvio_port bit-exactness harnesses (tolerance 0, memcmp).
 
-  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4] [--tag m1] [--oracle] [--sanitize]
+  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5] [--tag m1] [--oracle] [--sanitize]
 Per module: compile rdvio_port/c/check_rd_*.c (C99, -ffp-contract=off) together with the port and the okvis_port kernels it reuses,
 replay the dump files of runs/rdvio_port/<tag>/<seq>/dump (reference run with patch 0003) and, with --oracle, the random-input records
 written by the real RD-VIO classes (rdvio_port/reference_tools/rd_imu_oracle.cc, built against the reference build).
@@ -19,14 +19,17 @@ REF = REPO / "runs/rdvio_port/reference_build"
 V = REPO / "external/vio"
 
 STELLA = REPO / "stella_port/c"
-M4_SRC = ["rd_solve.c", "rd_solve_linear.c", "rd_static.c", "rd_factor.c", "rd_imu.c", "rd_lie.c", "rd_eigen.c", "rd_geom.c", "rd_svd.c", "rd_qr.c"]
+M4_SRC = ["rd_solve.c", "rd_solve_linear.c", "rd_static.c", "rd_factor.c", "rd_imu.c", "rd_lie.c", "rd_eigen.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_marg.c", "rd_seig.c"]
 MODULES = {  # name -> (harness, port sources, oracle source, extra flags, extra (non-port) sources)
     "m1": ("check_rd_imu.c", ["rd_imu.c", "rd_lie.c", "rd_eigen.c"], "rd_imu_oracle.cc", [], []),
     "m3": ("check_rd_m3.c", ["rd_rand.c", "rd_ransac.c", "rd_poisson.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], "rd_m3_oracle.cc", [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
     "m4": ("check_rd_solve.c", M4_SRC, "rd_m4_oracle.cc", ["-I" + str(OK_DIR)], [str(OK_DIR / x) for x in ("ok_blas.c", "ok_sparse.c", "ok_amd.c")] + [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
+    "m5": ("check_rd_m5.c", ["rd_marg.c", "rd_seig.c", "rd_imu.c", "rd_factor.c", "rd_lie.c", "rd_eigen.c"], "rd_m5_oracle.cc", [], []),
     "m2": ("check_rd_m2.c", ["rd_factor.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], "rd_m2_oracle.cc", [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
 }
 OK_SRC = ["ok_eigen.c", "ok_dense.c"]
+# dump channels of patches 0003-0005 switched off for the m5 oracle run
+M5_QUIET = "integ pred pie plus rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp fess frot fhom pess phom pois".split()
 
 
 def run(cmd, **kw):
@@ -73,16 +76,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--static-test", action="store_true", help="also run rd_m4_static_test (M4 static kernels vs the real Ceres headers)")
     ap.add_argument("--tag", default="m1")
-    ap.add_argument("--tag2", default="m2", help="dump run tag for the m2 module")
-    ap.add_argument("--tag3", default="m3", help="dump run tag for the m3 module")
+    ap.add_argument("--tag2", default="m23", help="dump run tag for the m2 module")
+    ap.add_argument("--tag3", default="m23", help="dump run tag for the m3 module")
     ap.add_argument("--seq", default="MH_01_easy")
     ap.add_argument("--oracle", action="store_true", help="also replay random inputs recorded from the real classes")
     ap.add_argument("--seeds", default="1,2,3")
     ap.add_argument("--count", default="20000")
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--count4", default="300", help="number of random Ceres problems per seed for the m4 oracle (rd_m4_oracle)")
-    ap.add_argument("--tag4", default="m4c", help="dump run tag for the m4 module (solve.bin of run_rdvio_reference.py --solve-dump)")
-    ap.add_argument("--modules", default="m1,m2,m3,m4")
+    ap.add_argument("--tag4", default="m5", help="dump run tag for the m4 module (solve.bin of run_rdvio_reference.py --solve-dump)")
+    ap.add_argument("--tag5", default="m5", help="dump run tag for the m5 module (marg.bin, run_rdvio_reference.py --dump --dump-every marg=3 ...)")
+    ap.add_argument("--chains5", default="40", help="number of random marginalisation chains per seed for the m5 oracle (rd_m5_oracle)")
+    ap.add_argument("--steps5", default="4", help="marginalisations per chain for the m5 oracle")
+    ap.add_argument("--modules", default="m1,m2,m3,m4,m5")
     a = ap.parse_args()
     BUILD.mkdir(parents=True, exist_ok=True)
     rc = static_test() if a.static_test else 0
@@ -95,7 +101,7 @@ def main():
         flags = ["-std=c99", "-O2", "-ffp-contract=off", "-Wall", "-Wextra", *xflags] + (["-fsanitize=address,undefined", "-g"] if a.sanitize else [])
         run(["cc", *flags, "-o", str(exe), str(PORT / "c" / harness), *[str(PORT / "c" / x) for x in srcs], *[str(OK / x) for x in OK_SRC], *xsrcs, "-lm"], check=True)
         dirs = []
-        dd = REPO / "runs/rdvio_port" / (a.tag if m == "m1" else a.tag2 if m == "m2" else a.tag3 if m == "m3" else a.tag4) / a.seq / "dump"
+        dd = REPO / "runs/rdvio_port" / (a.tag if m == "m1" else a.tag2 if m == "m2" else a.tag3 if m == "m3" else a.tag4 if m == "m4" else a.tag5) / a.seq / "dump"
         if dd.exists():
             dirs.append(("dump " + str(dd), dd))
         if a.oracle:
@@ -103,6 +109,12 @@ def main():
             for sd in a.seeds.split(","):
                 od = REPO / "runs/rdvio_port" / f"oracle{m}_{sd}"
                 od.mkdir(parents=True, exist_ok=True)
+                if m == "m5":   # the marg.bin records are written by the dump instrumentation (patch 0007) of the real class; eval.bin by the oracle
+                    e5 = dict(env, RDVIO_PORT_DUMP_DIR=str(od), RDVIO_PORT_MARG_FULL_EVERY="1",
+                              RDVIO_PORT_DUMP_EVERY=",".join(f"{k}=0" for k in M5_QUIET) + ",marg=1")
+                    run([str(orc), str(od), sd, a.chains5, a.steps5], env=e5, check=True)
+                    dirs.append((f"oracle seed {sd} x{a.chains5} chains x{a.steps5} steps", od))
+                    continue
                 run([str(orc), str(od), sd, a.count4 if m == "m4" else a.count], env=env, check=True)
                 dirs.append((f"oracle seed {sd} x{a.count4 if m == 'm4' else a.count}", od))
         for name, d in dirs:

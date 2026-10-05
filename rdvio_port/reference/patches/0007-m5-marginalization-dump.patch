@@ -1,0 +1,240 @@
+0007: M5 instrumentation (rd_vio side): channel marg (RDVIO_PORT_DUMP_DIR / RDVIO_PORT_DUMP_EVERY=marg=n, RDVIO_PORT_MARG_FULL_EVERY=n) records the inputs (previous prior, window frames, keyframe preintegration of frame index+1, visual observations of the victim frame) and outputs (new prior, optionally the stage matrices: information matrix after the Schur complements, eigendecomposition) of CeresMarginalizationFactor::marginalize; the patch-0006 solve snapshot gets the factor state as payload of type 6. Layouts in rdvio_port/c/rd_marg.h. No numerical effect.
+
+diff -ruN a/src/rdvio_estimation/include/rdvio/estimation/ceres/marginalization_factor.h b/src/rdvio_estimation/include/rdvio/estimation/ceres/marginalization_factor.h
+--- a/src/rdvio_estimation/include/rdvio/estimation/ceres/marginalization_factor.h	2026-10-05 12:55:15.409312765 +0200
++++ b/src/rdvio_estimation/include/rdvio/estimation/ceres/marginalization_factor.h	2026-10-05 12:56:01.703736161 +0200
+@@ -6,6 +6,8 @@
+ #include <rdvio/estimation/ceres/preintegration_factor.h>
+ #include <rdvio/estimation/ceres/reprojection_factor.h>
+ #include <rdvio/estimation/marginalization_factor.h>
++#include <rdvio/estimation/port_dump.h>
++#include <rdvio/map/track.h>
+ 
+ namespace rdvio {
+ 
+@@ -71,7 +73,141 @@
+         return true;
+     }
+ 
++    // ---- rdvio_port instrumentation (patch 0007): observation only ----
++    // Solver snapshot payload of this factor (patch 0006 type 6): nff, nff x {lin pose, lin motion}, sqrt_inv_cov, infovec
++    template <typename Buf> void port_payload(Buf &b) const {
++        b.u32((uint32_t)frames.size());
++        for (size_t i = 0; i < frames.size(); ++i) {
++            b.f64n(pose_linearization_point[i].q.coeffs().data(), 4);
++            b.f64n(pose_linearization_point[i].p.data(), 3);
++            b.f64n(motion_linearization_point[i].v.data(), 3);
++            b.f64n(motion_linearization_point[i].bg.data(), 3);
++            b.f64n(motion_linearization_point[i].ba.data(), 3);
++        }
++        b.f64n(sqrt_inv_cov.data(), (size_t)sqrt_inv_cov.size());
++        b.f64n(infovec.data(), (size_t)infovec.size());
++    }
++
+     void marginalize(size_t index) override {
++        portdump::Chan *pc = portdump::want(23);
++        if (!pc) {
++            marginalize_impl(index);
++            return;
++        }
++        static uint64_t full_n = 0;
++        const char *fe = std::getenv("RDVIO_PORT_MARG_FULL_EVERY");
++        const uint64_t fevery = fe ? std::strtoull(fe, nullptr, 10) : 4;
++        const bool full = fevery != 0 && (full_n++ % fevery == 0);
++        portdump::MargStage &st = portdump::marg_stage();
++        st.on = full;
++        const size_t nf = base_map->frame_num();
++        auto pos_of = [&](const Frame *f) {
++            for (size_t p = 0; p < nf; ++p)
++                if (base_map->get_frame(p) == f) return (int32_t)p;
++            return (int32_t)-1;
++        };
++        portdump::u32(pc, (uint32_t)nf);
++        portdump::u32(pc, (uint32_t)index);
++        portdump::u32(pc, full ? 1u : 0u);
++        portdump::u32(pc, (uint32_t)frames.size());
++        for (size_t i = 0; i < frames.size(); ++i) {
++            portdump::i32(pc, pos_of(frames[i]));
++            portdump::f64(pc, pose_linearization_point[i].q.coeffs().data(), 4);
++            portdump::f64(pc, pose_linearization_point[i].p.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].v.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].bg.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].ba.data(), 3);
++        }
++        portdump::f64(pc, sqrt_inv_cov.data(), (size_t)sqrt_inv_cov.size());
++        portdump::f64(pc, infovec.data(), (size_t)infovec.size());
++        for (size_t p = 0; p < nf; ++p) {
++            Frame *f = base_map->get_frame(p);
++            portdump::u64(pc, (uint64_t)f->id());
++            portdump::f64(pc, f->pose.q.coeffs().data(), 4);
++            portdump::f64(pc, f->pose.p.data(), 3);
++            portdump::f64(pc, f->motion.v.data(), 3);
++            portdump::f64(pc, f->motion.bg.data(), 3);
++            portdump::f64(pc, f->motion.ba.data(), 3);
++            portdump::f64(pc, f->imu.q_cs.coeffs().data(), 4);
++            portdump::f64(pc, f->imu.p_cs.data(), 3);
++            const bool has_pre = p > 0 && (p == index || p == index + 1);
++            portdump::u32(pc, has_pre ? 1u : 0u);
++            if (has_pre) {
++                const PreIntegrator &pre = f->keyframe_preintegration;
++                portdump::f64(pc, pre.delta.t);
++                portdump::f64(pc, pre.delta.q.coeffs().data(), 4);
++                portdump::f64(pc, pre.delta.p.data(), 3);
++                portdump::f64(pc, pre.delta.v.data(), 3);
++                portdump::f64(pc, pre.jacobian.dq_dbg.data(), 9);
++                portdump::f64(pc, pre.jacobian.dp_dbg.data(), 9);
++                portdump::f64(pc, pre.jacobian.dp_dba.data(), 9);
++                portdump::f64(pc, pre.jacobian.dv_dbg.data(), 9);
++                portdump::f64(pc, pre.jacobian.dv_dba.data(), 9);
++                portdump::f64(pc, pre.delta.sqrt_inv_cov.data(), 225);
++            }
++        }
++        {
++            // the visual part of the victim frame, in the loop order of marginalize_impl
++            Frame *victim = base_map->get_frame(index);
++            std::vector<Track *> sel;
++            for (size_t j = 0; j < victim->keypoint_num(); ++j) {
++                Track *track = victim->get_track(j);
++                if (!track || !track->tag(TT_VALID))
++                    continue;
++                if (!track->first_frame()->tag(FT_KEYFRAME))
++                    continue;
++                sel.push_back(track);
++            }
++            portdump::u32(pc, (uint32_t)sel.size());
++            for (Track *track : sel) {
++                Frame *frame_ref = track->first_frame();
++                portdump::u64(pc, (uint64_t)track->id());
++                portdump::u32(pc, (uint32_t)pos_of(frame_ref));
++                portdump::f64(pc, track->landmark.inv_depth);
++                uint32_t nobs = 0;
++                for (const auto &[frame_tgt, keypoint_index] : track->keypoint_map())
++                    if (frame_tgt != frame_ref && pos_of(frame_tgt) >= 0)
++                        nobs++;
++                portdump::u32(pc, nobs);
++                for (const auto &[frame_tgt, keypoint_index] : track->keypoint_map()) {
++                    if (frame_tgt == frame_ref || pos_of(frame_tgt) < 0)
++                        continue;
++                    const CeresReprojectionErrorFactor *f = static_cast<const CeresReprojectionErrorFactor *>(
++                        frame_tgt->reprojection_error_factors[keypoint_index].get());
++                    const auto &[fr, kir] = f->track->first_keypoint();
++                    portdump::i32(pc, pos_of(frame_tgt));
++                    portdump::f64(pc, f->frame->get_keypoint(f->keypoint_index).data(), 3);
++                    portdump::f64(pc, fr->get_keypoint(kir).data(), 3);
++                    portdump::f64(pc, fr->camera.q_cs.coeffs().data(), 4);
++                    portdump::f64(pc, fr->camera.p_cs.data(), 3);
++                    portdump::f64(pc, f->frame->camera.q_cs.coeffs().data(), 4);
++                    portdump::f64(pc, f->frame->camera.p_cs.data(), 3);
++                    portdump::f64(pc, f->frame->sqrt_inv_cov.data(), 4);
++                }
++            }
++        }
++        marginalize_impl(index);
++        // outputs: the new factor (frames, linearisation points, sqrt_inv_cov, infovec) and the stage matrices
++        portdump::u32(pc, (uint32_t)frames.size());
++        for (size_t i = 0; i < frames.size(); ++i) {
++            portdump::f64(pc, pose_linearization_point[i].q.coeffs().data(), 4);
++            portdump::f64(pc, pose_linearization_point[i].p.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].v.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].bg.data(), 3);
++            portdump::f64(pc, motion_linearization_point[i].ba.data(), 3);
++        }
++        portdump::f64(pc, sqrt_inv_cov.data(), (size_t)sqrt_inv_cov.size());
++        portdump::f64(pc, infovec.data(), (size_t)infovec.size());
++        if (full) {
++            portdump::f64(pc, st.infomat.data(), st.infomat.size());
++            portdump::f64(pc, st.infovec.data(), st.infovec.size());
++            portdump::f64(pc, st.evals.data(), st.evals.size());
++            portdump::f64(pc, st.evecs.data(), st.evecs.size());
++        }
++        st.on = false;
++    }
++
++    void marginalize_impl(size_t index) {
+         struct LandmarkInfo {
+             LandmarkInfo() {
+                 mat = 0;
+@@ -438,8 +574,18 @@
+         }
+ 
+         /* scope: create marginalization factor */ {
++            if (portdump::marg_stage().on) {
++                auto &st = portdump::marg_stage();
++                st.infomat.assign(pose_motion_infomat.data(), pose_motion_infomat.data() + pose_motion_infomat.size());
++                st.infovec.assign(pose_motion_infovec.data(), pose_motion_infovec.data() + pose_motion_infovec.size());
++            }
+             Eigen::SelfAdjointEigenSolver<matrix<>> saesolver(
+                 pose_motion_infomat);
++            if (portdump::marg_stage().on) {
++                auto &st = portdump::marg_stage();
++                st.evals.assign(saesolver.eigenvalues().data(), saesolver.eigenvalues().data() + saesolver.eigenvalues().size());
++                st.evecs.assign(saesolver.eigenvectors().data(), saesolver.eigenvectors().data() + saesolver.eigenvectors().size());
++            }
+ 
+             vector<> lambdas = (saesolver.eigenvalues().array() > 1.0e-8)
+                                    .select(saesolver.eigenvalues(), 0);
+diff -ruN a/src/rdvio_estimation/include/rdvio/estimation/port_dump.h b/src/rdvio_estimation/include/rdvio/estimation/port_dump.h
+--- a/src/rdvio_estimation/include/rdvio/estimation/port_dump.h	2026-10-05 12:55:15.414312703 +0200
++++ b/src/rdvio_estimation/include/rdvio/estimation/port_dump.h	2026-10-05 12:56:01.703736161 +0200
+@@ -3,6 +3,7 @@
+ // Enabled by RDVIO_PORT_DUMP_DIR; sampling by RDVIO_PORT_DUMP_EVERY="integ=1,pred=1,pie=20,plus=50,rpe=100,..." (0 = count only).
+ // Channels: M1 integ pred pie plus; M2 rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp (layouts in rdvio_port/c/rd_factor.h, rd_geom.h);
+ // M3 fess frot fhom pess phom pois (rd_ransac.h, rd_poisson.h). pess/phom/pois are replayed as sequences (persistent PARSAC bin state, filter op streams): keep every=1.
++// M5 marg (CeresMarginalizationFactor::marginalize inputs / outputs, layout in rdvio_port/c/rd_marg.h; RDVIO_PORT_MARG_FULL_EVERY=n adds the stage matrices of every n-th dumped call).
+ // Pure observation: reads state, never modifies it.
+ #include <cstdint>
+ #include <cstdio>
+@@ -18,12 +19,12 @@
+     const char *name;
+ };
+ inline Chan &chan(int k) {
+-    static Chan ch[23] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"},
++    static Chan ch[24] = {{nullptr, 0, 1, "integ"}, {nullptr, 0, 1, "pred"}, {nullptr, 0, 20, "pie"}, {nullptr, 0, 50, "plus"},
+                           {nullptr, 0, 100, "rpe"}, {nullptr, 0, 10, "rot"}, {nullptr, 0, 50, "wahba"}, {nullptr, 0, 100, "ess5"},
+                           {nullptr, 0, 1, "hom4"}, {nullptr, 0, 1, "decess"}, {nullptr, 0, 1, "dechom"}, {nullptr, 0, 1, "tri2"},
+                           {nullptr, 0, 1, "trin"}, {nullptr, 0, 1, "trk"}, {nullptr, 0, 5, "tang"}, {nullptr, 0, 50, "glp"}, {nullptr, 0, 5, "slp"},
+                           {nullptr, 0, 1, "fess"}, {nullptr, 0, 1, "frot"}, {nullptr, 0, 1, "fhom"}, {nullptr, 0, 1, "pess"},
+-                          {nullptr, 0, 1, "phom"}, {nullptr, 0, 1, "pois"}};
++                          {nullptr, 0, 1, "phom"}, {nullptr, 0, 1, "pois"}, {nullptr, 0, 1, "marg"}};
+     static bool init = false;
+     if (!init) {
+         init = true;
+@@ -54,7 +55,7 @@
+ inline void f64(Chan *c, const double *p, size_t n) { std::fwrite(p, 8, n, c->f); }
+ inline void f64(Chan *c, double v) { std::fwrite(&v, 8, 1, c->f); }
+ inline void flush_all() {
+-    for (int k = 0; k < 23; ++k)
++    for (int k = 0; k < 24; ++k)
+         if (chan(k).f) std::fflush(chan(k).f);
+ }
+ struct Flusher {
+@@ -74,6 +75,13 @@
+     u32(c, (uint32_t)mask.size());
+     if (!mask.empty()) std::fwrite(mask.data(), 1, mask.size(), c->f);
+ }
++// stage matrices of CeresMarginalizationFactor::marginalize (filled by marginalize_impl when `on`)
++struct MargStage {
++    bool on = false;
++    std::vector<double> infomat, infovec, evals, evecs;
++};
++inline MargStage &marg_stage() { static MargStage s; return s; }
++inline void i32(Chan *c, int32_t v) { std::fwrite(&v, 4, 1, c->f); }
+ inline uint64_t next_filter_id() { static uint64_t id = 0; return id++; }
+ inline void obs(Chan *c, const Eigen::Quaterniond &pq, const Eigen::Vector3d &pp, const Eigen::Quaterniond &cq, const Eigen::Vector3d &cp, const Eigen::Vector3d &kp) {
+     f64(c, pq.coeffs().data(), 4); f64(c, pp.data(), 3); f64(c, cq.coeffs().data(), 4); f64(c, cp.data(), 3); f64(c, kp.data(), 3);
+diff -ruN a/src/rdvio_estimation/src/solver.cpp b/src/rdvio_estimation/src/solver.cpp
+--- a/src/rdvio_estimation/src/solver.cpp	2026-10-05 12:55:15.419312641 +0200
++++ b/src/rdvio_estimation/src/solver.cpp	2026-10-05 12:56:01.703736161 +0200
+@@ -134,9 +134,10 @@
+                 pl.u32(5);
+                 port_live(pl, fi->pose.q.coeffs().data(), 4); port_live(pl, fi->pose.p.data(), 3);
+                 port_live(pl, fi->motion.v.data(), 3); port_live(pl, fi->motion.bg.data(), 3); port_live(pl, fi->motion.ba.data(), 3);
+-            } else if (dynamic_cast<const CeresMarginalizationFactor *>(cf)) {
++            } else if (auto f = dynamic_cast<const CeresMarginalizationFactor *>(cf)) {
+                 type = 6;
+-                rp::g.oracle.insert(cf);
++                f->port_payload(pl);   // patch 0007: the factor state (linearisation points, sqrt_inv_cov, infovec); Evaluate is ported (M5)
++                rp::g.oracle.insert(cf);   // the real outputs are still recorded (ORACLE) and compared with the native Evaluate
+             }
+             b.u64((uint64_t)(uintptr_t)rb); b.u32(type);
+             b.u32(lf == nullptr ? 0u : (lf == cauchy ? 1u : 2u));

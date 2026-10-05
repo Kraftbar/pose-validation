@@ -2,8 +2,10 @@
 // rdvio_port/reference/ceres_patches/0006) on RANDOM RD-VIO-shaped problems and writes solve.bin in the layout of rdvio_port/c/rd_solve.h.
 // The problems mimic the structure rdvio::Solver builds (frames q(4/3, quaternion manifold) p v bg ba (3), inverse depths (1), reprojection-like
 // rows (2) with Cauchy(1) loss, 15-row IMU-like factors, a dense marginalization-like factor over all frames but the last, rotation priors,
-// pose-only problems, constant blocks, unreferenced blocks) but every cost function is a SYNTHETIC smooth function of its parameters
-// (affine + quadratic, analytic ambient Jacobians): every evaluation is recorded as an ORACLE record (type 6) and replayed by
+// pose-only problems, constant blocks, unreferenced blocks; half of the dense marginalization-like factors are REAL CeresMarginalizationFactor objects
+// (a random window marginalised a few times with the real classes, rd_world.h: type 6, native Evaluate in the port, outputs compared with the ORACLE
+// record), the rest of the cost functions are SYNTHETIC smooth functions of its parameters
+// (affine + quadratic, analytic ambient Jacobians): every evaluation is recorded as an ORACLE record (type 7, synthetic) and replayed by
 // rdvio_port/c/check_rd_solve.c, so what is verified is the solver itself (reduction, Schur ordering, AMD of the Schur columns, lexicographic
 // residual order, Jacobian assembly with the quaternion manifold and the Cauchy corrector, Jacobi scaling, Dogleg, Schur elimination into the
 // block-sparse reduced system, Eigen SimplicialLDLT, user-state updates) against the real library on structures the MH_01 dump never reaches.
@@ -11,6 +13,7 @@
 #include <ceres/ceres.h>
 #include <ceres/rdvio_port_solve_hooks.h>
 #include <rdvio/estimation/ceres/quaternion_parameterization.h>
+#include "rd_world.h"
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -62,7 +65,7 @@ struct Synth : ceres::CostFunction {
     }
 };
 
-struct Frame { double q[4], p[3], v[3], bg[3], ba[3]; };
+struct Frame { double *q, *p, *v, *bg, *ba; };   // pointers into the members of a real rdvio::Frame owned by `world`
 
 static void write_problem(ceres::Problem &pr, ceres::LossFunction *cauchy, ceres::Manifold *quat, const ceres::Solver::Options &o, uint64_t id, int level) {
     rp::g.solve_id = id;
@@ -109,12 +112,16 @@ static void write_problem(ceres::Problem &pr, ceres::LossFunction *cauchy, ceres
         std::vector<double *> blocks;
         pr.GetParameterBlocksForResidualBlock(rb, &blocks);
         rp::g.oracle.insert(cf);
-        b.u64((uint64_t)(uintptr_t)rb); b.u32(6);
+        rp::Buf pl;
+        uint32_t type = 7;   // synthetic factor: replayed through ORACLE records (type 7)
+        if (auto mf = dynamic_cast<const rdvio::CeresMarginalizationFactor *>(cf)) { type = 6; mf->port_payload(pl); }
+        b.u64((uint64_t)(uintptr_t)rb); b.u32(type);
         b.u32(lf == nullptr ? 0u : (lf == cauchy ? 1u : 2u));
         b.u32((uint32_t)blocks.size());
         for (double *q : blocks) b.u32(pidx.at(q));
         b.u32((uint32_t)cf->num_residuals());
-        b.u64(0);
+        b.u64((uint64_t)pl.b.size());
+        b.raw(pl.b.data(), pl.b.size());
     }
     rp::g.write(rp::R_PROBLEM, b);
     rp::g.armed = true;
@@ -124,6 +131,7 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: rd_m4_oracle <outdir> [seed] [count]\n"); return 2; }
     const std::string dir = argv[1];
     rng.seed(argc > 2 ? strtoull(argv[2], nullptr, 10) : 1);
+    rdw::rng.seed((argc > 2 ? strtoull(argv[2], nullptr, 10) : 1) + 7919);
     const int count = argc > 3 ? atoi(argv[3]) : 200;
     rp::g.f = fopen((dir + "/solve.bin").c_str(), "wb");
     rp::g.enabled = rp::g.f != nullptr;
@@ -143,8 +151,14 @@ int main(int argc, char **argv) {
         std::vector<std::unique_ptr<Frame>> fr;
         std::vector<std::unique_ptr<double>> lm;
         const double sc = U(0.3, 1.5);
+        // the window frames live in a real Map; half of the marginalization-like factors are real (built over this very map)
+        rdvio::Map world;
+        const bool real_marg = kind >= 2 && F >= 3 && I(0, 2) == 0 && I(0, 1) == 0;
+        if (real_marg) rdw::make_chain(world, F, I(0, 5) == 0 ? I(0, 3) : I(4, 24), I(0, 3));
+        else for (int i = 0; i < F; ++i) rdw::push_frame(world, true, 0.5, I(0, 6));
         for (int i = 0; i < F; ++i) {
-            fr.emplace_back(new Frame);
+            rdvio::Frame *rf = world.get_frame(i);
+            fr.emplace_back(new Frame{rf->pose.q.coeffs().data(), rf->pose.p.data(), rf->motion.v.data(), rf->motion.bg.data(), rf->motion.ba.data()});
             Frame &f = *fr.back();
             double n = 0;
             for (int k = 0; k < 4; ++k) { f.q[k] = N(); n += f.q[k] * f.q[k]; }
@@ -184,7 +198,11 @@ int main(int argc, char **argv) {
                 if (I(0, 4) != 0)
                     add(15, {fr[i]->q, fr[i]->p, fr[i]->v, fr[i]->bg, fr[i]->ba, fr[i + 1]->q, fr[i + 1]->p, fr[i + 1]->v, fr[i + 1]->bg, fr[i + 1]->ba},
                         {4, 3, 3, 3, 3, 4, 3, 3, 3, 3}, false);
-            if (F >= 3 && I(0, 2) == 0) {  // marginalization-like: all blocks of the first F-1 frames
+            if (real_marg) {  // the real CeresMarginalizationFactor over the first F-1 frames of `world`
+                std::vector<double *> bl;
+                for (int i = 0; i + 1 < F; ++i) { bl.push_back(fr[i]->q); bl.push_back(fr[i]->p); bl.push_back(fr[i]->v); bl.push_back(fr[i]->bg); bl.push_back(fr[i]->ba); }
+                pr.AddResidualBlock(static_cast<rdvio::CeresMarginalizationFactor *>(world.marginalization_factor.get()), nullptr, bl);
+            } else if (F >= 3 && I(0, 2) == 0) {  // marginalization-like: all blocks of the first F-1 frames
                 std::vector<double *> bl;
                 std::vector<int> sz;
                 for (int i = 0; i + 1 < F; ++i) {

@@ -2,9 +2,11 @@ rdvio_port: clean-room pure-C port of RD-VIO (work in progress)
 
 Files under rdvio_port/c/ derived from RD-VIO (Jianxff/rd_vio, Apache-2.0; rd_vio is "separated and modified from" XRSLAM,
 Copyright 2022 XRSLAM Authors, Apache-2.0; full text rdvio_port/LICENSES/rdvio-Apache-2.0.txt) are translations of the original C++ and
-carry that notice: rd_imu.{h,c}, rd_lie.{h,c}, rd_factor.{h,c}, rd_geom.{h,c}, rd_rand.{h,c}, rd_ransac.{h,c}, rd_poisson.{h,c}. The upstream repository names no copyright holder in its LICENSE (unfilled template) and has
+carry that notice: rd_imu.{h,c}, rd_lie.{h,c}, rd_factor.{h,c}, rd_geom.{h,c}, rd_rand.{h,c}, rd_ransac.{h,c}, rd_poisson.{h,c}, rd_marg.{h,c} (module M5, marginalisation prior,
+translated from rdvio_estimation/ceres/marginalization_factor.h). The upstream repository names no copyright holder in its LICENSE (unfilled template) and has
 no per-file headers; the notice above is the conservative reading.
-Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, rd_svd.{h,c}, rd_qr.{h,c}, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
+Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, rd_svd.{h,c}, rd_qr.{h,c}, rd_seig.{h,c} (a generalised copy of the SelfAdjointEigenSolver model of okvis_port/c/ok_eigen.c
+for dynamic n <= 300), the dynamic GEMM / GEMV models inside rd_marg.c, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
 (Copyright (C) Gael Guennebaud, Benoit Jacob and the Eigen authors); they reuse okvis_port/c/ok_eigen.c and ok_dense.c (MPL-2.0 / BSD-3).
 Module M4 (rd_solve.{h,c}, rd_solve_linear.c, rd_solve_internal.h, rd_static.{h,c}) is derived from Ceres Solver 2.2.0 (BSD-3-Clause, Copyright 2023
 Google Inc. All rights reserved; text in rdvio_port/LICENSES/ceres-solver-BSD-3-Clause.txt: redistribution requires retaining that notice, the name of
@@ -17,7 +19,7 @@ as adapted in Eigen), ok_amd.c (Eigen AMDOrdering, MPL-2.0). Later modules deriv
 add their notices here.
 The reference Ceres copy (rdvio_port/reference/ceres_patches/0006-*.patch: instrumentation hooks inside Ceres 2.2.0, BSD-3-Clause) is reference tooling only.
 The reference instrumentation (rdvio_port/reference/patches/0003-*.patch) and the oracle program (rdvio_port/reference_tools) are never
-distributed (patches 0003-0006, ceres_patches/0006, reference_tools/*). EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).
+distributed (patches 0003-0007, ceres_patches/0006, reference_tools/*). EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).
 
 Read-only reuse by path (not copied, notices stay with the originals): okvis_port/c/ok_eigen.c, ok_dense.c (MPL-2.0 / BSD-3),
 stella_port/c/sv_eigen_svd.c, sv_eigen_qr.c, sv_eigen_eigensolver.c (MPL-2.0). rd_qr.c is a copy of stella_port/c/sv_eigen_qr.c (MPL-2.0) with one

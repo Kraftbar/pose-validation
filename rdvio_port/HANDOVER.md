@@ -84,7 +84,7 @@ done with the map layer (M6). Sub-second behaviour is deterministic only because
 * (source reading, not measured) The essential-matrix RANSAC in `Frame::track_keypoints` runs with threshold 1.0 on normalised-plane points (squared Sampson-like error <= 7.68): almost every KLT match is an inlier, so the
   frame-to-frame epipolar check is far weaker than the nominal 1 px; the separate rotation RANSAC (angle threshold) decides the `FT_NO_TRANSLATION` flag.
 
-## Next module: M7 (OpenCV CLAHE / LK / GFTT, the largest bit-exactness risk) or M5 (marginalisation factor: the last ORACLE term of the solver replay); see the M4 section below.
+## Next module: M7 (OpenCV CLAHE / LK / GFTT, the largest bit-exactness risk), then M6 (map layer) / M8-M11; the whole sliding-window refinement (IMU + visual + marginalisation factors, Ceres solve, `marginalize`) is native and exact since M5, see the M5 section at the end.
 
 ## M4 (the Ceres solver: SPARSE_SCHUR + Dogleg) DONE, bit-exact on every dumped Solve() (2026-10-05)
 
@@ -142,8 +142,7 @@ New rules measured here (Ceres 2.2.0 / Eigen 3.4.0; on top of okvis_port/HANDOVE
   So the window refinement is effectively one Gauss-Newton step plus a long tail of rejected shrinking steps (cheap: no new Jacobian), and `iteration_limit` only changes how long the tail runs.
 
 Not covered / not exact yet
-* The marginalisation factor (`CeresMarginalizationFactor::Evaluate`, module M5) is replayed through ORACLE records (the harness feeds the recorded residuals / Jacobians for the same parameter hash and verifies the
-  parameters handed to it); every other factor is evaluated natively with the M1 / M2 code. `SchurEliminator<2,3,4|6|9>` and the other static specialisations cannot occur with these block sizes (tangent 3 / 1) and
+* (superseded by M5) the marginalisation factor was replayed through ORACLE records; it is native now. `SchurEliminator<2,3,4|6|9>` and the other static specialisations cannot occur with these block sizes (tangent 3 / 1) and
   are not implemented; `<2,3,Dynamic>` and `<2,3,3>` are covered by the oracle runs; SPARSE_NORMAL_CHOLESKY / DENSE_SCHUR are not part of this port (okvis_port has them).
 * Only MH_01_easy was dumped (the phone / other-EuRoC problem mixes are not sampled); sampling is every 5th Solve (level 1) with every 4th of those at level 2 (all vectors).
 * Solves that fail in Eigen's LDLT (d == 0: mu increase path) and `step_is_valid == false` paths occur in the random oracle problems (exact) but never in MH_01.
@@ -155,3 +154,57 @@ Not covered / not exact yet
 * Do not use the stock `external/vio3/rd_vio/build` for comparisons of bits: it is fast-math, Ceres 1.14, Eigen 3.3.7.
 * `run_rdvio_reference.py --dump` needs the build to contain patch 0003 (it does by default).
 * Dump sizes: `integ=1` is ~170 MB per MH_01 run; `pie=4` ~290 MB. Delete `runs/rdvio_port/m1*/…/dump` when done (regenerable in 2 min).
+
+## M5 (marginalisation prior: `marginalize` + `Evaluate`) DONE, bit-exact; the whole window solve is native (2026-10-05)
+
+Deliverables (`rdvio_port/`)
+* C: `c/rd_marg.{h,c}` (`rd_marg_init` = `MarginalizationFactor::MarginalizationFactor`, `rd_marg_eval` = `CeresMarginalizationFactor::Evaluate` (residual + row-major Jacobians against the kept
+  linearisation points, `S r + infovec`), `rd_marg_marginalize` = `marginalize(index)`: information matrix from the old prior / victim IMU factor / victim-landmark reprojection factors, landmark Schur
+  complements in ascending track id, victim-frame Schur complement (`Matrix15::inverse()`), `SelfAdjointEigenSolver`, 1e-8 cut, `sqrt_inv_cov`, `infovec`, new linearisation points),
+  `c/rd_seig.{h,c}` (Eigen `SelfAdjointEigenSolver<MatrixXd>` model for n <= 300: generalised copy of okvis `ok_selfadjoint_eig` with heap storage), harness `c/check_rd_m5.c`.
+  `rd_solve.{h,c}` / `check_rd_solve.c` now evaluate the marginalisation factor natively (`RD_SV_T_MAR` = 6 with a payload; the synthetic factors of the M4 oracle are `RD_SV_T_SYN` = 7 and keep the ORACLE replay);
+  the ORACLE records of the real factor are only compared with the native outputs (row `marg`). Reused by path: `okvis_port/c/ok_dense.c` (`ok_gebp`, `ok_gemv_row`, `ok_blocking_sizes`), `rd_eigen.c`, `rd_imu.c`, `rd_factor.c`.
+* Reference: `reference/patches/0007-m5-marginalization-dump.patch` (channel `marg`, `RDVIO_PORT_DUMP_EVERY=marg=n`, `RDVIO_PORT_MARG_FULL_EVERY=n` for the stage matrices; marginalisation factor payload in the 0006 solve snapshot),
+  oracles `reference_tools/rd_m5_oracle.cc` (real `Map` / `Frame` / `Track` / `PreIntegrator` / factors: random windows of 2-13 frames with tracks, chains of `Map::marginalize_frame(0)` + new frames, random `Evaluate` calls with random Jacobian masks) and
+  `reference_tools/rd_world.h` (shared window builder; `rd_m4_oracle.cc` now also puts REAL marginalisation factors into half of its dense marginalisation-like factors). Runner: `tools/check_rdvio_port.py --modules m5`
+  (`--tag5`, `--chains5`, `--steps5`); the m4 row now defaults to the dump tag `m5` (the old `m4c` dump has no marginalisation payload and is not replayable).
+* Dump recipe (MH_01, own images under `external/vio/data/rdvio_m5/MH_01_easy`, deleted afterwards): solve + marg dump `run_rdvio_reference.py MH_01_easy --tag m5 --data-dir ... --dump --dump-every "integ=0,pred=0,pie=0,plus=0,rpe=0,rot=0,wahba=0,ess5=0,hom4=0,decess=0,dechom=0,tri2=0,trin=0,trk=0,tang=0,glp=0,slp=0,fess=0,frot=0,fhom=0,pess=0,phom=0,pois=0,marg=3" --solve-dump --solve-every 5 --solve-full-every 4`
+  with `RDVIO_PORT_MARG_FULL_EVERY=3` (90 s, 222 MB marg.bin + 310 MB solve.bin); the M2 / M3 dump (`--tag m23 --dump-every "integ=0,pred=0,pie=0,plus=0"`, 93 s, 1.2 GB incl. the complete marg.bin = all 617 marginalisations of MH_01) is what the m2 / m3 / m5 rows of the table below used (deleted afterwards like the images and the oracle dirs; `runs/rdvio_port/m5` (0.5 GB: marg.bin every 3rd call + solve.bin) is kept and is the default dump of the m4 / m5 rows; m1 / m4c are older dumps of earlier sessions, untouched).
+  All dumped runs keep the canonical trajectory sha256 `f0d60a3e03c1...` (ATE SE3 0.1514 m, Sim3 0.1491 m).
+
+Result (`python3 tools/check_rdvio_port.py --modules m1,m2,m3,m4,m5 --oracle --seeds 1,2,3 --tag m1 --tag2 m23 --tag3 m23 --tag4 m5 --tag5 m23 --count 20000 --count4 300 --chains5 30 --steps5 4`, tolerance 0, bitwise; exit 0):
+
+| row | source | records | values compared | mismatches |
+|---|---|---|---|---|
+| m1 | MH_01 dump m1 (integ 27,886 / pred 10,896 / pie 3,546 / plus 747) | 43,075 | 14,563,205 | 0 |
+| m1 | oracle seeds 1,2,3 x 20000 | | 12.04 M / 12.05 M / 12.09 M | 0 |
+| m2 | MH_01 dump m23 (rpe 459,072, slp 397,921, glp 70,745, trk / trin 34,472, tri2 400, ...) | | 3,523,610 | 0 |
+| m2 | oracle seeds 1,2,3 x 20000 | | 2.98 M / 2.98 M / 2.97 M | 0 |
+| m3 | MH_01 dump m23 (fess 3,681, frot 3,680, pess 440, pois 7,361, fhom 1) | | 5,073,925 | 0 |
+| m3 | oracle seeds 1,2,3 x 20000 | | 1.41 M / 1.43 M / 1.40 M | 0 |
+| m4 | MH_01 solve dump m5 (1455 solves, all factors native): reduced 593,602 / iter 802,094 / dogleg 171,654 / gn 49,446 / schur 11,640 / sparse 225,135 / end 13,095 / **marg 10,676,508 (3,847 Evaluate calls)** | 1,455 solves | 12,543,174 | 0 |
+| m4 | oracle seeds 1,2,3 x 300 random problems (half of the dense marginalisation-like factors are REAL marginalisation factors: marg 507 / 509 / 724 Evaluate calls, 0.74 M / 0.82 M / 1.09 M values) | 899 solves | 7.57 M / 6.21 M / 8.10 M | 0 |
+| m5 | MH_01 dump m23, marg.bin: every marginalisation (priors 12 x 15 = 180 (588) and 13 x 15 = 195 (29)), 168,291 victim landmarks / 1,151,899 observations; outputs: lin 118,928, sqrt_inv_cov 20,153,925, infovec 111,495; stage matrices on 155 records: infomat 5,055,750, infovec 27,990, eigenvalues 27,990, eigenvectors 5,055,750 | 617 | 30,551,828 | 0 |
+| m5 | MH_01 dump m5 (every 3rd call) | 206 | 11,331,816 | 0 |
+| m5 | oracle seeds 1,2,3 (30 chains x 4 steps, windows of 2-13 frames incl. direct `marginalize(index > 0)` calls, priors 15 ... 180): marg 152 / 144 / 151 records, 6.94 M / 8.53 M / 7.63 M values; random Evaluate calls (random Jacobian masks) 450 x 3 records, 2.74 M / 3.67 M / 2.99 M values | | 9.67 M / 12.20 M / 10.62 M | 0 |
+
+### The dynamic eigensolver was NOT a blocker: new Eigen 3.4.0 facts (Ceres/Eigen flags as before)
+* `SelfAdjointEigenSolver<MatrixXd>` for n = 15 ... 195 is exactly the okvis model with larger scratch: `tridiagonalization_inplace` is NOT blocked at any size (column-by-column symv + rank-2 update; the symv peeling follows the parity of the
+  heap-aligned `m_hcoeffs`, 0), and `mat = HouseholderSequence(mat, hCoeffs).setLength(n-1).setShift(1)` takes the `is_same_dense` in-place branch for every n, so the blocked application (BlockSize 48) is never used. The QL iteration, `hypot`, Givens
+  and the first-minimum selection sort are unchanged; the sort only runs on `Success` (after 30 n iterations without convergence Eigen returns the UNSORTED result and does not throw; never hit in real data or the oracle).
+* Dynamic GEMM (`block -= (A*inv)*B`, `J^T J`, `S * dr`): `general_matrix_matrix_product` with `computeProductBlockingSizes` (`ok_blocking_sizes`, kc 1): for depth <= 195 it never changes a sum (chunk boundaries fall on multiples of 4; removing the blocking in the
+  port gives 0 mismatches), but the loops are kept. A nested product `(A*inv)*B` is evaluated first into a zeroed column-major temporary (`0 + 1*acc`), then the outer GEMM runs with alpha = -1 on the destination (`R + (-1)*acc`); `block += A^T B` with a dynamic depth
+  accumulates in place. `Map<RowMajor> = S * Map<RowMajor>` evaluates into a column-major temporary (rows N, cols 3 / 4, depth N) and copies.
+* Column-major GEMV (`general_matrix_vector_product<ColMajor>`): `block_cols = 16` for `cols >= 128` (and lhsStride*8 < 32000): one accumulator per row per 16-column block, `y = acc*alpha + y` after every block (matters for the 135 ... 195 column whitening `S * r`).
+* `diag.asDiagonal() * V.transpose() * b` (lazy diagonal product as the lhs of a GEMV, `infovec`): `gemv_dense_selector<OnTheRight,RowMajor,false>` = `dest(i) += alpha * (lhs.row(i).cwiseProduct(b^T)).sum()` with the LinearVectorized dynamic redux (two two-lane accumulators, the same as `squaredNorm` / `dot`) over the
+  terms `(d_i V(k,i)) * b_k`; a left fold or a single two-lane accumulator both fail (measured, 4.5-5.0 k of 5.9 k mismatches against real Eigen). `diag * V^T` itself is the elementwise `d_i * V(j,i)` (zero eigenvalues give `+-0`).
+* `S * x + b` with a dynamic S: the product evaluates into a temporary (GEMV, `0 + acc`), then the elementwise sum. Small products of the visual factors (`3x2 * 2x3`, `3x2 * 2x1`, `1x2 * 2x3`, the 1x2 . 2x1 inner product): the left fold `(a0 b0) + (a1 b1)` for every entry; the landmark
+  elimination `block -= (h_i^T * inv) * h_j` is an OUTER product `dst.col(j) -= h_j[j] * (h_i^T * inv)` (the scalar is applied to the lhs first, never extracted), and `(h_i^T * inv) * vec` is the left-associated scalar chain `((h_i inv) vec)`.
+  The `unordered_map` iteration order of a landmark's frame entries does not matter (every (i, j) block and every segment is touched once per landmark); the landmark order (`std::map<Track*, ..., compare>`) is ascending track id.
+* The real map holds 13 or 14 frames at `marginalize` time (sliding_window_size 12, `while (frame_num > 12)`), so the priors are 12 x 15 = 180 (588 of 617 calls) or 13 x 15 = 195 (29): `RD_EIG_MAX` = 300.
+
+Not covered / not exact yet
+* Eigensolver `NoConvergence` (Eigen returns the unsorted result; the port does the same but it was never exercised), `inv_infomat` not finite (landmark skipped, `isfinite`), observations of the victim's landmarks in frames that are not in the map (skipped; the dump never contains them). `marginalize(index > 0)` is never called by the real code (`Map::marginalize_frame` asserts index == 0); the port is generic in the index and the M5 oracle exercises it through direct factor calls.
+* The map layer that decides WHICH tracks / observations reach `marginalize` (valid, anchored in a keyframe victim, factor existence) is C++ in the dump patch only; M6 has to port that selection.
+
+Why it scores what it scores (M5, from source reading + measurements): see PLAN.md section 6, "Marginalisation keeps linearisation points".

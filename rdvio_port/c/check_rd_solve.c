@@ -4,8 +4,8 @@
  *   check_rd_solve <dump_dir>   |   check_rd_solve <label> <dump_dir> [max_solves]
  *
  * Replays every snapshotted Solve() of <dump_dir>/solve.bin (patch 0006 + ceres_patches/0006, layout in rd_solve.h): the Problem
- * is rebuilt from the PROBLEM record (M1/M2 factors evaluated natively; the marginalization factor, module M5, through the
- * ORACLE records), rd_sv_solve runs, and at every observation point the C state is compared bitwise with the dumped record: the
+ * is rebuilt from the PROBLEM record (every factor is evaluated natively: M1 / M2 factors and the marginalization factor of module M5;
+ * the ORACLE records of the real marginalization factor are only compared with the native outputs, the 'marg' row), rd_sv_solve runs, and at every observation point the C state is compared bitwise with the dumped record: the
  * reduced/reordered program (Schur ordering + AMD of the Schur columns + lexicographic residual order), every iteration summary
  * and the hashes (or, at level 2, the full vectors) of x, delta, step, gradient, scaling, residuals; the Dogleg and
  * Gauss-Newton internals; the Schur structure; the reduced Schur system as handed to the sparse Cholesky and its solution; the END
@@ -25,7 +25,7 @@ enum { R_SOLVE = 1, R_PROBLEM = 2, R_REDUCED = 3, R_ITER = 4, R_DOGLEG = 5, R_GN
 typedef struct rec { uint32_t tag; uint64_t len; unsigned char* p; } rec;
 typedef struct counts { long bad, tot, recs, badrecs; } counts;
 
-static counts C_reduced, C_iter, C_dogleg, C_gn, C_schur, C_sparse, C_oracle, C_end;
+static counts C_reduced, C_iter, C_dogleg, C_gn, C_schur, C_sparse, C_oracle, C_marg, C_end;
 static long G_solves_total, G_solves_replayed, G_level0, G_struct_bad;
 static int G_debug, G_dbg_printed;
 static long G_only = -1;   /* RD_ONLY=<solve id>: print the mismatches of that solve only */
@@ -141,6 +141,42 @@ static int h_oracle(void* ctx, const rd_sv_resid* rb, const double* const* param
     }
     if (bad) C_oracle.badrecs++;
     return 1;
+}
+
+/* native marginalization factor outputs against the real ones (the ORACLE record of the same evaluation) */
+static void h_marg(void* ctx, const rd_sv_resid* rb, const double* const* params, const double* residuals, double* const* jacobians) {
+    solve_ctx* X = (solve_ctx*)ctx;
+    rec* r = next_rec(X, R_ORACLE, "ORACLE");
+    cur c;
+    uint64_t ptr, hp, h = 1469598103934665603ULL;
+    uint32_t have_jac, nb, nres, nonnull[RD_SV_MAXB];
+    uint32_t k;
+    C_marg.recs++;
+    if (!r) { C_marg.badrecs++; return; }
+    c.p = r->p; c.off = 0; c.len = r->len; c.bad = 0;
+    ptr = cu64(&c); hp = cu64(&c); have_jac = cu32(&c); nb = cu32(&c);
+    for (k = 0; k < nb && k < RD_SV_MAXB; ++k) nonnull[k] = cu32(&c);
+    nres = cu32(&c);
+    G_kind = "marg";
+    {
+        long before = C_marg.bad;
+        cmp_u64(&C_marg, "marg.ptr", rb->ptr, ptr);
+        for (k = 0; k < (uint32_t)rb->nb; ++k) h = rd_fnv_combine(h, rd_fnv(params[k], 8 * (size_t)X->pb->p[rb->blk[k]].size));
+        cmp_u64(&C_marg, "marg.params", h, hp);
+        cmp_i(&C_marg, "marg.nres", rb->nres, nres);
+        cmp_i(&C_marg, "marg.have_jac", jacobians != NULL, have_jac);
+        if ((uint32_t)rb->nb != nb || nb > RD_SV_MAXB) { C_marg.badrecs++; return; }
+        cmp_vec(&C_marg, "marg.residual", residuals, cf64n(&c, nres), (long)nres);
+        for (k = 0; k < nb; ++k) {
+            const uint32_t size = (uint32_t)X->pb->p[rb->blk[k]].size;
+            cmp_i(&C_marg, "marg.jac_nonnull", jacobians && jacobians[k] ? 1 : 0, nonnull[k]);
+            if (nonnull[k]) {
+                const double* J = cf64n(&c, (size_t)nres * size);
+                if (jacobians && jacobians[k]) cmp_vec(&C_marg, "marg.jac", jacobians[k], J, (long)nres * size);
+            }
+        }
+        if (C_marg.bad != before) C_marg.badrecs++;
+    }
 }
 
 static void h_reduced(void* ctx, const rd_sv_problem* pb, double fixed_cost, int num_eliminate_blocks, int np_red,
@@ -415,6 +451,34 @@ static void resolve_live(rd_sv_problem* pb) {
         }
 }
 
+/* type 6 payload: nff, lin points, sqrt_inv_cov, infovec (rd_solve.h) */
+static void rd_marg_payload(cur* c, rd_sv_resid* rb) {
+    const uint32_t nff = cu32(c);
+    uint32_t i;
+    long N = (long)nff * 15;
+    rd_marg* m = (rd_marg*)calloc(1, sizeof(rd_marg));
+    rb->marg = m;
+    if (nff > 64 || (long)rb->nb != 5 * (long)nff || (long)rb->nres != N) { c->bad = 1; return; }
+    m->nf = (int)nff;
+    m->ids = (uint64_t*)calloc(nff ? nff : 1, 8);
+    m->lin_pose = (rd_pose*)calloc(nff ? nff : 1, sizeof(rd_pose));
+    m->lin_motion = (rd_motion*)calloc(nff ? nff : 1, sizeof(rd_motion));
+    for (i = 0; i < nff; ++i) {
+        const double* v = cf64n(c, 16);
+        if (!v) return;
+        m->lin_pose[i].q.x = v[0]; m->lin_pose[i].q.y = v[1]; m->lin_pose[i].q.z = v[2]; m->lin_pose[i].q.w = v[3];
+        memcpy(m->lin_pose[i].p, v + 4, 24); memcpy(m->lin_motion[i].v, v + 7, 24); memcpy(m->lin_motion[i].bg, v + 10, 24); memcpy(m->lin_motion[i].ba, v + 13, 24);
+    }
+    m->sqrt_inv_cov = (double*)calloc((size_t)(N * N) + 1, 8);
+    m->infovec = (double*)calloc((size_t)N + 1, 8);
+    {
+        const double* v = cf64n(c, (size_t)(N * N));
+        if (v) memcpy(m->sqrt_inv_cov, v, 8 * (size_t)(N * N));
+        v = cf64n(c, (size_t)N);
+        if (v) memcpy(m->infovec, v, 8 * (size_t)N);
+    }
+}
+
 static rd_sv_problem* build_problem(const rec* r, const rd_sv_options* opt, int* ok) {
     cur c;
     rd_sv_problem* pb = (rd_sv_problem*)calloc(1, sizeof(rd_sv_problem));
@@ -453,7 +517,9 @@ static rd_sv_problem* build_problem(const rec* r, const rd_sv_options* opt, int*
             case RD_SV_T_RPP: rd_vis(&c, &rb->term.vis); rd_live(&c, rb); break;
             case RD_SV_T_ROP: rd_vis(&c, &rb->term.vis); rd_live(&c, rb); break;   /* z z_ref cam_ref cam_tgt sqrt_inv_cov: same prefix */
             case RD_SV_T_PIE: case RD_SV_T_PIP: rd_pie(&c, &rb->term.pie); rd_live(&c, rb); break;
-            default: rb->oracle = 1; break;
+            case RD_SV_T_MAR: rd_marg_payload(&c, rb); break;
+            case RD_SV_T_SYN: rb->oracle = 1; break;
+            default: c.bad = 1; break;
         }
         c.off = pend;
         if (rb->loss == RD_SV_LOSS_OTHER) c.bad = 1;
@@ -466,6 +532,7 @@ static void free_problem(rd_sv_problem* pb) {
     int i;
     if (!pb) return;
     for (i = 0; i < pb->np; ++i) free(pb->p[i].x);
+    for (i = 0; i < pb->nr; ++i) if (pb->r[i].marg) { rd_marg_free(pb->r[i].marg); free(pb->r[i].marg); }
     free(pb->p); free(pb->r); free(pb);
 }
 
@@ -584,7 +651,7 @@ int main(int argc, char** argv) {
                 if (ok) {
                     memset(&hooks, 0, sizeof hooks);
                     hooks.ctx = &X;
-                    hooks.oracle = h_oracle; hooks.on_reduced = h_reduced; hooks.on_iter = h_iter; hooks.on_dogleg = h_dogleg;
+                    hooks.oracle = h_oracle; hooks.on_marg = h_marg; hooks.on_reduced = h_reduced; hooks.on_iter = h_iter; hooks.on_dogleg = h_dogleg;
                     hooks.on_gn = h_gn; hooks.on_schur = h_schur; hooks.on_sparse = h_sparse; hooks.on_end = h_end;
                     rd_sv_solve(X.pb, &hooks);
                     G_solves_replayed++;
@@ -606,11 +673,11 @@ int main(int argc, char** argv) {
     }
     fclose(f);
     print_kind("reduced", &C_reduced); print_kind("iter", &C_iter); print_kind("dogleg", &C_dogleg); print_kind("gn", &C_gn);
-    print_kind("schur", &C_schur); print_kind("sparse", &C_sparse); print_kind("oracle", &C_oracle); print_kind("end", &C_end);
+    print_kind("schur", &C_schur); print_kind("sparse", &C_sparse); print_kind("oracle", &C_oracle); print_kind("marg", &C_marg); print_kind("end", &C_end);
     printf("  solves: %ld replayed of %ld (%ld summary-only), %ld with mismatches, %ld structural errors\n", G_solves_replayed,
            G_solves_total, G_level0, solves_bad, G_struct_bad);
-    bad = C_reduced.bad + C_iter.bad + C_dogleg.bad + C_gn.bad + C_schur.bad + C_sparse.bad + C_oracle.bad + C_end.bad + G_struct_bad;
-    tot = C_reduced.tot + C_iter.tot + C_dogleg.tot + C_gn.tot + C_schur.tot + C_sparse.tot + C_oracle.tot + C_end.tot + G_struct_bad;
+    bad = C_reduced.bad + C_iter.bad + C_dogleg.bad + C_gn.bad + C_schur.bad + C_sparse.bad + C_oracle.bad + C_marg.bad + C_end.bad + G_struct_bad;
+    tot = C_reduced.tot + C_iter.tot + C_dogleg.tot + C_gn.tot + C_schur.tot + C_sparse.tot + C_oracle.tot + C_marg.tot + C_end.tot + G_struct_bad;
     printf("%s: %ld/%ld\n", label, bad, tot);
     return bad == 0 && tot > 0 ? 0 : 1;
 }

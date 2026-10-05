@@ -49,7 +49,9 @@
  *                  4 PreIntegrationError: pre{t, q[4], p[3], v[3], dq_dbg dp_dbg dp_dba dv_dbg dv_dba (5x9), sqrt_inv_cov[225]}
  *                        imu_i{q[4] p[3]} imu_j{q[4] p[3]}, live{bg_i, ba_i}   blocks 10 (q p v bg ba) x 2
  *                  5 PreIntegrationPrior: as 4, live{q_i, p_i, v_i, bg_i, ba_i}   blocks 5 (frame j)
- *                  6 Marginalization: no payload (evaluated through the ORACLE records)
+ *                  6 Marginalization: nff, nff x {lin pose q[4] p[3], lin motion v[3] bg[3] ba[3]}, sqrt_inv_cov[N*N] (column-major), infovec[N], N = 15 nff
+ *                        (patch 0007; blocks 5 nff, evaluated natively by rd_marg_eval (module M5); the ORACLE records only verify the outputs)
+ *                  7 Synthetic (oracle programs only): evaluated through the ORACLE records
  *   PROGRAM (12): u32 np, u64 ptr[np], u32 nr, u64 ptr[nr]: program order at Solve() entry
  *   REDUCED (3) : u32 status, f64 fixed_cost, u32 num_eliminate_blocks, u32 linear_solver_type, u32 np_reduced, u64 ptr[np_reduced]
  *                (order after Schur ordering AND the AMD pre-ordering of the f blocks), u32 nr_reduced, u64 ptr[nr_reduced]
@@ -58,7 +60,8 @@
  *   SPARSE (9)  : the REDUCED SCHUR system handed to EigenSparseCholesky: u32 n, u32 nnz, u32 storage_type, u32 cholesky_storage_type,
  *                u64 fnv(values), fnv(rhs), fnv(rows), fnv(cols); level 2: i32 rows[n+1], i32 cols[nnz], f64 values[nnz], f64 rhs[n];
  *                u32 termination, u64 fnv(x); level 2 && success: f64 x[n]
- *   ORACLE (10) : raw outputs of the marginalization factor evaluations (as okvis_port/c/ok_solve.h)
+ *   ORACLE (10) : raw outputs of the evaluations of the real marginalization factor (type 6: compared with the native outputs) or of the
+ *                synthetic factors (type 7: replayed) (as okvis_port/c/ok_solve.h)
  */
 #ifndef RD_SOLVE_H
 #define RD_SOLVE_H
@@ -66,13 +69,14 @@
 #include <stdlib.h>
 #include "rd_factor.h"
 #include "rd_imu.h"
+#include "rd_marg.h"
 
 #define RD_SV_MAXB 64   /* the marginalization factor of a 12-frame window has 55 parameter blocks */
 
 uint64_t rd_fnv(const void* p, size_t n);                 /* FNV-1a 64 */
 uint64_t rd_fnv_combine(uint64_t h, uint64_t block_hash); /* h ^= block; h *= prime */
 
-enum { RD_SV_T_UNKNOWN = 0, RD_SV_T_RPE = 1, RD_SV_T_RPP = 2, RD_SV_T_ROP = 3, RD_SV_T_PIE = 4, RD_SV_T_PIP = 5, RD_SV_T_MAR = 6 };
+enum { RD_SV_T_UNKNOWN = 0, RD_SV_T_RPE = 1, RD_SV_T_RPP = 2, RD_SV_T_ROP = 3, RD_SV_T_PIE = 4, RD_SV_T_PIP = 5, RD_SV_T_MAR = 6, RD_SV_T_SYN = 7 };
 enum { RD_SV_KIND_NONE = 0, RD_SV_KIND_QUAT = 1, RD_SV_KIND_OTHER = 3 };
 enum { RD_SV_LOSS_NONE = 0, RD_SV_LOSS_CAUCHY = 1, RD_SV_LOSS_OTHER = 2 };
 /* ceres::LinearSolverType values */
@@ -119,7 +123,8 @@ typedef struct rd_sv_resid {
     union { rd_sv_vis vis; rd_sv_pie pie; } term;
     int nlive;
     rd_sv_live live[5];
-    int oracle;                      /* evaluated through rd_sv_hooks.oracle (marginalization factor) */
+    int oracle;                      /* evaluated through rd_sv_hooks.oracle (synthetic factors of the oracle programs) */
+    rd_marg* marg;                   /* marginalization factor state (type 6), owned by the problem */
 } rd_sv_resid;
 
 typedef struct rd_sv_problem {
@@ -157,10 +162,12 @@ typedef struct rd_sv_end { int termination_type, num_iterations, num_successful_
 
 typedef struct rd_sv_hooks {
     void* ctx;
-    /* evaluate a not-ported residual block (marginalization factor): fill residuals (nres) and the non-NULL jacobians
+    /* evaluate a not-ported residual block (synthetic oracle factor, type 7): fill residuals (nres) and the non-NULL jacobians
      * (nres x size row-major, ambient); return 1 on success */
     int (*oracle)(void* ctx, const rd_sv_resid* rb, const double* const* params, double* residuals,
                   double* const* jacobians);
+    /* called after the native evaluation of a marginalization factor with its outputs (a harness compares them with the real ones) */
+    void (*on_marg)(void* ctx, const rd_sv_resid* rb, const double* const* params, const double* residuals, double* const* jacobians);
     void (*on_reduced)(void* ctx, const rd_sv_problem* pb, double fixed_cost, int num_eliminate_blocks,
                        int np_reduced, const int* param_order, int nr_reduced, const int* resid_order);
     void (*on_iter)(void* ctx, const rd_sv_iter* it);

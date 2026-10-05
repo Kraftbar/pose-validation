@@ -301,6 +301,11 @@ static int cost_function_evaluate(rd_sv_state* S, rd_sv_resid* rb, const double*
             rd_pie_eval(&e->pre, &e->imu_i_q, e->imu_i_p, &e->imu_j_q, e->imu_j_p, p10[3], p10[4], p10, res, jac ? j10 : NULL);
             return 1;
         }
+        case RD_SV_T_MAR: {   /* CeresMarginalizationFactor::Evaluate (module M5) */
+            const int ok = rb->marg ? rd_marg_eval(rb->marg, params, res, jac) : 0;
+            if (ok && S->hooks && S->hooks->on_marg) S->hooks->on_marg(S->hooks->ctx, rb, params, res, jac);
+            return ok;
+        }
         default:
             if (S->hooks && S->hooks->oracle) return S->hooks->oracle(S->hooks->ctx, rb, params, res, jac);
             return 0;
