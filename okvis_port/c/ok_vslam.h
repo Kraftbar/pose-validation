@@ -69,6 +69,8 @@ typedef struct ok_vsb_cam_view {
     double T_SC[7];                           /* MultiFrame::T_SC(i) (set by addStates; the NCameraSystem extrinsics) */
     float* kp;                                /* nkp x {x, y, size} */
     uint64_t* lm;                             /* landmark id per keypoint */
+    double* lmhp;                             /* Frame::landmarks_: nkp x 4, the landmark in the sensor frame (zero until convertToPoseGraphMst) */
+    unsigned char* lminit;                    /* Frame::landmarkInitialisations_ */
 } ok_vsb_cam_view;
 typedef struct ok_vsb_frame_view { int alive, ncam; ok_vsb_cam_view cam[OK_VSB_MAXCAM]; } ok_vsb_frame_view;
 /* ViSlamBackend::overlapFraction(frameA, frameB) with kptradius_ (NaN when both images are cleared, as in the C++) */
@@ -146,6 +148,11 @@ int ok_vsb_clear(ok_vsb* b);
 int ok_vsb_needs_full_graph_optimisation(const ok_vsb* b);
 int ok_vsb_is_loop_closing(const ok_vsb* b);
 int ok_vsb_is_loop_closure_available(const ok_vsb* b);
+/* auxiliaryStates_ / loopClosureFrames_ queries of the frontend's place recognition block (module 7d) */
+int ok_vsb_is_pose_graph_frame(const ok_vsb* b, uint64_t id);
+int ok_vsb_is_place_recognition_frame(const ok_vsb* b, uint64_t id);
+int ok_vsb_is_loop_closure_frame(const ok_vsb* b, uint64_t id);
+int ok_vsb_is_recent_loop_closure_frame(const ok_vsb* b, uint64_t id);
 const ok_idset* ok_vsb_key_frames(const ok_vsb* b);
 const ok_idset* ok_vsb_imu_frames(const ok_vsb* b);
 const ok_idset* ok_vsb_loop_closure_frames(const ok_vsb* b);

@@ -121,6 +121,9 @@ typedef struct ok_sv_options {
     double initial_trust_region_radius, max_trust_region_radius, min_trust_region_radius;
     double min_relative_decrease, min_lm_diagonal, max_lm_diagonal;
     int jacobi_scaling, max_num_consecutive_invalid_steps;
+    int strategy_lm;      /* 1: LEVENBERG_MARQUARDT (ceres::Solver::Options default; used by the place-recognition quickSolver of
+                           * module 7d), 0: TRADITIONAL_DOGLEG (ViGraph::optimise, the default of this struct) */
+    double cauchy_a;      /* CauchyLoss(a) scale of the residual blocks with a loss (0 = 1.0, the graph's CauchyLoss(1)) */
 } ok_sv_options;
 
 typedef struct ok_sv_param {

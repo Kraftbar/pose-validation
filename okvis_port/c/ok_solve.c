@@ -261,9 +261,9 @@ static int cost_function_evaluate(ok_sv_state* S, ok_sv_resid* rb, const double*
     }
 }
 
-/* CauchyLoss(a = 1): b = a^2, c = 1/b */
-static void cauchy_evaluate(double s, double rho[3]) {
-    const double b = 1.0, c = 1.0;
+/* CauchyLoss(a): b = a^2, c = 1/b */
+static void cauchy_evaluate(double a, double s, double rho[3]) {
+    const double b = a * a, c = 1.0 / b;
     const double sum = 1.0 + s * c;
     const double inv = 1.0 / sum;
     rho[0] = b * log(sum);
@@ -306,7 +306,7 @@ int ok_sv_eval_block(ok_sv_state* S, ok_sv_resid* rb, const double* const* param
     {
         double rho[3], sqrt_rho1, residual_scaling, alpha_sq_norm;
         int i;
-        cauchy_evaluate(sq, rho);
+        cauchy_evaluate(S->pb->opt.cauchy_a > 0.0 ? S->pb->opt.cauchy_a : 1.0, sq, rho);
         *cost = 0.5 * rho[0];
         if (!jacobians && !residuals) return 1;
         /* Corrector */
@@ -477,6 +477,7 @@ static void dogleg_init(ok_sv_dogleg_state* D, const ok_sv_options* o, int n) {
     D->increase_threshold = 0.75; D->decrease_threshold = 0.25;
     D->dogleg_step_norm = 0.0;
     D->reuse = 0;
+    D->decrease_factor = 2.0;
     D->n = n;
     D->diagonal = (double*)xcalloc((size_t)n, sizeof(double));
     D->gradient = (double*)xcalloc((size_t)n, sizeof(double));
@@ -616,6 +617,42 @@ static void dogleg_step_accepted(ok_sv_dogleg_state* D, double step_quality) {
 static void dogleg_step_rejected(ok_sv_dogleg_state* D) { D->radius *= 0.5; D->reuse = 1; }
 static void dogleg_step_invalid(ok_sv_dogleg_state* D) { D->mu *= D->mu_increase_factor; D->reuse = 0; }
 
+/* ----------------------------------------- Levenberg-Marquardt strategy ------------------------------------- */
+/* LevenbergMarquardtStrategy::ComputeStep (levenberg_marquardt_strategy.cc): D = sqrt(diagonal / radius); returns the linear
+ * solver termination type; the step is negated on success */
+static int lm_compute_step(ok_sv_state* S, double* step) {
+    ok_sv_dogleg_state* D = &S->dog;
+    const int n = D->n;
+    int term, i, valid = 1;
+    if (!D->reuse) {
+        squared_column_norm(S, D->diagonal);
+        for (i = 0; i < n; ++i) {
+            double v = D->diagonal[i];
+            v = (v < D->min_diagonal) ? D->min_diagonal : v;      /* array().max(min_diagonal) */
+            v = (D->max_diagonal < v) ? D->max_diagonal : v;      /* .min(max_diagonal) */
+            D->diagonal[i] = v;
+        }
+    }
+    for (i = 0; i < n; ++i) D->lm_diagonal[i] = sqrt(D->diagonal[i] / D->radius);
+    for (i = 0; i < n; ++i) step[i] = NAN;                        /* InvalidateArray */
+    term = ok_sv_linear_solve(S, D->lm_diagonal, step);
+    if (term != OK_SV_LS_FATAL_ERROR && term != OK_SV_LS_FAILURE) {
+        for (i = 0; i < n; ++i) if (!(step[i] == step[i]) || fabs(step[i]) > 1.7976931348623157e308) valid = 0;
+        if (!valid) term = OK_SV_LS_FAILURE;
+        else for (i = 0; i < n; ++i) step[i] = -step[i];
+    }
+    D->reuse = 1;
+    return term;
+}
+static void lm_step_accepted(ok_sv_dogleg_state* D, double step_quality) {
+    const double t = 1.0 - pow(2.0 * step_quality - 1.0, 3.0);
+    D->radius = D->radius / ((1.0 / 3.0 < t) ? t : 1.0 / 3.0);   /* std::max(1/3, 1 - pow(2q - 1, 3)) */
+    D->radius = (D->max_radius < D->radius) ? D->max_radius : D->radius;
+    D->decrease_factor = 2.0;
+    D->reuse = 0;
+}
+static void lm_step_rejected(ok_sv_dogleg_state* D) { D->radius = D->radius / D->decrease_factor; D->decrease_factor *= 2.0; D->reuse = 1; }
+
 /* -------------------------------------------- TrustRegionMinimizer ---------------------------------------- */
 static int evaluate_gradient_and_jacobian(ok_sv_state* S) {
     int i;
@@ -674,7 +711,7 @@ static int finalize_iteration(ok_sv_state* S) {
 static int compute_trust_region_step(ok_sv_state* S) {
     int term, i;
     S->it.step_is_valid = 0;
-    term = dogleg_compute_step(S, S->residuals, S->trust_region_step);
+    term = S->pb->opt.strategy_lm ? lm_compute_step(S, S->trust_region_step) : dogleg_compute_step(S, S->residuals, S->trust_region_step);
     if (term == OK_SV_LS_FATAL_ERROR) { S->termination = OK_SV_FAILURE; return 0; }
     if (term == OK_SV_LS_FAILURE) return 1;
     S->step_valid = 1;
@@ -695,7 +732,7 @@ static int handle_invalid_step(ok_sv_state* S) {
         S->termination = OK_SV_FAILURE;
         return 0;
     }
-    dogleg_step_invalid(&S->dog);
+    if (S->pb->opt.strategy_lm) lm_step_rejected(&S->dog); else dogleg_step_invalid(&S->dog);   /* StepIsInvalid = StepRejected(-DBL_MAX) */
     S->it.cost = S->x_cost + S->fixed_cost;
     S->it.cost_change = 0.0;
     S->it.gradient_max_norm = S->last_iteration.gradient_max_norm;
@@ -785,14 +822,14 @@ static void minimize(ok_sv_state* S) {
             memcpy(S->x, S->candidate_x, sizeof(double) * (size_t)S->num_parameters);
             if (!evaluate_gradient_and_jacobian(S)) { S->termination = OK_SV_FAILURE; return; }
             S->it.step_is_successful = 1;
-            dogleg_step_accepted(&S->dog, S->it.relative_decrease);
+            if (S->pb->opt.strategy_lm) lm_step_accepted(&S->dog, S->it.relative_decrease); else dogleg_step_accepted(&S->dog, S->it.relative_decrease);
             step_evaluator_accepted(&S->se, S->candidate_cost, S->model_cost_change);
         } else {
             S->it.step_is_successful = 0;
             S->it.cost = S->candidate_cost + S->fixed_cost;
             S->it.gradient_norm = previous_gradient_norm;
             S->it.gradient_max_norm = previous_gradient_max_norm;
-            dogleg_step_rejected(&S->dog);
+            if (S->pb->opt.strategy_lm) lm_step_rejected(&S->dog); else dogleg_step_rejected(&S->dog);
         }
     }
 }

@@ -73,6 +73,13 @@ watch".
   Dorian Galvez-Lopez on redistribution and keep the DBoW2 notice. If it is implemented from the
   paper (Galvez-Lopez & Tardos, T-RO 2012) plus black-box behavioural checks, no DBoW2 notice/clause
   applies. Recommended: the second route (also FBoW, MIT, is already vendored for stella).
+* Status 2026-10-05 (module 7d): `okvis_port/c/ok_dbow.{h,c}` was written while reading DBoW2's `TemplatedVocabulary::transform`,
+  `TemplatedDatabase::{add,queryL1}`, `BowVector`, `QueryResults` and OKVIS2's `FBrisk` / `getFilteredDBoWResult`, i.e. it is the FIRST
+  route (a source-level port): the DBoW2 notice is carried (okvis_port/NOTICE, `okvis_port/LICENSES/dbow2-LICENSE.txt`) and the clause
+  applies, i.e. Dorian Galvez-Lopez must be notified before okvis_port is redistributed in source or binary form (not done: nothing
+  has been redistributed). The vocabulary file stays a reference-run input: `tools/convert_okvis_vocabulary.py` writes it into the
+  gitignored `runs/okvis_port/vocabulary/`; a product needs an own vocabulary (see above). The scoring / transform semantics are
+  validated bit for bit against the reference (3.4 M query values on mono + stereo, HANDOVER 2026-10-05).
 
 ## What the port must replace / watch
 

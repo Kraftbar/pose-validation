@@ -90,7 +90,7 @@ static void fr_erase(ok_vsb* b, uint64_t id) {
     vframe* f = fr_get(b, id);
     int c;
     if (!f) return;
-    for (c = 0; c < f->ncam; ++c) { free(f->cam[c].kp); free(f->cam[c].lm); }
+    for (c = 0; c < f->ncam; ++c) { free(f->cam[c].kp); free(f->cam[c].lm); free(f->cam[c].lmhp); free(f->cam[c].lminit); }
     memset(f, 0, sizeof *f);
     b->nframes_alive--;
 }
@@ -403,6 +403,8 @@ int ok_vsb_add_states(ok_vsb* b, ok_time t, const ok_imu_meas* meas, size_t n, i
         f->cam[c].kp = (float*)malloc(sizeof(float) * 3 * (size_t)(cams[c].nkp ? cams[c].nkp : 1));
         if (cams[c].nkp) memcpy(f->cam[c].kp, cams[c].kp, sizeof(float) * 3 * (size_t)cams[c].nkp);
         f->cam[c].lm = (uint64_t*)calloc((size_t)(cams[c].nkp ? cams[c].nkp : 1), sizeof(uint64_t));
+        f->cam[c].lmhp = (double*)calloc(4 * (size_t)(cams[c].nkp ? cams[c].nkp : 1), sizeof(double));
+        f->cam[c].lminit = (unsigned char*)calloc((size_t)(cams[c].nkp ? cams[c].nkp : 1), 1);
         for (k = 0; k < cams[c].nz; ++k) if ((int)cams[c].nz_kp[k] < cams[c].nkp) f->cam[c].lm[cams[c].nz_kp[k]] = cams[c].nz_id[k];
     }
     ax = ax_make(b, id);
@@ -621,6 +623,21 @@ const ok_idset* ok_vsb_imu_frames(const ok_vsb* b) { return &b->imu_frames; }
 const ok_idset* ok_vsb_loop_closure_frames(const ok_vsb* b) { return &b->lc_frames; }
 int ok_vsb_needs_full_graph_optimisation(const ok_vsb* b) { return b->needs_full; }
 int ok_vsb_is_loop_closing(const ok_vsb* b) { return b->is_loop_closing; }
+int ok_vsb_is_pose_graph_frame(const ok_vsb* b, uint64_t id) { const aux* a = (id < (uint64_t)b->naux_alloc && b->aux[id].alive) ? &b->aux[id] : NULL; return a ? a->is_pg : 0; }
+int ok_vsb_is_place_recognition_frame(const ok_vsb* b, uint64_t id) { const aux* a = (id < (uint64_t)b->naux_alloc && b->aux[id].alive) ? &b->aux[id] : NULL; return a ? a->is_prf : 0; }
+int ok_vsb_is_loop_closure_frame(const ok_vsb* b, uint64_t id) { return ok_idset_has(&b->lc_frames, id); }
+int ok_vsb_is_recent_loop_closure_frame(const ok_vsb* b, uint64_t id) {
+    int i;
+    for (i = 0; i < b->key_frames.n; ++i) {
+        const aux* a = (b->key_frames.a[i] < (uint64_t)b->naux_alloc && b->aux[b->key_frames.a[i]].alive) ? &b->aux[b->key_frames.a[i]] : NULL;
+        if (a && ok_idset_has(&a->recent, id)) return 1;
+    }
+    for (i = 0; i < b->lc_frames.n; ++i) {
+        const aux* a = (b->lc_frames.a[i] < (uint64_t)b->naux_alloc && b->aux[b->lc_frames.a[i]].alive) ? &b->aux[b->lc_frames.a[i]] : NULL;
+        if (a && ok_idset_has(&a->recent, id)) return 1;
+    }
+    return 0;
+}
 int ok_vsb_is_loop_closure_available(const ok_vsb* b) { return b->is_loop_closure_available && !b->is_loop_closing; }
 
 uint64_t ok_vsb_most_overlapped_state_id(const ok_vsb* bc, uint64_t frame, int consider_lc) {
@@ -874,7 +891,28 @@ static void w_mst(ok_vsb* b, const ok_idset* convert, const ok_idset* consider, 
 static int convert_to_pose_graph_mst(ok_vsb* b, const ok_idset* convert, const ok_idset* consider, ok_idset* affected) {
     ok_vg_mst_result res;
     int i;
-    /* (the multiframe landmark positions, MultiFrame::setLandmark, only serve the frontend's matching) */
+    /* remember landmarks in frames (transformed to sensor frame): MultiFrame::setLandmark(i, k, T_SW * landmark, initialised) */
+    for (i = 0; i < convert->n; ++i) {
+        vframe* mf = fr_get(b, convert->a[i]);
+        double c7[7];
+        ok_tf T_WS, T_SW;
+        int im, k;
+        if (!mf || !ok_vg_state_find(b->g[0], convert->a[i], NULL)) continue;
+        ok_vg_pose_values(b->g[0], convert->a[i], c7);
+        ok_tf_convert(&T_WS, c7);
+        ok_tf_inverse(&T_WS, &T_SW, 1);
+        for (im = 0; im < mf->ncam; ++im)
+            for (k = 0; k < mf->cam[im].nkp; ++k) {
+                const uint64_t lm = mf->cam[im].lm[k];
+                ok_vg_lm_view lv;
+                if (lm && ok_vg_landmark_find(b->g[0], lm, &lv)) {
+                    double out[4];
+                    ok_tf_mul_v4(&T_SW, lv.hp, out, 1);
+                    memcpy(mf->cam[im].lmhp + 4 * k, out, sizeof out);
+                    mf->cam[im].lminit[k] = (unsigned char)(lv.initialised ? 1 : 0);
+                }
+            }
+    }
     w_mst(b, convert, consider, affected, &res);
     for (i = 0; i < res.ncreated; ++i) { ok_idset_add(affected, res.created[i][1]); ok_idset_add(affected, res.created[i][0]); }
     for (i = 0; i < res.nremoved_tp; ++i) { ok_idset_add(affected, res.removed_tp[i][0]); ok_idset_add(affected, res.removed_tp[i][1]); }

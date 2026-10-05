@@ -4,6 +4,7 @@
  * adapters' correspondence lists); the Eigen expressions are written with the evaluation order measured against
  * Eigen 3.4.0 (dot / squaredNorm / norm: left fold, normalized(): x / sqrt(L), Matrix3d * Vector3d: ok_m3_mulv). */
 #include "ok_frontend.h"
+#include "ok_place.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +43,7 @@ struct ok_fe {
     fe_frame* frames; int nframes_alloc;
     int is_initialised;
     ok_ncam ncam_sys; int ncam_built;
+    ok_dbow_voc voc; ok_dbow_db db; int have_voc;          /* Frontend::DBoW (module 7d) */
 };
 
 ok_fe* ok_fe_new(const ok_vsb* b, const ok_fe_params* p, const ok_fe_est* est) {
@@ -57,9 +59,17 @@ void ok_fe_free(ok_fe* f) {
         for (c = 0; c < f->frames[i].ncam; ++c) { free(f->frames[i].cam[c].desc); free(f->frames[i].cam[c].bp); free(f->frames[i].cam[c].bp_ok); }
     free(f->frames);
     if (f->ncam_built) ok_ncam_free(&f->ncam_sys);
+    if (f->have_voc) { ok_dbow_db_free(&f->db); ok_dbow_voc_free(&f->voc); }
     free(f);
 }
 int ok_fe_is_initialised(const ok_fe* f) { return f->is_initialised; }
+int ok_fe_set_vocabulary(ok_fe* f, const unsigned char* payload, size_t n) {
+    if (f->have_voc) { ok_dbow_db_free(&f->db); ok_dbow_voc_free(&f->voc); f->have_voc = 0; }
+    if (ok_dbow_voc_parse(&f->voc, payload, n)) return 1;
+    ok_dbow_db_init(&f->db, &f->voc);
+    f->have_voc = 1;
+    return 0;
+}
 
 void ok_fe_add_frame(ok_fe* f, uint64_t frame, int ncam, const int* nkp, const unsigned char* const* desc) {
     fe_frame* fr;
@@ -128,23 +138,6 @@ static double cam_f(const ok_cam* c) { return 0.5 * (c->fu + c->fv); }
 /* ------------------------------------------------------------------------------------------------------------------
  * the OpenGV adapters' correspondence lists
  * ---------------------------------------------------------------------------------------------------------------- */
-/* FrameNoncentralAbsoluteAdapter: keypoints of `frame` whose landmark is added, has >= 2 observations, not at infinity */
-static int abs_correspondences(const ok_fe* f, uint64_t frame, int** cam_idx, int** kp_idx) {
-    const ok_vsb_frame_view* v = ok_vsb_frame(f->b, frame);
-    int n = 0, cap = 64, im, k;
-    *cam_idx = (int*)malloc(sizeof(int) * (size_t)cap); *kp_idx = (int*)malloc(sizeof(int) * (size_t)cap);
-    for (im = 0; im < v->ncam; ++im)
-        for (k = 0; k < v->cam[im].nkp; ++k) {
-            const uint64_t id = v->cam[im].lm[k];
-            ok_vg_lm_view lv;
-            if (id == 0 || !ok_vg_landmark_find(G0(f), id, &lv)) continue;
-            if (lv.nobs < 2) continue;
-            if (fabs(lv.hp[3]) < 1.0e-8) continue;
-            if (n == cap) { cap *= 2; *cam_idx = (int*)realloc(*cam_idx, sizeof(int) * (size_t)cap); *kp_idx = (int*)realloc(*kp_idx, sizeof(int) * (size_t)cap); }
-            (*cam_idx)[n] = im; (*kp_idx)[n] = k; ++n;
-        }
-    return n;
-}
 /* FrameRelativeAdapter: matches (idxA ascending) between frame A camera `cam` and frame B camera `cam` via the landmark ids */
 static int rel_correspondences(const ok_fe* f, uint64_t frame_a, uint64_t frame_b, int cam, int** idx_a, int** idx_b) {
     const ok_vsb_frame_view* a = ok_vsb_frame(f->b, frame_a);
@@ -167,23 +160,72 @@ static int rel_correspondences(const ok_fe* f, uint64_t frame_a, uint64_t frame_
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
- * RANSAC glue
+ * the OpenGV adapters' data (FrameNoncentralAbsoluteAdapter / FrameRelativeAdapter constructors) and the RANSAC glue
  * ---------------------------------------------------------------------------------------------------------------- */
+/* sigmaAngle = sqrt(2) * sd * sd / (fu * fu) with sd = 0.8 * size / 12 */
+static double adapter_sigma(float size, double fu) {
+    const double sd = 0.8 * (double)size / 12.0;
+    return sqrt(2.0) * sd * sd / (fu * fu);
+}
+typedef struct fe_abs { ok_og_abs v; double *bearing, *point, *offset, *rot, *sigma; int *cam, *kp; } fe_abs;
+static void fe_abs_free(fe_abs* a) { free(a->bearing); free(a->point); free(a->offset); free(a->rot); free(a->sigma); free(a->cam); free(a->kp); }
+/* FrameNoncentralAbsoluteAdapter(estimator, nCameraSystem, frame) */
+static void abs_adapter(const ok_fe* f, uint64_t frame, fe_abs* a) {
+    const ok_vsb_frame_view* v = ok_vsb_frame(f->b, frame);
+    const fe_frame* fr = fe_fr(f, frame);
+    int n = 0, cap = 64, im, k, i;
+    memset(a, 0, sizeof *a);
+    a->bearing = (double*)malloc(sizeof(double) * 3 * (size_t)cap); a->point = (double*)malloc(sizeof(double) * 3 * (size_t)cap);
+    a->offset = (double*)malloc(sizeof(double) * 3 * (size_t)cap); a->rot = (double*)malloc(sizeof(double) * 9 * (size_t)cap);
+    a->sigma = (double*)malloc(sizeof(double) * (size_t)cap); a->cam = (int*)malloc(sizeof(int) * (size_t)cap); a->kp = (int*)malloc(sizeof(int) * (size_t)cap);
+    for (im = 0; im < v->ncam; ++im) {
+        ok_tf T_SC; double C[9];
+        const double fu = ok_vsb_camera(f->b, im)->fu;
+        tsc_tf(v, im, &T_SC);                          /* camOffsets_ = T_SC(im)->r(), camRotations_ = T_SC(im)->C() */
+        ok_tf_C(&T_SC, C, 1);
+        for (k = 0; k < v->cam[im].nkp; ++k) {
+            const uint64_t id = v->cam[im].lm[k];
+            ok_vg_lm_view lv;
+            double bearing[3];
+            if (id == 0 || !ok_vg_landmark_find(G0(f), id, &lv)) continue;
+            if (lv.nobs < 2) continue;
+            if (fabs(lv.hp[3]) < 1.0e-8) continue;
+            if (n == cap) {
+                cap *= 2;
+                a->bearing = (double*)realloc(a->bearing, sizeof(double) * 3 * (size_t)cap); a->point = (double*)realloc(a->point, sizeof(double) * 3 * (size_t)cap);
+                a->offset = (double*)realloc(a->offset, sizeof(double) * 3 * (size_t)cap); a->rot = (double*)realloc(a->rot, sizeof(double) * 9 * (size_t)cap);
+                a->sigma = (double*)realloc(a->sigma, sizeof(double) * (size_t)cap); a->cam = (int*)realloc(a->cam, sizeof(int) * (size_t)cap); a->kp = (int*)realloc(a->kp, sizeof(int) * (size_t)cap);
+            }
+            for (i = 0; i < 3; ++i) a->point[3 * n + i] = lv.hp[i] / lv.hp[3];                 /* hp.head<3>() / hp[3] */
+            if (fr && fr->cam[im].bp_ok[k]) memcpy(bearing, fr->cam[im].bp + 3 * k, sizeof bearing);
+            else { bearing[0] = 1; bearing[1] = 0; bearing[2] = 0; }                          /* getBackProjection failed */
+            a->sigma[n] = adapter_sigma(v->cam[im].kp[3 * k + 2], fu);
+            nrm3(bearing, a->bearing + 3 * n);
+            memcpy(a->offset + 3 * n, T_SC.r, sizeof T_SC.r);
+            memcpy(a->rot + 9 * n, C, sizeof C);
+            a->cam[n] = im; a->kp[n] = k; ++n;
+        }
+    }
+    a->v.n = n; a->v.bearing = a->bearing; a->v.point = a->point; a->v.offset = a->offset; a->v.rot = a->rot; a->v.sigma = a->sigma;
+}
+
 static int run_ransac_3d2d(ok_fe* f, uint64_t frame, int initialise_pose, int remove_outliers) {
-    int *ci, *ki, nc, ok = 0;
-    ok_fe_ransac r;
+    fe_abs a;
+    ok_og_result r;
+    int nc, ok = 0, ran;
     if (ok_vsb_num_frames(f->b) < 2) return 0;
-    nc = abs_correspondences(f, frame, &ci, &ki);
-    if (nc < 10) { free(ci); free(ki); return nc != 0; }           /* `return int(numCorrespondences)` as a bool */
-    memset(&r, 0, sizeof r);
-    if (!f->est.ransac || !f->est.ransac(f->est.ctx, 0, nc, &r)) { free(ci); free(ki); return 0; }
+    abs_adapter(f, frame, &a);
+    nc = a.v.n;
+    if (nc < 10) { fe_abs_free(&a); return nc != 0; }              /* `return int(numCorrespondences)` as a bool */
+    ran = ok_og_ransac_abs(&a.v, 16, 50, &r);                      /* GP3P, threshold 16, 50 iterations */
+    if (f->est.ransac_observe) f->est.ransac_observe(f->est.ctx, 0, &a.v, NULL, &r, ran);
     if (r.ninliers >= 10 && (double)r.ninliers / (double)nc > 0.7) {
         if (remove_outliers) {
             unsigned char* inl = (unsigned char*)calloc((size_t)nc, 1);
             int k;
             for (k = 0; k < r.ninliers; ++k) if (r.inliers[k] >= 0 && r.inliers[k] < nc) inl[r.inliers[k]] = 1;
             for (k = 0; k < nc; ++k)
-                if (!inl[k]) f->est.remove_observation(f->est.ctx, frame, (uint32_t)ci[k], (uint32_t)ki[k]);
+                if (!inl[k]) f->est.remove_observation(f->est.ctx, frame, (uint32_t)a.cam[k], (uint32_t)a.kp[k]);
             free(inl);
         }
         {   /* T_WS_mat = Identity; topLeftCorner<3,4>() = model; Transformation(T_WS_mat) */
@@ -196,9 +238,34 @@ static int run_ransac_3d2d(ok_fe* f, uint64_t frame, int initialise_pose, int re
         }
         ok = 1;
     }
-    free(r.inliers); free(ci); free(ki);
+    free(r.inliers); fe_abs_free(&a);
     return ok;
 }
+
+/* FrameRelativeAdapter(estimator, nCameraSystem, older, cam, cur, cam) data for the matches ia / ib */
+typedef struct fe_rel { ok_og_rel v; double *f1, *f2, *s1, *s2; } fe_rel;
+static void rel_adapter(const ok_fe* f, uint64_t older, uint64_t cur, int cam, const int* ia, const int* ib, int nc, fe_rel* r) {
+    const ok_vsb_frame_view* va = ok_vsb_frame(f->b, older);
+    const ok_vsb_frame_view* vb = ok_vsb_frame(f->b, cur);
+    const fe_frame* fa = fe_fr(f, older);
+    const fe_frame* fb = fe_fr(f, cur);
+    const double fu1 = ok_vsb_camera(f->b, cam)->fu, fu2 = fu1;       /* the camera geometry of A, for both camIdA and camIdB */
+    int k;
+    r->f1 = (double*)malloc(sizeof(double) * 3 * (size_t)(nc ? nc : 1)); r->f2 = (double*)malloc(sizeof(double) * 3 * (size_t)(nc ? nc : 1));
+    r->s1 = (double*)malloc(sizeof(double) * (size_t)(nc ? nc : 1)); r->s2 = (double*)malloc(sizeof(double) * (size_t)(nc ? nc : 1));
+    for (k = 0; k < nc; ++k) {
+        double b1[3], b2[3] = {0, 0, 0};
+        r->s1[k] = adapter_sigma(va->cam[cam].kp[3 * ia[k] + 2], fu1);
+        if (fa && fa->cam[cam].bp_ok[ia[k]]) memcpy(b1, fa->cam[cam].bp + 3 * ia[k], sizeof b1);
+        else { b1[0] = 1; b1[1] = 0; b1[2] = 0; }
+        nrm3(b1, r->f1 + 3 * k);
+        r->s2[k] = adapter_sigma(vb->cam[cam].kp[3 * ib[k] + 2], fu2);
+        if (fb && fb->cam[cam].bp_ok[ib[k]]) memcpy(b2, fb->cam[cam].bp + 3 * ib[k], sizeof b2);
+        nrm3(b2, r->f2 + 3 * k);                  /* (a failed back-projection of B leaves the vector uninitialised upstream) */
+    }
+    r->v.n = nc; r->v.f1 = r->f1; r->v.f2 = r->f2; r->v.s1 = r->s1; r->v.s2 = r->s2;
+}
+static void fe_rel_free(fe_rel* r) { free(r->f1); free(r->f2); free(r->s1); free(r->s2); }
 
 /* returns the C++ int result (unused by the caller apart from rotationOnly) */
 static int run_ransac_2d2d(ok_fe* f, uint64_t cur, uint64_t older, int initialise_pose, int remove_outliers, int* rotation_only) {
@@ -206,15 +273,19 @@ static int run_ransac_2d2d(ok_fe* f, uint64_t cur, uint64_t older, int initialis
     *rotation_only = 0;
     for (im = 0; im < ncam; ++im) {
         int *ia, *ib, nc, k;
-        ok_fe_ransac rr, rp;
+        fe_rel ad;
+        ok_og_result rr, rp;
+        int ran_r, ran_p;
         int rot_inl, rel_inl; float rot_ratio, rel_ratio;
         unsigned char* inl;
         nc = rel_correspondences(f, older, cur, im, &ia, &ib);
         if (nc < 10) { free(ia); free(ib); continue; }
-        memset(&rr, 0, sizeof rr); memset(&rp, 0, sizeof rp);
-        if (!f->est.ransac || !f->est.ransac(f->est.ctx, 1, nc, &rr)) { free(ia); free(ib); return -1; }
+        rel_adapter(f, older, cur, im, ia, ib, nc, &ad);
+        ran_r = ok_og_ransac_rotation(&ad.v, 9, 50, &rr);              /* rotation-only, threshold 9, 50 iterations */
+        if (f->est.ransac_observe) f->est.ransac_observe(f->est.ctx, 1, NULL, &ad.v, &rr, ran_r);
         rot_inl = rr.ninliers; rot_ratio = (float)rot_inl / (float)nc;
-        if (!f->est.ransac(f->est.ctx, 2, nc, &rp)) { free(rr.inliers); free(ia); free(ib); return -1; }
+        ran_p = ok_og_ransac_stewenius(&ad.v, 9, 50, &rp);             /* Stewenius 5-point, threshold 9, 50 iterations */
+        if (f->est.ransac_observe) f->est.ransac_observe(f->est.ctx, 2, NULL, &ad.v, &rp, ran_p);
         rel_inl = rp.ninliers; rel_ratio = (float)rel_inl / (float)nc;
         inl = (unsigned char*)calloc((size_t)nc, 1);
         if (rot_ratio > rel_ratio || rot_ratio > 0.8f) {
@@ -227,7 +298,7 @@ static int run_ransac_2d2d(ok_fe* f, uint64_t cur, uint64_t older, int initialis
             total += rel_inl;
             for (k = 0; k < rp.ninliers; ++k) if (rp.inliers[k] >= 0 && rp.inliers[k] < nc) inl[rp.inliers[k]] = 1;
         }
-        free(rr.inliers); free(rp.inliers);
+        free(rr.inliers); free(rp.inliers); fe_rel_free(&ad);
         if (!rot_success && !rel_success) { free(inl); free(ia); free(ib); continue; }
         {
             const ok_vsb_frame_view* mf = ok_vsb_frame(f->b, cur);
@@ -989,6 +1060,281 @@ static void match_stereo(ok_fe* f, uint64_t mf_id, int as_keyframe) {
     }
 }
 
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * place recognition (module 7d): Frontend::verifyRecognisedPlace and the loop-closure block of dataAssociationAndInitialization
+ * ---------------------------------------------------------------------------------------------------------------- */
+typedef struct pr_desc { uint64_t lm; int seq; const unsigned char* d; double hp[4]; } pr_desc;
+static int cmp_pr_desc(const void* a, const void* b) {
+    const pr_desc *x = (const pr_desc*)a, *y = (const pr_desc*)b;
+    if (x->lm != y->lm) return x->lm < y->lm ? -1 : 1;
+    return x->seq < y->seq ? -1 : (x->seq > y->seq);
+}
+typedef struct pr_match { uint64_t frame; uint32_t cam, kp; uint64_t lm; } pr_match;      /* KeypointIdentifier -> landmark id */
+static int cmp_pr_match(const void* a, const void* b) {
+    const pr_match *x = (const pr_match*)a, *y = (const pr_match*)b;
+    if (x->frame != y->frame) return x->frame < y->frame ? -1 : 1;
+    if (x->cam != y->cam) return x->cam < y->cam ? -1 : 1;
+    return x->kp < y->kp ? -1 : (x->kp > y->kp);
+}
+/* std::map<KeypointIdentifier, uint64_t>::operator[] = : insert or overwrite, keeping the array sorted */
+static void pr_match_set(pr_match** m, int* n, int* cap, pr_match v) {
+    int lo = 0, hi = *n;
+    while (lo < hi) { const int mid = (lo + hi) / 2; if (cmp_pr_match(&(*m)[mid], &v) < 0) lo = mid + 1; else hi = mid; }
+    if (lo < *n && cmp_pr_match(&(*m)[lo], &v) == 0) { (*m)[lo].lm = v.lm; return; }
+    if (*n == *cap) { *cap = *cap ? 2 * *cap : 64; *m = (pr_match*)realloc(*m, sizeof(pr_match) * (size_t)*cap); }
+    memmove(*m + lo + 1, *m + lo, sizeof(pr_match) * (size_t)(*n - lo));
+    (*m)[lo] = v; ++*n;
+}
+static int pr_match_find(const pr_match* m, int n, uint64_t frame, uint32_t cam, uint32_t kp) {
+    int lo = 0, hi = n;
+    pr_match v; v.frame = frame; v.cam = cam; v.kp = kp; v.lm = 0;
+    while (lo < hi) { const int mid = (lo + hi) / 2; if (cmp_pr_match(&m[mid], &v) < 0) lo = mid + 1; else hi = mid; }
+    return (lo < n && cmp_pr_match(&m[lo], &v) == 0) ? lo : -1;
+}
+
+/* Frontend::verifyRecognisedPlace; returns the C++ bool, T_out (r, q xyzw) / H_out valid on success */
+static int verify_recognised_place(ok_fe* f, uint64_t new_id, uint64_t old_id, int min_inliers, double T_out[7], double H_out[36]) {
+    const ok_vsb_frame_view* nv = ok_vsb_frame(f->b, new_id);
+    const ok_vsb_frame_view* ov = ok_vsb_frame(f->b, old_id);
+    const fe_frame* nf = fe_fr(f, new_id);
+    const fe_frame* of = fe_fr(f, old_id);
+    const int ncam = nv->ncam;
+    ok_fe_verify st;
+    pr_desc* ds = NULL; int nds = 0, capds = 0;
+    uint64_t* ulm = NULL; double* uhp = NULL; int nulm = 0;          /* landmarks (ascending id) with the first-seen position */
+    int* ufirst = NULL; int* ucount = NULL;                           /* range of each landmark in the sorted descriptor list */
+    pr_match* matches = NULL; int nmatches = 0, capmatches = 0;
+    uint64_t* pts_ids = NULL; double* pts_hp = NULL; int npts = 0;    /* `points` (matched landmarks, ascending id) */
+    fe_abs ad;
+    ok_og_result res;
+    int ctr = 0, im, k, i, j, ran, ret = 0, code = -1;
+    memset(&st, 0, sizeof st); memset(&res, 0, sizeof res); memset(&ad, 0, sizeof ad);
+    st.frame = new_id; st.old_frame = old_id; st.min_inliers = min_inliers;
+    /* find matchable points */
+    for (im = 0; im < ncam; ++im)
+        for (k = 0; k < ov->cam[im].nkp; ++k) {
+            const uint64_t lm = ov->cam[im].lm[k];
+            double lmhp[4];
+            if (lm == 0) continue;
+            memcpy(lmhp, ov->cam[im].lmhp + 4 * k, sizeof lmhp);
+            if (!ov->cam[im].lminit[k]) continue;
+            if (norm4(lmhp) < 1.0e-12) continue;                       /* signals there was no associated 3d point */
+            if (nds == capds) { capds = capds ? 2 * capds : 256; ds = (pr_desc*)realloc(ds, sizeof(pr_desc) * (size_t)capds); }
+            ds[nds].lm = lm; ds[nds].seq = nds; ds[nds].d = of->cam[im].desc + 48 * (size_t)k; memcpy(ds[nds].hp, lmhp, sizeof lmhp); ++nds;
+        }
+    qsort(ds, (size_t)nds, sizeof(pr_desc), cmp_pr_desc);
+    ulm = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)(nds ? nds : 1)); uhp = (double*)malloc(sizeof(double) * 4 * (size_t)(nds ? nds : 1));
+    ufirst = (int*)malloc(sizeof(int) * (size_t)(nds ? nds : 1)); ucount = (int*)malloc(sizeof(int) * (size_t)(nds ? nds : 1));
+    {   /* the first encountered position of a landmark is kept (smallest seq of the group) */
+        int g;
+        for (i = 0; i < nds; i = g) {
+            for (g = i; g < nds && ds[g].lm == ds[i].lm; ++g) {}
+            ulm[nulm] = ds[i].lm; memcpy(uhp + 4 * nulm, ds[i].hp, 4 * sizeof(double)); ufirst[nulm] = i; ucount[nulm] = g - i; ++nulm;
+        }
+    }
+    /* match */
+    pts_ids = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)(nulm ? nulm : 1)); pts_hp = (double*)malloc(sizeof(double) * 4 * (size_t)(nulm ? nulm : 1));
+    for (i = 0; i < nulm; ++i)
+        for (im = 0; im < ncam; ++im) {
+            const int K = nv->cam[im].nkp;
+            unsigned dist_min = (unsigned)f->p.matching_threshold;
+            int k_min = 0;
+            if (K == 0) continue;
+            for (j = 0; j < ucount[i]; ++j)
+                for (k = 0; k < K; ++k) {
+                    const unsigned dist = (unsigned)hamming48(nf->cam[im].desc + 48 * (size_t)k, ds[ufirst[i] + j].d);
+                    if (dist < dist_min) { dist_min = dist; k_min = k; }
+                }
+            if ((double)dist_min < f->p.matching_threshold) {
+                pr_match m;
+                ++ctr;
+                m.frame = new_id; m.cam = (uint32_t)im; m.kp = (uint32_t)k_min; m.lm = ulm[i];
+                { int lo = 0, hi = npts;                              /* points[lm] = landmark */
+                  while (lo < hi) { const int mid = (lo + hi) / 2; if (pts_ids[mid] < ulm[i]) lo = mid + 1; else hi = mid; }
+                  if (!(lo < npts && pts_ids[lo] == ulm[i])) {
+                      memmove(pts_ids + lo + 1, pts_ids + lo, sizeof(uint64_t) * (size_t)(npts - lo));
+                      memmove(pts_hp + 4 * (lo + 1), pts_hp + 4 * lo, sizeof(double) * 4 * (size_t)(npts - lo));
+                      pts_ids[lo] = ulm[i]; memcpy(pts_hp + 4 * lo, uhp + 4 * i, 4 * sizeof(double)); ++npts;
+                  } else memcpy(pts_hp + 4 * lo, uhp + 4 * i, 4 * sizeof(double)); }
+                pr_match_set(&matches, &nmatches, &capmatches, m);
+            }
+        }
+    st.ctr = ctr; st.npoints = npts;
+    st.nlandmarks = nulm; st.lm_ids = ulm; st.lm_hp = uhp;
+    if (ctr < min_inliers || npts < 8) { code = 0; goto done; }
+    /* the LoopclosureNoncentralAbsoluteAdapter */
+    {
+        int n = 0, cap = 64;
+        ad.bearing = (double*)malloc(sizeof(double) * 3 * (size_t)cap); ad.point = (double*)malloc(sizeof(double) * 3 * (size_t)cap);
+        ad.offset = (double*)malloc(sizeof(double) * 3 * (size_t)cap); ad.rot = (double*)malloc(sizeof(double) * 9 * (size_t)cap);
+        ad.sigma = (double*)malloc(sizeof(double) * (size_t)cap); ad.cam = (int*)malloc(sizeof(int) * (size_t)cap); ad.kp = (int*)malloc(sizeof(int) * (size_t)cap);
+        for (im = 0; im < ncam; ++im) {
+            ok_tf T_SC; double C[9];
+            const double fu = ok_vsb_camera(f->b, im)->fu;
+            tsc_tf(nv, im, &T_SC);
+            ok_tf_C(&T_SC, C, 1);
+            for (k = 0; k < nv->cam[im].nkp; ++k) {
+                const int mi = pr_match_find(matches, nmatches, new_id, (uint32_t)im, (uint32_t)k);
+                double bearing[3], hp[4];
+                int lo = 0, hi = npts;
+                if (mi < 0) continue;
+                while (lo < hi) { const int mid = (lo + hi) / 2; if (pts_ids[mid] < matches[mi].lm) lo = mid + 1; else hi = mid; }
+                memcpy(hp, pts_hp + 4 * lo, sizeof hp);
+                if (fabs(hp[3]) < 1.0e-8) continue;
+                if (n == cap) {
+                    cap *= 2;
+                    ad.bearing = (double*)realloc(ad.bearing, sizeof(double) * 3 * (size_t)cap); ad.point = (double*)realloc(ad.point, sizeof(double) * 3 * (size_t)cap);
+                    ad.offset = (double*)realloc(ad.offset, sizeof(double) * 3 * (size_t)cap); ad.rot = (double*)realloc(ad.rot, sizeof(double) * 9 * (size_t)cap);
+                    ad.sigma = (double*)realloc(ad.sigma, sizeof(double) * (size_t)cap); ad.cam = (int*)realloc(ad.cam, sizeof(int) * (size_t)cap); ad.kp = (int*)realloc(ad.kp, sizeof(int) * (size_t)cap);
+                }
+                for (i = 0; i < 3; ++i) ad.point[3 * n + i] = hp[i] / hp[3];
+                if (nf->cam[im].bp_ok[k]) memcpy(bearing, nf->cam[im].bp + 3 * k, sizeof bearing);
+                else { bearing[0] = 1; bearing[1] = 0; bearing[2] = 0; }
+                ad.sigma[n] = adapter_sigma(nv->cam[im].kp[3 * k + 2], fu);
+                nrm3(bearing, ad.bearing + 3 * n);
+                memcpy(ad.offset + 3 * n, T_SC.r, sizeof T_SC.r);
+                memcpy(ad.rot + 9 * n, C, sizeof C);
+                ad.cam[n] = im; ad.kp[n] = k; ++n;
+            }
+        }
+        ad.v.n = n; ad.v.bearing = ad.bearing; ad.v.point = ad.point; ad.v.offset = ad.offset; ad.v.rot = ad.rot; ad.v.sigma = ad.sigma;
+    }
+    st.ncorr = ad.v.n;
+    if (ad.v.n < 7) { code = 1; goto done; }
+    ran = ok_og_ransac_abs(&ad.v, 16, 50, &res);                      /* GP3P, threshold 16, 50 iterations */
+    if (f->est.ransac_observe) f->est.ransac_observe(f->est.ctx, 3, &ad.v, NULL, &res, ran);
+    {
+        const int num_inliers = res.ninliers;
+        const double ratio = (double)res.ninliers / (double)ad.v.n;
+        unsigned char* inl = (unsigned char*)calloc((size_t)ad.v.n, 1);
+        float sum = 0.0f, avg;
+        double m4[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        ok_tf T0; double T0c[7];
+        ok_place_term* terms; int nterms = 0;
+        ok_place_refine_out ro;
+        double (*T_SC7)[7];
+        st.ninl = num_inliers;
+        if (num_inliers < min_inliers || ratio < 0.7) { free(inl); code = 2; goto done; }
+        for (i = 0; i < res.ninliers; ++i) if (res.inliers[i] >= 0 && res.inliers[i] < ad.v.n) inl[res.inliers[i]] = 1;
+        /* check distinctiveness of survived matches */
+        for (im = 0; im < ncam; ++im) {
+            unsigned char* dm = (unsigned char*)malloc(48 * (size_t)(res.ninliers ? res.ninliers : 1));
+            int inlier_ctr = 0, ctr2 = 0;
+            for (i = 0; i < nmatches; ++i) {
+                if ((int)matches[i].cam != im) { ctr2++; continue; }
+                if (ctr2 < ad.v.n && inl[ctr2] && inlier_ctr < res.ninliers) {
+                    memcpy(dm + 48 * (size_t)inlier_ctr, nf->cam[im].desc + 48 * (size_t)matches[i].kp, 48);
+                    inlier_ctr++;
+                }
+                ctr2++;
+            }
+            if (inlier_ctr > 0) sum = sum + ok_place_distinctiveness(dm, inlier_ctr);
+            free(dm);
+        }
+        avg = sum / (float)res.ninliers;
+        st.avg = (double)avg;
+        if (avg < 182.0 && res.ninliers < 20) { free(inl); code = 3; goto done; }
+        /* refine */
+        for (i = 0; i < 12; ++i) m4[(i % 3) + 4 * (i / 3)] = res.model[i];
+        ok_tf_from_m4(&T0, m4, 1);
+        T0c[0] = T0.r[0]; T0c[1] = T0.r[1]; T0c[2] = T0.r[2]; T0c[3] = T0.q.x; T0c[4] = T0.q.y; T0c[5] = T0.q.z; T0c[6] = T0.q.w;
+        st.have_T0 = 1; memcpy(st.T0, T0c, sizeof T0c);
+        T_SC7 = (double (*)[7])malloc(sizeof(double) * 7 * (size_t)ncam);
+        for (im = 0; im < ncam; ++im) {                              /* estimator.extrinsics(StateId(frameId), i) */
+            ok_vg_extrinsics_values(G0(f), new_id, im, T_SC7[im]);       /* the raw parameters (TransformationCacheless -> Transformation copies them) */
+        }
+        terms = (ok_place_term*)calloc((size_t)(ad.v.n ? ad.v.n : 1), sizeof(ok_place_term));
+        for (i = 0; i < ad.v.n; ++i) {
+            if (!inl[i]) continue;
+            {
+                const int mi = pr_match_find(matches, nmatches, new_id, (uint32_t)ad.cam[i], (uint32_t)ad.kp[i]);
+                int lo = 0, hi = npts;
+                ok_place_term* t = &terms[nterms++];
+                while (lo < hi) { const int mid = (lo + hi) / 2; if (pts_ids[mid] < matches[mi].lm) lo = mid + 1; else hi = mid; }
+                t->cam = ok_vsb_camera(f->b, ad.cam[i]); t->cam_idx = ad.cam[i];
+                t->meas[0] = (double)nv->cam[ad.cam[i]].kp[3 * ad.kp[i]]; t->meas[1] = (double)nv->cam[ad.cam[i]].kp[3 * ad.kp[i] + 1];
+                t->size = (double)nv->cam[ad.cam[i]].kp[3 * ad.kp[i] + 2];
+                t->lm_id = matches[mi].lm; memcpy(t->hp, pts_hp + 4 * lo, 4 * sizeof(double));
+            }
+        }
+        ok_place_refine(terms, nterms, ncam, (const double (*)[7])T_SC7, T0c, f->p.realtime_max_iterations, &ro);
+        st.have_T1 = 1; memcpy(st.T1, ro.T, sizeof ro.T);
+        st.ceres_iters = ro.iterations; st.ceres_term = ro.termination; st.c0 = ro.initial_cost; st.c1 = ro.final_cost;
+        st.have_H = 1; memcpy(st.H, ro.H, sizeof ro.H);
+        st.add_out = ro.additional_outliers;
+        st.nfinal = res.ninliers - ro.additional_outliers;
+        free(terms); free(T_SC7); free(inl);
+        if (st.nfinal < min_inliers || (double)st.nfinal / (double)ad.v.n < 0.7) { code = 4; goto done; }
+        memcpy(T_out, ro.T, sizeof ro.T); memcpy(H_out, ro.H, sizeof ro.H);
+        code = 5; ret = 1;
+    }
+done:
+    st.code = code;
+    st.nmatches = nmatches;
+    if (f->est.on_verify) {
+        uint64_t* mf = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)(nmatches ? nmatches : 1)), *ml = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)(nmatches ? nmatches : 1));
+        uint32_t* mc = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nmatches ? nmatches : 1)), *mk = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nmatches ? nmatches : 1));
+        for (i = 0; i < nmatches; ++i) { mf[i] = matches[i].frame; mc[i] = matches[i].cam; mk[i] = matches[i].kp; ml[i] = matches[i].lm; }
+        st.m_frame = mf; st.m_cam = mc; st.m_kp = mk; st.m_lm = ml;
+        f->est.on_verify(f->est.ctx, &st);
+        free(mf); free(mc); free(mk); free(ml);
+    }
+    free(res.inliers); fe_abs_free(&ad);
+    free(ds); free(ulm); free(uhp); free(ufirst); free(ucount); free(matches); free(pts_ids); free(pts_hp);
+    return ret;
+}
+
+/* the DBoW part and the loop-closure block of dataAssociationAndInitialization (the caller checked the entry condition);
+ * *as_keyframe may be re-decided */
+static void place_recognition_block(ok_fe* f, uint64_t frame, int* as_keyframe) {
+    const ok_vsb_frame_view* v = ok_vsb_frame(f->b, frame);
+    const fe_frame* fr = fe_fr(f, frame);
+    int nfeat = 0, im, off = 0;
+    unsigned char* feat;
+    ok_dbow_bow bow;
+    ok_dbow_result* orig = NULL; int norig = 0;
+    uint64_t* sids = NULL; double* sc = NULL; int nst = 0, a;
+    size_t attempts = 0;
+    for (im = 0; im < v->ncam; ++im) nfeat += v->cam[im].nkp;
+    feat = (unsigned char*)malloc(48 * (size_t)(nfeat ? nfeat : 1));
+    for (im = 0; im < v->ncam; ++im) { if (v->cam[im].nkp) memcpy(feat + 48 * (size_t)off, fr->cam[im].desc, 48 * (size_t)v->cam[im].nkp); off += v->cam[im].nkp; }
+    /* getFilteredDBoWResult */
+    ok_dbow_transform(&f->voc, feat, nfeat, &bow);
+    ok_dbow_query(&f->db, &bow, &orig, &norig);
+    ok_dbow_filtered(&f->db, orig, norig, &sids, &sc, &nst);
+    if (f->est.on_query) f->est.on_query(f->est.ctx, frame, nfeat, &bow, f->db.nentries, orig, norig, sids, sc, nst);
+    for (a = 0; a < nst; ++a) {
+        const uint64_t old_id = sids[a];
+        const double p = sc[a];
+        double T[7], H[36];
+        int skip = 0, success;
+        uint64_t* lc = NULL; int nlc = 0;
+        const size_t lim = (size_t)f->db.npose / 20 > 10 ? (size_t)f->db.npose / 20 : 10;
+        if (attempts > lim) break;
+        if (!(p > f->p.p_dbow)) continue;
+        if (!ok_vsb_is_pose_graph_frame(f->b, old_id)) continue;
+        if (ok_vsb_is_loop_closure_frame(f->b, old_id)) continue;
+        if (ok_vsb_is_recent_loop_closure_frame(f->b, old_id)) continue;
+        if (!ok_vsb_is_place_recognition_frame(f->b, old_id)) continue;
+        if (!verify_recognised_place(f, frame, old_id, 10, T, H)) { attempts++; continue; }
+        attempts++;
+        success = f->est.attempt_loop_closure(f->est.ctx, old_id, frame, T, H, f->p.drift_percentage, &skip);
+        if (!success) continue;
+        f->est.add_loop_closure_frame(f->est.ctx, old_id, skip, &lc, &nlc);
+        match_to_map(f, frame, lc, nlc, 1);
+        free(lc);
+        *as_keyframe = do_we_need_a_new_keyframe(f, frame);
+        break;                                                         /* only consider oldest keyframe match */
+    }
+    if (*as_keyframe) {                                                /* if keyframe, we add to relocalisation database */
+        const int entry = f->db.nentries;
+        if (f->est.on_db_add) f->est.on_db_add(f->est.ctx, entry, frame, nfeat, &bow);
+        ok_dbow_db_add(&f->db, feat, nfeat, frame);
+    }
+    ok_dbow_bow_free(&bow); free(orig); free(sids); free(sc); free(feat);
+}
+
 /* ------------------------------------------------------------------------------------------------------------------
  * dataAssociationAndInitialization
  * ---------------------------------------------------------------------------------------------------------------- */
@@ -1008,13 +1354,17 @@ int ok_fe_data_association(ok_fe* f, uint64_t frame, int* as_keyframe) {
     }
     /* loop closures: place recognition, attemptLoopClosure, addLoopClosureFrame, matchToMap against the loop closure landmarks */
     if (f->p.do_loop_closures && !ok_vsb_is_loop_closing(f->b) && !ok_vsb_is_loop_closure_available(f->b)
-        && !ok_vsb_needs_full_graph_optimisation(f->b) && f->is_initialised && f->est.place_recognition) {
-        uint64_t* lc = NULL; int nlc = 0;
-        if (f->est.place_recognition(f->est.ctx, frame, &lc, &nlc)) {
-            match_to_map(f, frame, lc, nlc, 1);
-            *as_keyframe = do_we_need_a_new_keyframe(f, frame);
+        && !ok_vsb_needs_full_graph_optimisation(f->b) && f->is_initialised) {
+        if (f->have_voc && f->est.attempt_loop_closure && f->est.add_loop_closure_frame) {
+            place_recognition_block(f, frame, as_keyframe);
+        } else if (f->est.place_recognition) {              /* answered from the reference log (tags without place.bin) */
+            uint64_t* lc = NULL; int nlc = 0;
+            if (f->est.place_recognition(f->est.ctx, frame, &lc, &nlc)) {
+                match_to_map(f, frame, lc, nlc, 1);
+                *as_keyframe = do_we_need_a_new_keyframe(f, frame);
+            }
+            free(lc);
         }
-        free(lc);
     }
     /* do stereo match -- get new landmarks only when this is a keyframe */
     if (*as_keyframe) match_stereo(f, frame, *as_keyframe);

@@ -15,10 +15,10 @@
  * ---- scope ----
  * `ok_fe_data_association` is Frontend::dataAssociationAndInitialization for the configurations the port targets
  * (radial-tangential / equidistant pinhole, IMU on, 1-4 cameras). BRISK detection / description is Codex's leaf: the
- * descriptors of a frame are handed in with ok_fe_add_frame. What is NOT native yet (reached through hooks of ok_fe_est,
- * answered by the replay harness from the reference log):
- *   - the OpenGV RANSAC runs (GP3P absolute pose, rotation-only and Stewenius relative pose; module M7c);
- *   - place recognition (DBoW2 query, verifyRecognisedPlace) with attemptLoopClosure / addLoopClosureFrame (module M7d).
+ * descriptors of a frame are handed in with ok_fe_add_frame. The OpenGV RANSAC runs (GP3P absolute pose, rotation-only and
+ * Stewenius relative pose; module M7c, ok_opengv.c) are native; what is NOT native yet (reached through the `place_recognition`
+ * hook of ok_fe_est, answered by the replay harness from the reference log): place recognition (DBoW2 query,
+ * verifyRecognisedPlace) with attemptLoopClosure / addLoopClosureFrame (module M7d).
  * The frontend reads the estimator (ViSlamBackend, module 6) through the const accessors of ok_vslam.h and acts on it
  * only through the ok_fe_est table, whose entries mirror the ViSlamBackend methods the frontend calls one to one.
  *
@@ -27,6 +27,8 @@
  *   162 RANSAC  u32 kind (0 GP3P 3d2d, 1 rotation-only 2d2d, 2 Stewenius 2d2d, 3 GP3P of verifyRecognisedPlace),
  *               u32 numCorrespondences, u32 iterations, u32 nInliers, nInliers x i32, u32 rows, u32 cols,
  *               rows*cols x f64 (column-major model)
+ * and, from patch 0013, ransac.bin next to problem.bin (layouts in ok_opengv.h): the OpenGV adapter data (163 / 164) + the 162
+ * result of every run.
  */
 #ifndef OK_FRONTEND_H
 #define OK_FRONTEND_H
@@ -34,19 +36,14 @@
 #include <stdint.h>
 #include "ok_vslam.h"
 #include "ok_eigen.h"
+#include "ok_opengv.h"
+#include "ok_dbow.h"
 
 #define OK_FE_MAXCAM OK_VSB_MAXCAM
 
 /* triangulation::triangulateFast: p1, e1, p2, e2 in the world frame, returns the homogeneous point */
 void ok_fe_triangulate_fast(const double p1[3], const double e1[3], const double p2[3], const double e2[3], double sigma,
                             int* is_valid, int* is_parallel, double hp[4]);
-
-typedef struct ok_fe_ransac {
-    int iterations, ninliers;
-    int* inliers;                   /* malloc'd by the hook, freed by the frontend */
-    int rows, cols;
-    double model[16];               /* column-major (3x4 transformation / 3x3 rotation) */
-} ok_fe_ransac;
 
 typedef struct ok_fe_params {
     double matching_threshold;      /* briskMatchingThreshold_ (frontend_parameters.matching_threshold) */
@@ -55,7 +52,26 @@ typedef struct ok_fe_params {
     int imu_use;
     int do_loop_closures;
     int realtime_num_threads;       /* passed on to optimiseRealtimeGraph (no numerical effect) */
+    double p_dbow;                  /* params.estimator.p_dbow (place recognition score threshold) */
+    double drift_percentage;        /* params.estimator.drift_percentage_heuristic */
+    int realtime_max_iterations;    /* params.estimator.realtime_max_iterations (the quickSolver of verifyRecognisedPlace) */
 } ok_fe_params;
+
+/* the stages of one verifyRecognisedPlace call (record 173 of place.bin, see ok_place.h) handed to the observer */
+typedef struct ok_fe_verify {
+    uint64_t frame, old_frame;
+    int min_inliers, code;                       /* exit code: 0 too few matches, 1 < 7 correspondences, 2 RANSAC, 3 indistinctive, 4 refinement, 5 accepted */
+    int ctr, npoints, ncorr, ninl;
+    double avg;
+    int have_T0, have_T1, have_H;
+    double T0[7], T1[7], H[36];
+    int add_out, nfinal, ceres_iters, ceres_term;
+    double c0, c1;
+    int nlandmarks;                              /* the landmarks of the old frame (ascending id) */
+    const uint64_t* lm_ids; const double* lm_hp;
+    int nmatches;                                /* the matches in std::map order */
+    const uint64_t* m_frame; const uint32_t* m_cam; const uint32_t* m_kp; const uint64_t* m_lm;
+} ok_fe_verify;
 
 /* the ViSlamBackend calls the frontend makes (write path) and the hooks for what is not ported yet */
 typedef struct ok_fe_est {
@@ -71,8 +87,20 @@ typedef struct ok_fe_est {
     int (*optimise_realtime)(void* ctx, int num_iter, int num_threads, int verbose, int only_newest, int is_initialised);
     int (*clean_unobserved_landmarks)(void* ctx);
     void (*set_landmark_id)(void* ctx, uint64_t frame, uint32_t cam, uint32_t kp, uint64_t id);
-    /* OpenGV RANSAC (M7c): kind as in record 162; returns 1 and fills `out` (out->inliers malloc'd) */
-    int (*ransac)(void* ctx, int kind, int num_correspondences, ok_fe_ransac* out);
+    /* observer of every native OpenGV run of the frontend (M7c; optional, the harness compares the adapter data and the result
+     * with the reference log): kind as in record 162, exactly one of `abs` / `rel` is non-NULL */
+    void (*ransac_observe)(void* ctx, int kind, const ok_og_abs* abs, const ok_og_rel* rel, ok_og_result* res, int ran);
+    /* place recognition (M7d; optional observers of the native block: database add (entry id, frame, bag of words), query (bag of
+     * words, query results in score order, retained state ids and scores) and every verifyRecognisedPlace call) */
+    void (*on_db_add)(void* ctx, int entry, uint64_t frame, int nfeat, const ok_dbow_bow* bow);
+    void (*on_query)(void* ctx, uint64_t frame, int nfeat, const ok_dbow_bow* bow, int db_size, const ok_dbow_result* orig, int norig,
+                     const uint64_t* state_ids, const double* scores, int nstate);
+    void (*on_verify)(void* ctx, const ok_fe_verify* v);
+    /* ViSlamBackend::attemptLoopClosure / addLoopClosureFrame (the calls of the native place recognition block; the harness compares
+     * them with the logged entry records before executing them) */
+    int (*attempt_loop_closure)(void* ctx, uint64_t old_id, uint64_t new_id, const double T7[7], const double H36[36], double drift,
+                                int* skip_full_graph_optimisation);
+    int (*add_loop_closure_frame)(void* ctx, uint64_t id, int skip, uint64_t** landmarks, int* nlandmarks);
     /* the loop-closure block of dataAssociationAndInitialization (M7d): query + verify + attemptLoopClosure +
      * addLoopClosureFrame; returns 1 when a loop closure frame was added (landmarks: malloc'd, ascending) */
     int (*place_recognition)(void* ctx, uint64_t frame, uint64_t** landmarks, int* nlandmarks);
@@ -80,6 +108,8 @@ typedef struct ok_fe_est {
 
 typedef struct ok_fe ok_fe;
 ok_fe* ok_fe_new(const ok_vsb* b, const ok_fe_params* p, const ok_fe_est* est);
+/* the BRISK vocabulary (payload of ok_dbow.h): enables the native place recognition block; without it `place_recognition` is used */
+int ok_fe_set_vocabulary(ok_fe* f, const unsigned char* payload, size_t n);
 void ok_fe_free(ok_fe* f);
 /* the descriptors of the multiframe `frame` (state id): nkp[c] x 48 bytes per camera */
 void ok_fe_add_frame(ok_fe* f, uint64_t frame, int ncam, const int* nkp, const unsigned char* const* desc);

@@ -25,8 +25,10 @@ TwoPose* terms, updateLandmarks) and problem.bin (check_ok_problem: ceres::Probl
 patch 0009 / --graph-dump (m5, s5). check_ok_vigraph replays the ViGraph mutation log of patch 0010 that
 the same problem.bin carries from tag m6/s6 on (see okvis_port/c/ok_vigraph.h). check_ok_vslam (module 6) replays the
 ViSlamBackend entry records of patch 0011 (tags m7/s7 on) through the C backend and compares every graph call it makes.
-check_ok_frontend (module 7b) additionally runs the C frontend on the logged descriptors of patch 0012 (tags m8/s8 on, the
-consolidated run: tools/run_okvis_reference.py --consolidated) and compares every backend call the frontend makes.
+check_ok_frontend (modules 7b-7d) additionally runs the C frontend on the logged descriptors of patch 0012 (tags m8/s8 on, the
+consolidated run: tools/run_okvis_reference.py --consolidated) and compares every backend call the frontend makes; with the add-on
+files ransac.bin (patch 0013) and place.bin (patch 0014) in the dumps dir the OpenGV RANSAC runs and the whole place recognition block
+(DBoW2 query, verifyRecognisedPlace, attemptLoopClosure) run natively and are compared with the log.
 
 --eigen-tests additionally builds okvis_port/reference_tools/eigen_*_test.cc against the real Eigen 3.4.0
 (external/vio/deps, flags -O2 -DNDEBUG -ffp-contract=off -fno-fast-math) and runs them (random-case,
@@ -34,7 +36,9 @@ tolerance-0 comparisons of the C evaluation-order models), and okvis_port/refere
 compare the C modules against the real OKVIS2 classes (okvis_time, okvis_kinematics, okvis_cv; headers/sources from
 external/vio/okvis2, OpenCV from external/vio/deps/opencv) on random inputs including edge values.
 okvis_solve_dense_test / okvis_solve_sparse_test compare the M4 kernels against real Eigen and the header-only Ceres
-kernels (small_blas.h, invert_psd_matrix.h from the Ceres source tree inside external/vio/okvis2).
+kernels (small_blas.h, invert_psd_matrix.h from the Ceres source tree inside external/vio/okvis2). okvis_opengv_test (module 7c)
+links the real OpenGV library of the reference build (test directive `OK_PORT_TEST_LIBS: opengv`: patched OpenGV headers, libopengv.a,
+and the shadow adapters of okvis_port/reference_tools/shadow so that the UNMODIFIED OKVIS2 Frame*SacProblem headers run on random data).
 """
 import argparse
 import os
@@ -55,6 +59,8 @@ TEST_SRC_RE = re.compile(r"//\s*OK_PORT_TEST_SRC:\s*(.+)")
 TEST_C_RE = re.compile(r"//\s*OK_PORT_TEST_C:\s*(.+)")
 TEST_LIBS_RE = re.compile(r"//\s*OK_PORT_TEST_LIBS:\s*(.+)")
 CERES = ROOT / "external/vio/deps/ceres"
+REF_SRC = ROOT / "runs/okvis_port/reference_build/src"
+REF_BUILD = ROOT / "runs/okvis_port/reference_build/build"
 VROOT = ROOT / "external/vio/deps/root/usr"
 SOURCES_RE = re.compile(r"/\*\s*OK_PORT_SOURCES:\s*(.+?)\s*(?:\*/)?\s*$")
 CFLAGS = ["-std=c99", "-Wall", "-Wextra", "-O2", "-ffp-contract=off", "-fno-fast-math"]
@@ -168,10 +174,13 @@ def eigen_tests():
         exe = BUILD_DIR / src.stem
         incs = [f"-I{EIGEN_INC}", f"-I{OCV}/include/opencv4"] + [f"-I{p}" for p in sorted(OKVIS_SRC.glob("okvis_*/include"))]
         extra_link = []
+        if "opengv" in libs:  # real OpenGV (BSD-3, reference build: patched headers + libopengv.a); the shadow adapters come first
+            incs = [f"-I{TOOLS_DIR}/shadow", f"-I{REF_SRC}/external/opengv/include"] + incs
+            extra_link += [str(REF_BUILD / "external/opengv/libopengv.a")]
         if "ceres" in libs:  # okvis_ceres classes derive from ceres::SizedCostFunction / Manifold (BSD-3, reference only)
             incs += [f"-I{CERES}/include", f"-I{OKVIS_SRC}/external/ceres-solver/internal",  # header-only internals
                      f"-I{VROOT}/include", f"-I{VROOT}/include/x86_64-linux-gnu"]
-            extra_link = [f"{CERES}/lib/libceres.a", f"-L{VROOT}/lib/x86_64-linux-gnu", "-lglog", "-lgflags", "-fopenmp", "-lpthread",
+            extra_link += [f"{CERES}/lib/libceres.a", f"-L{VROOT}/lib/x86_64-linux-gnu", "-lglog", "-lgflags", "-fopenmp", "-lpthread",
                           f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu"]
         run(["g++", "-std=c++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", *incs, str(src),
              *[str(OKVIS_SRC / s) for s in srcs], *objs, f"-L{OCV}/lib", "-lopencv_core", "-lopencv_imgproc",

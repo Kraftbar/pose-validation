@@ -6,6 +6,8 @@
            [--graph-dump [--graph-lm-every 2 --graph-lm-sub 8 --graph-tpeval-every 50]]   (M5 graph dump, patch 0009;
             from patch 0010 on problem.bin also carries the ViGraph mutation log of module M5d, from 0011 the backend entry
             records, from 0012 the frontend descriptors / RANSAC runs)
+           [--ransac-dump]   (patch 0013: ransac.bin, the OpenGV adapter inputs of every RANSAC run)
+           [--place-dump]    (patch 0014: place.bin, the DBoW2 vocabulary / queries and the verifyRecognisedPlace stages)
            [--consolidated]   (all of the above in one run with the sampling of tags m8 / s8)
 
 Dataset: external/vio/data/<seq>/mav0 (tools/vio_harness/fetch_seq_stream.py). Outputs go to
@@ -52,6 +54,12 @@ def main():
     ap.add_argument("--graph-lm-every", default=None, help="OKVIS_PORT_GRAPH_LM_EVERY: every Nth updateLandmarks call (default 2)")
     ap.add_argument("--graph-lm-sub", default=None, help="OKVIS_PORT_GRAPH_LM_SUB: every Kth landmark of a recorded call (default 8)")
     ap.add_argument("--graph-problem-full-every", default=None, help="OKVIS_PORT_GRAPH_PROBLEM_FULL_EVERY: full program order every Nth Solve (default 50)")
+    ap.add_argument("--ransac-dump", action="store_true", help="OKVIS_PORT_RANSAC_DIR (patch 0013, module M7c): ransac.bin = the "
+                    "OpenGV adapter data + result of every RANSAC run of the frontend into <tag>/dumps (independent of the other dumps; "
+                    "a lean run with only this flag costs a few KB: its ransac.bin is then copied into the m8 / s8 dumps dir)")
+    ap.add_argument("--place-dump", action="store_true", help="OKVIS_PORT_PLACE_DIR (patch 0014, module M7d): place.bin = the DBoW2 "
+                    "vocabulary, every database add, every query + filtered result and a stage record of every verifyRecognisedPlace "
+                    "into <tag>/dumps (lean like --ransac-dump: the file is then copied into the m8 / s8 dumps dir)")
     ap.add_argument("--consolidated", action="store_true", help="the one-run dump set of tags m8 / s8 (every dump kind the "
                     "okvis_port harnesses need, sampled to ~2.5 GB mono / ~4 GB stereo): --dump --solve-dump --graph-dump with the "
                     "sampling in CONSOLIDATED below; explicitly given sampling options win")
@@ -107,6 +115,12 @@ def main():
                      ("OKVIS_PORT_GRAPH_LM_SUB", args.graph_lm_sub), ("OKVIS_PORT_GRAPH_PROBLEM_FULL_EVERY", args.graph_problem_full_every)]:
             if v is not None:
                 env[k] = v
+    if args.ransac_dump:
+        (out / "dumps").mkdir(exist_ok=True)
+        env["OKVIS_PORT_RANSAC_DIR"] = str(out / "dumps")
+    if args.place_dump:
+        (out / "dumps").mkdir(exist_ok=True)
+        env["OKVIS_PORT_PLACE_DIR"] = str(out / "dumps")
     if args.trace:
         (out / "trace").mkdir()
         env["OKVIS_PORT_TRACE_DIR"] = str(out / "trace")

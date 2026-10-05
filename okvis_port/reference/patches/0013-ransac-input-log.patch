@@ -1,0 +1,134 @@
+0013: module M7c instrumentation (OpenGV RANSAC inputs), active only with OKVIS_PORT_RANSAC_DIR.
+ One file ransac.bin (framing as problem.bin) with, per Ransac::computeModel run of the frontend, the adapter data the run sees
+ (tag 163 absolute-pose adapter, 164 relative-pose adapter; layouts in okvis_port/c/ok_opengv.h) followed by the result record 162
+ (same layout as patch 0012). No computed value changes.
+
+diff -ruN a/okvis_frontend/src/Frontend.cpp b/okvis_frontend/src/Frontend.cpp
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -75,6 +75,8 @@
+ #include <ceres/version.h>
+ #pragma GCC diagnostic pop
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include <okvis/Frontend.hpp>
+ #include <okvis/ceres/OkvisPortTrace.hpp>
+ #include <okvis/ceres/OkvisPortVigraphLog.hpp>  // okvis_port (patch 0012)
+@@ -117,6 +119,72 @@
+   okvis_portv::bWrite(okvis_portv::B_RANSAC, b);
+ }
+ 
++
++// okvis_port (patch 0013): OPENGV RANSAC INPUT log (OKVIS_PORT_RANSAC_DIR/ransac.bin, same framing as problem.bin: u32 tag, u64 length,
++// payload; layouts in okvis_port/c/ok_opengv.h). 163 = absolute-pose adapter (kind, n, n x {bearing[3], point[3], camOffset[3],
++// camRotation[9] column-major, sigmaAngle}), 164 = relative adapter (kind, n, n x {bearing1[3], bearing2[3], sigma1, sigma2}),
++// 162 = the result record of patch 0012. No numerical effect.
++struct PortRansacBuf {
++  std::vector<unsigned char> b;
++  void raw(const void* p, size_t n) { const unsigned char* c = static_cast<const unsigned char*>(p); b.insert(b.end(), c, c + n); }
++  void u32(uint32_t v) { raw(&v, 4); }
++  void f64n(const double* p, size_t n) { raw(p, 8 * n); }
++};
++static FILE* portRansacFile() {
++  static FILE* f = []() -> FILE* {
++    const char* d = std::getenv("OKVIS_PORT_RANSAC_DIR");
++    if (!d) return nullptr;
++    return std::fopen((std::string(d) + "/ransac.bin").c_str(), "wb");
++  }();
++  return f;
++}
++static void portRansacWrite(uint32_t tag, const PortRansacBuf& b) {
++  FILE* f = portRansacFile();
++  if (!f) return;
++  const uint64_t len = b.b.size();
++  std::fwrite(&tag, 4, 1, f);
++  std::fwrite(&len, 8, 1, f);
++  std::fwrite(b.b.data(), 1, b.b.size(), f);
++  std::fflush(f);
++}
++template <class A>
++static void portRansacInAbs(uint32_t kind, A& a) {
++  if (!portRansacFile()) return;
++  PortRansacBuf b;
++  const size_t n = a.getNumberCorrespondences();
++  b.u32(kind); b.u32(uint32_t(n));
++  for (size_t i = 0; i < n; ++i) {
++    const Eigen::Vector3d f = a.getBearingVector(i), p = a.getPoint(i), t = a.getCamOffset(i);
++    const Eigen::Matrix3d R = a.getCamRotation(i);
++    const double s = a.getSigmaAngle(i);
++    b.f64n(f.data(), 3); b.f64n(p.data(), 3); b.f64n(t.data(), 3); b.f64n(R.data(), 9); b.f64n(&s, 1);
++  }
++  portRansacWrite(163, b);
++}
++template <class A>
++static void portRansacInRel(uint32_t kind, A& a) {
++  if (!portRansacFile()) return;
++  PortRansacBuf b;
++  const size_t n = a.getNumberCorrespondences();
++  b.u32(kind); b.u32(uint32_t(n));
++  for (size_t i = 0; i < n; ++i) {
++    const Eigen::Vector3d f1 = a.getBearingVector1(i), f2 = a.getBearingVector2(i);
++    const double s1 = a.getSigmaAngle1(i), s2 = a.getSigmaAngle2(i);
++    b.f64n(f1.data(), 3); b.f64n(f2.data(), 3); b.f64n(&s1, 1); b.f64n(&s2, 1);
++  }
++  portRansacWrite(164, b);
++}
++template <class R>
++static void portRansacOut(uint32_t kind, size_t numCorr, const R& r) {
++  if (!portRansacFile()) return;
++  PortRansacBuf b;
++  b.u32(kind); b.u32(uint32_t(numCorr)); b.u32(uint32_t(r.iterations_)); b.u32(uint32_t(r.inliers_.size()));
++  for (int i : r.inliers_) b.u32(uint32_t(i));
++  b.u32(uint32_t(r.model_coefficients_.rows())); b.u32(uint32_t(r.model_coefficients_.cols()));
++  b.f64n(r.model_coefficients_.data(), size_t(r.model_coefficients_.size()));
++  portRansacWrite(162, b);
++}
++
+ static const double kptrad = 0.09;
+ //cv::Ptr<cv::CLAHE> mClahe;
+ 
+@@ -416,8 +484,10 @@
+     return false;
+   }
+   TimerSwitchable ransacLoopClosureTimer("2.05 loop closure ransacking");
++  portRansacInAbs(3, adapter);  // okvis_port (patch 0013)
+   ransac.computeModel(0);
+   portLogRansac(3, adapter.getNumberCorrespondences(), ransac);
++  portRansacOut(3, adapter.getNumberCorrespondences(), ransac);
+   const int numInliers = int(ransac.inliers_.size());
+   const double inlierRatio = double(ransac.inliers_.size())
+                              / double(adapter.getNumberCorrespondences());
+@@ -2464,8 +2534,10 @@
+   ransac.max_iterations_ = 50;
+   // initial guess not needed...
+   // run the ransac
++  portRansacInAbs(0, adapter);  // okvis_port (patch 0013)
+   ransac.computeModel(0);
+   portLogRansac(0, numCorrespondences, ransac);
++  portRansacOut(0, numCorrespondences, ransac);
+ 
+   // deal with outliers and assign transformation
+   numInliers = int(ransac.inliers_.size());
+@@ -2540,8 +2612,10 @@
+     rotation_only_ransac.max_iterations_ = 50;
+ 
+     // run the ransac
++    portRansacInRel(1, adapter);  // okvis_port (patch 0013)
+     rotation_only_ransac.computeModel(0);
+     portLogRansac(1, numCorrespondences, rotation_only_ransac);
++    portRansacOut(1, numCorrespondences, rotation_only_ransac);
+ 
+     // get quality
+     int rotation_only_inliers = int(rotation_only_ransac.inliers_.size());
+@@ -2558,8 +2632,10 @@
+     rel_pose_ransac.max_iterations_ = 50;
+ 
+     // run the ransac
++    portRansacInRel(2, adapter);  // okvis_port (patch 0013)
+     rel_pose_ransac.computeModel(0);
+     portLogRansac(2, numCorrespondences, rel_pose_ransac);
++    portRansacOut(2, numCorrespondences, rel_pose_ransac);
+ 
+     // assess success
+     int rel_pose_inliers = int(rel_pose_ransac.inliers_.size());

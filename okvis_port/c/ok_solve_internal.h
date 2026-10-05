@@ -12,6 +12,7 @@ typedef struct ok_sv_dogleg_state {
     double radius, max_radius, min_diagonal, max_diagonal, mu, min_mu, max_mu, mu_increase_factor;
     double increase_threshold, decrease_threshold, dogleg_step_norm, alpha;
     int reuse, n, mu_increases, branch;
+    double decrease_factor;        /* LevenbergMarquardtStrategy (strategy_lm): reuse = reuse_diagonal_, radius shared */
     double *diagonal, *gradient, *gauss_newton_step, *lm_diagonal, *scaled_gradient;
 } ok_sv_dogleg_state;
 
