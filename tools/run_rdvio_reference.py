@@ -36,8 +36,11 @@ def main():
     ap.add_argument("--sensor", default=str(REPO / "rdvio_port/reference/configs/euroc_sensor.yaml"))
     ap.add_argument("--setting", default=str(REPO / "rdvio_port/reference/configs/setting.yaml"))
     ap.add_argument("--max-seconds", default=None)
-    ap.add_argument("--dump", action="store_true", help="set RDVIO_PORT_DUMP_DIR (needs patches 0003-0005 in the build)")
+    ap.add_argument("--dump", action="store_true", help="set RDVIO_PORT_DUMP_DIR (needs patches 0003-0005 in the build; --solve-dump needs 0006 + the patched Ceres)")
     ap.add_argument("--dump-every", default=None, help="RDVIO_PORT_DUMP_EVERY, e.g. 'eval=200'")
+    ap.add_argument("--solve-dump", action="store_true", help="RDVIO_PORT_SOLVE_DUMP_DIR: per-Solve() snapshot + Ceres internals (patch 0006, M4)")
+    ap.add_argument("--solve-every", default="20", help="dump every n-th Solve() (RDVIO_PORT_SOLVE_EVERY)")
+    ap.add_argument("--solve-full-every", default="4", help="every n-th dumped Solve() with full vectors (RDVIO_PORT_SOLVE_FULL_EVERY)")
     ap.add_argument("--stock-binary", default=None, help="run another driver binary (e.g. the stock build) with the same arguments")
     a = ap.parse_args()
     data = Path(a.data_dir) if a.data_dir else REPO / "runs/rdvio_port/data" / a.seq
@@ -50,6 +53,9 @@ def main():
         d = out / "dump"; d.mkdir(exist_ok=True); env["RDVIO_PORT_DUMP_DIR"] = str(d)
         if a.dump_every:
             env["RDVIO_PORT_DUMP_EVERY"] = a.dump_every
+    if a.solve_dump:
+        d = out / "dump"; d.mkdir(exist_ok=True)
+        env["RDVIO_PORT_SOLVE_DUMP_DIR"] = str(d); env["RDVIO_PORT_SOLVE_EVERY"] = a.solve_every; env["RDVIO_PORT_SOLVE_FULL_EVERY"] = a.solve_full_every
     traj = out / "traj.tum"
     cmd = [a.stock_binary or str(BIN), a.sensor, a.setting, str(data / "mav0"), str(traj)] + ([a.max_seconds] if a.max_seconds else [])
     t0 = time.time()

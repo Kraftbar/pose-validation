@@ -1,0 +1,175 @@
+0006: M4 instrumentation (rd_vio side): per-Solve() snapshot in rdvio::Solver::solve (RDVIO_PORT_SOLVE_DUMP_DIR, RDVIO_PORT_SOLVE_EVERY, RDVIO_PORT_SOLVE_FULL_EVERY): solver options, Problem snapshot (parameter blocks, residual blocks with factor payloads, loss), arming of the Ceres hooks of rdvio_port/reference/ceres_patches/0006. Needs the patched Ceres copy. Layouts in rdvio_port/c/rd_solve.h. No numerical effect.
+
+diff -ruN a/src/rdvio_estimation/src/solver.cpp b/src/rdvio_estimation/src/solver.cpp
+--- a/src/rdvio_estimation/src/solver.cpp	2026-10-05 09:12:47.384114154 +0200
++++ b/src/rdvio_estimation/src/solver.cpp	2026-10-05 09:13:13.985733973 +0200
+@@ -1,4 +1,8 @@
+ #include <ceres/ceres.h>
++#include <ceres/rdvio_port_solve_hooks.h> // rdvio_port instrumentation (patch 0006, needs the patched Ceres copy)
++#include <cstdlib>
++#include <string>
++#include <unordered_map>
+ #include <rdvio/estimation/ceres/marginalization_factor.h>
+ #include <rdvio/estimation/ceres/preintegration_factor.h>
+ #include <rdvio/estimation/ceres/quaternion_parameterization.h>
+@@ -10,6 +14,145 @@
+ 
+ namespace rdvio {
+ 
++// ---- rdvio_port instrumentation (patch 0006): per-Solve() snapshot for rdvio_port/c/check_rd_solve.c. Observation only. ----
++namespace {
++namespace rp = rdvio_port_solve;
++// Reads RDVIO_PORT_SOLVE_DUMP_DIR (solve.bin), RDVIO_PORT_SOLVE_EVERY (every n-th Solve is dumped, default 20) and
++// RDVIO_PORT_SOLVE_FULL_EVERY (every n-th dumped Solve carries full vectors, level 2, default 4). Layout: rdvio_port/c/rd_solve.h.
++bool port_solve_enabled() {
++    static int init = 0;
++    if (!init) {
++        init = 1;
++        if (const char *d = std::getenv("RDVIO_PORT_SOLVE_DUMP_DIR")) {
++            std::string path = std::string(d) + "/solve.bin";
++            rp::g.f = std::fopen(path.c_str(), "wb");
++            rp::g.enabled = rp::g.f != nullptr;
++        }
++    }
++    return rp::g.enabled;
++}
++uint64_t port_env(const char *name, uint64_t def) {
++    const char *e = std::getenv(name);
++    return e ? std::strtoull(e, nullptr, 10) : def;
++}
++void port_live(rp::Buf &b, const double *p, int n) { b.u64((uint64_t)(uintptr_t)p); b.u32((uint32_t)n); b.f64n(p, (size_t)n); }
++void port_extr(rp::Buf &b, const ExtrinsicParams &e) { b.f64n(e.q_cs.coeffs().data(), 4); b.f64n(e.p_cs.data(), 3); }
++void port_vis(rp::Buf &b, const CeresReprojectionErrorFactor &f) {
++    const auto &[fr, kir] = f.track->first_keypoint();
++    b.f64n(f.frame->get_keypoint(f.keypoint_index).data(), 3);
++    b.f64n(fr->get_keypoint(kir).data(), 3);
++    port_extr(b, fr->camera);
++    port_extr(b, f.frame->camera);
++    b.f64n(f.frame->sqrt_inv_cov.data(), 4);
++}
++void port_pie(rp::Buf &b, const CeresPreIntegrationErrorFactor &f) {
++    const PreIntegrator &pre = f.preintegration;
++    b.f64(pre.delta.t); b.f64n(pre.delta.q.coeffs().data(), 4); b.f64n(pre.delta.p.data(), 3); b.f64n(pre.delta.v.data(), 3);
++    b.f64n(pre.jacobian.dq_dbg.data(), 9); b.f64n(pre.jacobian.dp_dbg.data(), 9); b.f64n(pre.jacobian.dp_dba.data(), 9);
++    b.f64n(pre.jacobian.dv_dbg.data(), 9); b.f64n(pre.jacobian.dv_dba.data(), 9);
++    b.f64n(pre.delta.sqrt_inv_cov.data(), 225);
++    port_extr(b, f.frame_i->imu); port_extr(b, f.frame_j->imu);
++}
++// Returns true when this Solve() is armed (dumped).
++bool port_solve_begin(ceres::Problem *problem, ceres::LossFunction *cauchy, ceres::Manifold *quat,
++                      const ceres::Solver::Options &o) {
++    if (!port_solve_enabled()) return false;
++    static uint64_t n = 0;
++    const uint64_t k = n++;
++    const uint64_t every = port_env("RDVIO_PORT_SOLVE_EVERY", 20), full = port_env("RDVIO_PORT_SOLVE_FULL_EVERY", 4);
++    if (every == 0 || k % every != 0) return false;
++    rp::g.solve_id = k;
++    rp::g.level = ((k / every) % (full ? full : 1) == 0) ? 2 : 1;
++    rp::g.oracle.clear();
++    {
++        rp::Buf b;
++        b.u64(k); b.u32((uint32_t)rp::g.level);
++        b.u32((uint32_t)o.linear_solver_type); b.u32((uint32_t)o.trust_region_strategy_type); b.u32((uint32_t)o.dogleg_type);
++        b.u32((uint32_t)o.max_num_iterations); b.u32((uint32_t)o.num_threads);
++        b.f64(o.function_tolerance); b.f64(o.gradient_tolerance); b.f64(o.parameter_tolerance);
++        b.f64(o.initial_trust_region_radius); b.f64(o.max_trust_region_radius); b.f64(o.min_trust_region_radius);
++        b.f64(o.min_relative_decrease); b.f64(o.min_lm_diagonal); b.f64(o.max_lm_diagonal);
++        b.u32(o.jacobi_scaling); b.u32(o.use_nonmonotonic_steps); b.u32((uint32_t)o.max_num_consecutive_invalid_steps);
++        b.u32((uint32_t)o.linear_solver_ordering_type); b.u32((uint32_t)o.sparse_linear_algebra_library_type);
++        b.u32((uint32_t)o.dense_linear_algebra_library_type); b.u32(o.linear_solver_ordering ? 1u : 0u);
++        b.u32((uint32_t)o.callbacks.size()); b.u32(o.use_inner_iterations); b.u32(o.dynamic_sparsity);
++        b.u32((uint32_t)o.minimizer_type); b.u32((uint32_t)o.preconditioner_type); b.u32(o.use_explicit_schur_complement);
++        b.u32((uint32_t)o.max_num_refinement_iterations); b.u32(o.use_mixed_precision_solves);
++        b.u32(o.update_state_every_iteration); b.f64(o.max_solver_time_in_seconds); b.u32((uint32_t)o.num_threads);
++        rp::g.write(rp::R_SOLVE, b);
++    }
++    std::vector<double *> pbs;
++    problem->GetParameterBlocks(&pbs);
++    std::unordered_map<const double *, uint32_t> pidx;
++    {
++        rp::Buf b;
++        b.u32((uint32_t)pbs.size());
++        for (size_t i = 0; i < pbs.size(); ++i) {
++            double *q = pbs[i];
++            pidx[q] = (uint32_t)i;
++            const int sz = problem->ParameterBlockSize(q), ts = problem->ParameterBlockTangentSize(q);
++            const ceres::Manifold *m = problem->GetManifold(q);
++            b.u64((uint64_t)(uintptr_t)q); b.u32((uint32_t)sz); b.u32((uint32_t)ts);
++            b.u32(m == nullptr ? 0u : (m == quat ? 1u : 3u));
++            b.u32(problem->IsParameterBlockConstant(q) ? 1u : 0u);
++            b.f64n(q, (size_t)sz);
++        }
++        std::vector<ceres::ResidualBlockId> rbs;
++        problem->GetResidualBlocks(&rbs);
++        b.u32((uint32_t)rbs.size());
++        for (auto rb : rbs) {
++            const ceres::CostFunction *cf = problem->GetCostFunctionForResidualBlock(rb);
++            const ceres::LossFunction *lf = problem->GetLossFunctionForResidualBlock(rb);
++            std::vector<double *> blocks;
++            problem->GetParameterBlocksForResidualBlock(rb, &blocks);
++            rp::Buf pl;
++            uint32_t type = 0;
++            if (auto f = dynamic_cast<const CeresReprojectionErrorFactor *>(cf)) {
++                type = 1; port_vis(pl, *f);
++            } else if (auto f = dynamic_cast<const CeresReprojectionPriorFactor *>(cf)) {
++                type = 2; port_vis(pl, f->rpefactor);
++                Frame *fr = f->rpefactor.track->first_frame();
++                pl.u32(3);
++                port_live(pl, fr->pose.q.coeffs().data(), 4); port_live(pl, fr->pose.p.data(), 3);
++                port_live(pl, &(f->rpefactor.track->landmark.inv_depth), 1);
++            } else if (auto f = dynamic_cast<const CeresRotationPriorFactor *>(cf)) {
++                type = 3;
++                const auto &[fr, kir] = f->track->first_keypoint();
++                pl.f64n(f->frame->get_keypoint(f->keypoint_index).data(), 3);
++                pl.f64n(fr->get_keypoint(kir).data(), 3);
++                port_extr(pl, fr->camera); port_extr(pl, f->frame->camera);
++                pl.f64n(f->frame->sqrt_inv_cov.data(), 4);
++                pl.u32(1);
++                port_live(pl, fr->pose.q.coeffs().data(), 4);
++            } else if (auto f = dynamic_cast<const CeresPreIntegrationErrorFactor *>(cf)) {
++                type = 4; port_pie(pl, *f);
++                pl.u32(2);
++                port_live(pl, f->frame_i->motion.bg.data(), 3); port_live(pl, f->frame_i->motion.ba.data(), 3);
++            } else if (auto f = dynamic_cast<const CeresPreIntegrationPriorFactor *>(cf)) {
++                type = 5; port_pie(pl, f->piefactor);
++                const Frame *fi = f->piefactor.frame_i;
++                pl.u32(5);
++                port_live(pl, fi->pose.q.coeffs().data(), 4); port_live(pl, fi->pose.p.data(), 3);
++                port_live(pl, fi->motion.v.data(), 3); port_live(pl, fi->motion.bg.data(), 3); port_live(pl, fi->motion.ba.data(), 3);
++            } else if (dynamic_cast<const CeresMarginalizationFactor *>(cf)) {
++                type = 6;
++                rp::g.oracle.insert(cf);
++            }
++            b.u64((uint64_t)(uintptr_t)rb); b.u32(type);
++            b.u32(lf == nullptr ? 0u : (lf == cauchy ? 1u : 2u));
++            b.u32((uint32_t)blocks.size());
++            for (double *q : blocks) b.u32(pidx.at(q));
++            b.u32((uint32_t)cf->num_residuals());
++            b.u64((uint64_t)pl.b.size());
++            b.raw(pl.b.data(), pl.b.size());
++        }
++        rp::g.write(rp::R_PROBLEM, b);
++    }
++    rp::g.armed = true;
++    return true;
++}
++} // namespace
++
+ struct Solver::SolverDetails {
+     static Config *&config() {
+         static Config *s_config = nullptr;
+@@ -184,7 +327,14 @@
+     solver_options.num_threads = 1;
+     solver_options.minimizer_progress_to_stdout = verbose;
+     solver_options.update_state_every_iteration = true;
++    const bool port_armed = port_solve_begin(details->problem.get(), details->cauchy_loss.get(),
++                                              details->quaternion_parameterization.get(), solver_options);
+     ceres::Solve(solver_options, details->problem.get(), &solver_summary);
++    if (port_armed) {
++        rp::g.armed = false;
++        rp::g.oracle.clear();
++        if (rp::g.f) std::fflush(rp::g.f);
++    }
+     return solver_summary.IsSolutionUsable();
+ }
+ 

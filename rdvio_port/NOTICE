@@ -6,10 +6,18 @@ carry that notice: rd_imu.{h,c}, rd_lie.{h,c}, rd_factor.{h,c}, rd_geom.{h,c}, r
 no per-file headers; the notice above is the conservative reading.
 Eigen 3.4.0 evaluation-order models (rd_eigen.{h,c}, rd_svd.{h,c}, rd_qr.{h,c}, and the Eigen expression models inside rd_lie.c / rd_imu.c) are MPL-2.0
 (Copyright (C) Gael Guennebaud, Benoit Jacob and the Eigen authors); they reuse okvis_port/c/ok_eigen.c and ok_dense.c (MPL-2.0 / BSD-3).
-Later modules derived from Ceres Solver (BSD-3-Clause, Google Inc.; text in rdvio_port/LICENSES/ceres-solver-BSD-3-Clause.txt) and from
-OpenCV (Apache-2.0, OpenCV Foundation / Intel / contributors) will add their notices here.
+Module M4 (rd_solve.{h,c}, rd_solve_linear.c, rd_solve_internal.h, rd_static.{h,c}) is derived from Ceres Solver 2.2.0 (BSD-3-Clause, Copyright 2023
+Google Inc. All rights reserved; text in rdvio_port/LICENSES/ceres-solver-BSD-3-Clause.txt: redistribution requires retaining that notice, the name of
+Google Inc. may not be used to endorse derived products) through MODIFIED COPIES of okvis_port/c/ok_solve.{h,c}, ok_solve_linear.c, ok_solve_internal.h
+(BSD-3-Clause: Ceres + OKVIS2, Copyright (c) 2015 ETH Zurich ASL, 2020 Imperial College London SRL, 2024 TUM SRL; the copies keep those notices) and
+from RD-VIO's solver.cpp / factor classes (Apache-2.0, see above), plus Eigen 3.4.0 evaluation-order models (MPL-2.0; rd_static.c). Copied with changes
+(not included by path): the minimizer / Dogleg / reduction / Schur eliminator (rd_solve*.c) and the problem types (rd_solve.h). Reused by path, read-only:
+okvis_port/c/ok_blas.c (Ceres small_blas kernels, BSD-3), ok_dense.c (Eigen kernels, MPL-2.0), ok_sparse.c (Eigen SimplicialLDLT, MPL-2.0; Timothy Davis' LDL
+as adapted in Eigen), ok_amd.c (Eigen AMDOrdering, MPL-2.0). Later modules derived from OpenCV (Apache-2.0, OpenCV Foundation / Intel / contributors) will
+add their notices here.
+The reference Ceres copy (rdvio_port/reference/ceres_patches/0006-*.patch: instrumentation hooks inside Ceres 2.2.0, BSD-3-Clause) is reference tooling only.
 The reference instrumentation (rdvio_port/reference/patches/0003-*.patch) and the oracle program (rdvio_port/reference_tools) are never
-distributed. EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).
+distributed (patches 0003-0006, ceres_patches/0006, reference_tools/*). EuRoC / phone data and all dumps stay under gitignored runs/ (non-commercial licences).
 
 Read-only reuse by path (not copied, notices stay with the originals): okvis_port/c/ok_eigen.c, ok_dense.c (MPL-2.0 / BSD-3),
 stella_port/c/sv_eigen_svd.c, sv_eigen_qr.c, sv_eigen_eigensolver.c (MPL-2.0). rd_qr.c is a copy of stella_port/c/sv_eigen_qr.c (MPL-2.0) with one

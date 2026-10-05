@@ -1,0 +1,516 @@
+0006 (Ceres side): per-Solve() dump hooks inside a COPY of Ceres 2.2.0 (the okvis2 submodule, 85331393), for rdvio_port M4
+(rdvio_port/c/check_rd_solve.c). Derived from okvis_port/reference/patches/0008-solver-dump.patch (same hooks, namespace renamed
+rdvio_port_solve) plus an R_SPARSE record in SparseSchurComplementSolver::SolveReducedLinearSystem (the reduced Schur system as
+handed to Eigen's SimplicialLDLT). Active only while rdvio::Solver::solve arms it (RDVIO_PORT_SOLVE_DUMP_DIR, patch 0006 of
+rdvio_port/reference/patches). Purely observational. Applied with -p1 by tools/build_rdvio_reference.py (--ceres) to
+runs/rdvio_port/reference_build/ceres-src (git archive of the pristine submodule), built into ceres-install-m4.
+diff -ruN -x '*.orig' ceres-src-pristine/include/ceres/rdvio_port_solve_hooks.h ceres-src/include/ceres/rdvio_port_solve_hooks.h
+--- a/include/ceres/rdvio_port_solve_hooks.h	1970-01-01 01:00:00.000000000 +0100
++++ b/include/ceres/rdvio_port_solve_hooks.h	2026-10-05 09:11:12.563477280 +0200
+@@ -0,0 +1,76 @@
++/* rdvio_port reference instrumentation (NOT upstream code, patch 0006): per-Solve() dump of the Ceres problem
++ * snapshot and of the trust-region / Dogleg / linear-solver internals, used by rdvio_port/c/check_rd_solve.c.
++ * Active only while rdvio::Solver::solve arms it (RDVIO_PORT_SOLVE_DUMP_DIR set). Purely observational:
++ * nothing here changes a computed value. The global state is defined in internal/ceres/solver.cc.
++ *
++ * Stream solve.bin = sequence of framed records: u32 tag, u64 payload length, payload (native endian).
++ * Record layouts are documented in rdvio_port/c/rd_solve.h.
++ */
++#ifndef CERES_RDVIO_PORT_SOLVE_HOOKS_H_
++#define CERES_RDVIO_PORT_SOLVE_HOOKS_H_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <unordered_set>
++#include <vector>
++
++namespace rdvio_port_solve {
++
++enum Record : uint32_t {
++  R_SOLVE = 1,    // ViGraph::optimise: options + sampling level
++  R_PROBLEM = 2,  // ViGraph::optimise: Problem snapshot (parameter blocks, residual blocks, cost-function payloads)
++  R_REDUCED = 3,  // solver.cc: reduced program order after preprocessing/reordering
++  R_ITER = 4,     // trust_region_minimizer.cc: one record per iteration (summary + internals)
++  R_DOGLEG = 5,   // dogleg_strategy.cc: ComputeTraditionalDoglegStep
++  R_GN = 6,       // dogleg_strategy.cc: ComputeGaussNewtonStep (mu loop)
++  R_SCHUR = 7,    // schur_complement_solver.cc: detected structure / eliminator kind (once per Solve)
++  R_DENSE = 8,    // schur_complement_solver.cc: reduced dense system (lhs, rhs, solution)
++  R_SPARSE = 9,   // sparse_normal_cholesky_solver.cc (J^T J) or schur_complement_solver.cc (reduced Schur system): CRS, rhs, solution
++  R_ORACLE = 10,  // residual_block.cc: raw cost-function outputs of not-yet-ported terms
++  R_END = 11,     // solver.cc: termination, final cost, parameter hash
++  R_PROGRAM = 12  // solver.cc: the Problem program order of parameter / residual blocks before preprocessing
++};
++
++struct Buf {
++  std::vector<char> b;
++  void raw(const void* p, size_t n) { const char* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
++  void u32(uint32_t v) { raw(&v, 4); }
++  void i32(int32_t v) { raw(&v, 4); }
++  void u64(uint64_t v) { raw(&v, 8); }
++  void f64(double v) { raw(&v, 8); }
++  void f64n(const double* p, size_t n) { raw(p, 8 * n); }
++  void i32n(const int* p, size_t n) { raw(p, 4 * n); }
++};
++
++inline uint64_t fnv(const void* p, size_t n) {
++  const unsigned char* c = static_cast<const unsigned char*>(p);
++  uint64_t h = 1469598103934665603ULL;
++  for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ULL; }
++  return h;
++}
++inline uint64_t fnvd(const double* p, size_t n) { return fnv(p, 8 * n); }
++
++struct State {
++  FILE* f = nullptr;
++  bool enabled = false;  // RDVIO_PORT_SOLVE_DUMP_DIR set and file open
++  bool armed = false;    // inside ViGraph::optimise's ::ceres::Solve
++  int level = 0;         // 0: per-iteration summary only; 1: + snapshot and hashes; 2: + full vectors
++  uint64_t solve_id = 0;
++  std::unordered_set<const void*> oracle;  // cost functions whose raw Evaluate outputs are recorded
++  bool reuse = false;    // DoglegStrategy: ComputeStep took the reuse branch
++  int mu_increases = 0;  // DoglegStrategy: number of mu increases in the last ComputeGaussNewtonStep
++  bool on(int min_level) const { return enabled && armed && level >= min_level; }
++  void write(uint32_t rec, const Buf& b) {
++    if (!f) return;
++    const uint64_t n = b.b.size();
++    std::fwrite(&rec, 4, 1, f);
++    std::fwrite(&n, 8, 1, f);
++    if (n) std::fwrite(b.b.data(), 1, n, f);
++  }
++};
++extern State g;
++
++}  // namespace rdvio_port_solve
++
++#endif  // CERES_RDVIO_PORT_SOLVE_HOOKS_H_
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/dogleg_strategy.cc ceres-src/internal/ceres/dogleg_strategy.cc
+--- a/internal/ceres/dogleg_strategy.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/dogleg_strategy.cc	2026-10-05 09:11:08.724532753 +0200
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/dogleg_strategy.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -75,6 +76,25 @@
+ // gradient) and the new Gauss-Newton step are computed from
+ // scratch. The Dogleg step is then computed as interpolation of these
+ // two vectors.
++// rdvio_port (patch 0006): record the strategy state after ComputeStep (members are read, nothing is changed).
++#define rdvio_port_dogleg_record(REUSE, TERM, STEP)                                                      \
++  if (rdvio_port_solve::g.on(1)) {                                                                       \
++    rdvio_port_solve::Buf b;                                                                             \
++    const int nn = int(gradient_.rows());                                                                \
++    b.u32((REUSE) ? 1u : 0u); b.u32(uint32_t(TERM)); b.f64(radius_); b.f64(mu_); b.f64(alpha_);          \
++    b.f64(dogleg_step_norm_); b.f64(gradient_.norm()); b.f64(gauss_newton_step_.norm()); b.u32(uint32_t(nn)); \
++    b.u64(rdvio_port_solve::fnvd(gradient_.data(), size_t(nn)));                                         \
++    b.u64(rdvio_port_solve::fnvd(gauss_newton_step_.data(), size_t(nn)));                                \
++    b.u64(rdvio_port_solve::fnvd(diagonal_.data(), size_t(nn)));                                         \
++    const bool okstep = (REUSE) || (TERM) == int(LinearSolverTerminationType::SUCCESS);                  \
++    b.u64(okstep ? rdvio_port_solve::fnvd(STEP, size_t(nn)) : 0ULL);                                      \
++    if (rdvio_port_solve::g.on(2)) {                                                                     \
++      b.f64n(gradient_.data(), size_t(nn)); b.f64n(gauss_newton_step_.data(), size_t(nn));               \
++      b.f64n(diagonal_.data(), size_t(nn)); if (okstep) b.f64n(STEP, size_t(nn));                       \
++    }                                                                                                    \
++    rdvio_port_solve::g.write(rdvio_port_solve::R_DOGLEG, b);                                            \
++  }
++
+ TrustRegionStrategy::Summary DoglegStrategy::ComputeStep(
+     const TrustRegionStrategy::PerSolveOptions& per_solve_options,
+     SparseMatrix* jacobian,
+@@ -84,6 +104,7 @@
+   CHECK(residuals != nullptr);
+   CHECK(step != nullptr);
+ 
++  rdvio_port_solve::g.reuse = reuse_;  // rdvio_port
+   const int n = jacobian->num_cols();
+   if (reuse_) {
+     // Gauss-Newton and gradient vectors are always available, only a
+@@ -98,6 +119,7 @@
+         ComputeSubspaceDoglegStep(step);
+         break;
+     }
++    rdvio_port_dogleg_record(true, 0, step);  // rdvio_port
+     TrustRegionStrategy::Summary summary;
+     summary.num_iterations = 0;
+     summary.termination_type = LinearSolverTerminationType::SUCCESS;
+@@ -162,6 +184,7 @@
+     }
+   }
+ 
++  rdvio_port_dogleg_record(false, int(summary.termination_type), step);  // rdvio_port
+   return summary;
+ }
+ 
+@@ -540,6 +563,7 @@
+   // When a step is declared successful, the multiplier is decreased
+   // by half of mu_increase_factor_.
+ 
++  rdvio_port_solve::g.mu_increases = 0;  // rdvio_port
+   while (mu_ < max_mu_) {
+     // Dogleg, as far as I (sameeragarwal) understand it, requires a
+     // reasonably good estimate of the Gauss-Newton step. This means
+@@ -593,6 +617,7 @@
+         !IsArrayValid(n, gauss_newton_step_.data())) {
+       mu_ *= mu_increase_factor_;
+       VLOG(2) << "Increasing mu " << mu_;
++      ++rdvio_port_solve::g.mu_increases;  // rdvio_port
+       linear_solver_summary.termination_type =
+           LinearSolverTerminationType::FAILURE;
+       continue;
+@@ -600,6 +625,22 @@
+     break;
+   }
+ 
++  if (rdvio_port_solve::g.on(1)) {  // rdvio_port: Gauss-Newton step as returned by the linear solver
++    rdvio_port_solve::Buf b;
++    b.u32(uint32_t(linear_solver_summary.termination_type));
++    b.u32(uint32_t(rdvio_port_solve::g.mu_increases));
++    b.f64(mu_);
++    b.u32(uint32_t(n));
++    const bool ok = linear_solver_summary.termination_type != LinearSolverTerminationType::FAILURE &&
++                    linear_solver_summary.termination_type != LinearSolverTerminationType::FATAL_ERROR;
++    b.u64(ok ? rdvio_port_solve::fnvd(gauss_newton_step_.data(), size_t(n)) : 0ULL);
++    b.u64(rdvio_port_solve::fnvd(lm_diagonal_.data(), size_t(n)));
++    if (rdvio_port_solve::g.on(2)) {
++      b.f64n(lm_diagonal_.data(), size_t(n));
++      if (ok) b.f64n(gauss_newton_step_.data(), size_t(n));
++    }
++    rdvio_port_solve::g.write(rdvio_port_solve::R_GN, b);
++  }
+   if (linear_solver_summary.termination_type !=
+       LinearSolverTerminationType::FAILURE) {
+     // The scaled Gauss-Newton step is D * GN:
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/residual_block.cc ceres-src/internal/ceres/residual_block.cc
+--- a/internal/ceres/residual_block.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/residual_block.cc	2026-10-05 09:11:08.724532753 +0200
+@@ -30,6 +30,7 @@
+ //         sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/residual_block.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -113,6 +114,27 @@
+     return false;
+   }
+ 
++  if (rdvio_port_solve::g.on(1) && rdvio_port_solve::g.oracle.count(cost_function_)) {  // rdvio_port: raw outputs
++    rdvio_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this)));
++    uint64_t hp = 1469598103934665603ULL;
++    for (int i = 0; i < num_parameter_blocks; ++i) {
++      const uint64_t h1 = rdvio_port_solve::fnvd(parameters[i], size_t(parameter_blocks_[i]->Size()));
++      hp ^= h1;
++      hp *= 1099511628211ULL;
++    }
++    b.u64(hp);
++    b.u32(eval_jacobians ? 1u : 0u);
++    b.u32(uint32_t(num_parameter_blocks));
++    for (int i = 0; i < num_parameter_blocks; ++i) b.u32(eval_jacobians && eval_jacobians[i] ? 1u : 0u);
++    b.u32(uint32_t(num_residuals));
++    b.f64n(residuals, size_t(num_residuals));
++    for (int i = 0; i < num_parameter_blocks; ++i)
++      if (eval_jacobians && eval_jacobians[i])
++        b.f64n(eval_jacobians[i], size_t(num_residuals) * size_t(parameter_blocks_[i]->Size()));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_ORACLE, b);
++  }
++
+   if (!IsEvaluationValid(*this, parameters.data(), residuals, eval_jacobians)) {
+     // clang-format off
+     std::string message =
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/schur_complement_solver.cc ceres-src/internal/ceres/schur_complement_solver.cc
+--- a/internal/ceres/schur_complement_solver.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/schur_complement_solver.cc	2026-10-05 09:11:21.910342315 +0200
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/schur_complement_solver.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
+ 
+ #include <algorithm>
+ #include <ctime>
+@@ -127,6 +128,14 @@
+     } else {
+       eliminator_ = SchurEliminatorBase::Create(options_);
+     }
++    if (rdvio_port_solve::g.on(1)) {  // rdvio_port: detected structure / eliminator kind
++      rdvio_port_solve::Buf b;
++      b.i32(options_.row_block_size); b.i32(options_.e_block_size); b.i32(options_.f_block_size);
++      b.u32(uint32_t(num_eliminate_blocks)); b.u32(uint32_t(num_f_blocks));
++      b.u32((options_.row_block_size == 2 && options_.e_block_size == 3 && options_.f_block_size == 6 && num_f_blocks == 1) ? 1u : 0u);
++      b.u32(uint32_t(bs->cols.size())); b.u32(uint32_t(bs->rows.size()));
++      rdvio_port_solve::g.write(rdvio_port_solve::R_SCHUR, b);
++    }
+ 
+     CHECK(eliminator_);
+     const bool kFullRankETE = true;
+@@ -195,9 +204,24 @@
+     return summary;
+   }
+ 
++  rdvio_port_solve::Buf okb;  // rdvio_port: reduced dense system before the (in-place) factorisation
++  const bool okon = rdvio_port_solve::g.on(1);
++  if (okon) {
++    okb.u32(uint32_t(num_rows));
++    okb.u64(rdvio_port_solve::fnvd(m->values(), size_t(num_rows) * size_t(num_rows)));
++    okb.u64(rdvio_port_solve::fnvd(rhs().data(), size_t(num_rows)));
++    if (rdvio_port_solve::g.on(2)) { okb.f64n(m->values(), size_t(num_rows) * size_t(num_rows)); okb.f64n(rhs().data(), size_t(num_rows)); }
++  }
+   summary.num_iterations = 1;
+   summary.termination_type = cholesky_->FactorAndSolve(
+       num_rows, m->mutable_values(), rhs().data(), solution, &summary.message);
++  if (okon) {
++    okb.u32(uint32_t(summary.termination_type));
++    const bool ok = summary.termination_type == LinearSolverTerminationType::SUCCESS;
++    okb.u64(ok ? rdvio_port_solve::fnvd(solution, size_t(num_rows)) : 0ULL);
++    if (ok && rdvio_port_solve::g.on(2)) okb.f64n(solution, size_t(num_rows));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_DENSE, okb);
++  }
+   return summary;
+ }
+ 
+@@ -326,9 +350,32 @@
+     }
+   }
+ 
++  rdvio_port_solve::Buf okb;  // rdvio_port: reduced Schur system as handed to the sparse Cholesky (CRS), rhs
++  const bool okon = rdvio_port_solve::g.on(1);
++  if (okon) {
++    const int nn = crs_lhs_->num_rows();
++    okb.u32(uint32_t(nn)); okb.u32(uint32_t(crs_lhs_->num_nonzeros())); okb.u32(uint32_t(crs_lhs_->storage_type()));
++    okb.u32(uint32_t(sparse_cholesky_->StorageType()));
++    okb.u64(rdvio_port_solve::fnvd(crs_lhs_->values(), size_t(crs_lhs_->num_nonzeros())));
++    okb.u64(rdvio_port_solve::fnvd(rhs().data(), size_t(nn)));
++    okb.u64(rdvio_port_solve::fnv(crs_lhs_->rows(), 4 * (size_t(nn) + 1)));
++    okb.u64(rdvio_port_solve::fnv(crs_lhs_->cols(), 4 * size_t(crs_lhs_->num_nonzeros())));
++    if (rdvio_port_solve::g.on(2)) {
++      okb.i32n(crs_lhs_->rows(), size_t(nn) + 1); okb.i32n(crs_lhs_->cols(), size_t(crs_lhs_->num_nonzeros()));
++      okb.f64n(crs_lhs_->values(), size_t(crs_lhs_->num_nonzeros())); okb.f64n(rhs().data(), size_t(nn));
++    }
++  }
+   summary.num_iterations = 1;
+   summary.termination_type = sparse_cholesky_->FactorAndSolve(
+       crs_lhs_.get(), rhs().data(), solution, &summary.message);
++  if (okon) {
++    const int nn = crs_lhs_->num_rows();
++    okb.u32(uint32_t(summary.termination_type));
++    const bool ok = summary.termination_type == LinearSolverTerminationType::SUCCESS;
++    okb.u64(ok ? rdvio_port_solve::fnvd(solution, size_t(nn)) : 0ULL);
++    if (ok && rdvio_port_solve::g.on(2)) okb.f64n(solution, size_t(nn));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_SPARSE, okb);
++  }
+   return summary;
+ }
+ 
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/solver.cc ceres-src/internal/ceres/solver.cc
+--- a/internal/ceres/solver.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/solver.cc	2026-10-05 09:11:08.723532767 +0200
+@@ -30,6 +30,10 @@
+ //         sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/solver.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
++#include "ceres/parameter_block.h"
++#include "ceres/residual_block.h"
++namespace rdvio_port_solve { State g; }
+ 
+ #include <algorithm>
+ #include <map>
+@@ -760,6 +764,15 @@
+   // values provided by the user.
+   program->SetParameterBlockStatePtrsToUserStatePtrs();
+ 
++  if (rdvio_port_solve::g.on(1)) {  // rdvio_port: the Problem's program order (ParameterMap is pointer-sorted)
++    rdvio_port_solve::Buf b;
++    b.u32(uint32_t(program->NumParameterBlocks()));
++    for (const auto* pb : program->parameter_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(pb->user_state())));
++    b.u32(uint32_t(program->NumResidualBlocks()));
++    for (const auto* rb : program->residual_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(rb)));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_PROGRAM, b);
++  }
++
+   // The main thread also does work so we only need to launch num_threads - 1.
+   problem_impl->context()->EnsureMinimumThreads(options.num_threads - 1);
+ 
+@@ -769,6 +782,22 @@
+   const bool status =
+       preprocessor->Preprocess(modified_options, problem_impl, &pp);
+ 
++  if (rdvio_port_solve::g.on(1)) {  // rdvio_port: reduced program order after preprocessing / reordering
++    rdvio_port_solve::Buf b;
++    b.u32(status ? 1u : 0u);
++    b.f64(pp.fixed_cost);
++    b.u32(uint32_t(pp.evaluator_options.num_eliminate_blocks));
++    b.u32(uint32_t(pp.linear_solver_options.type));
++    const internal::Program* rp = pp.reduced_program.get();
++    b.u32(rp ? uint32_t(rp->NumParameterBlocks()) : 0u);
++    if (rp) for (const auto* pb : rp->parameter_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(pb->user_state())));
++    b.u32(rp ? uint32_t(rp->NumResidualBlocks()) : 0u);
++    if (rp) for (const auto* rb : rp->residual_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(rb)));
++    b.u32(uint32_t(pp.removed_parameter_blocks.size()));
++    for (const double* q : pp.removed_parameter_blocks) b.u64(uint64_t(reinterpret_cast<uintptr_t>(q)));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_REDUCED, b);
++  }
++
+   // We check the linear_solver_options.type rather than
+   // modified_options.linear_solver_type because, depending on the
+   // lack of a Schur structure, the preprocessor may change the linear
+@@ -826,6 +855,27 @@
+     summary->message = gradient_checking_callback.error_log();
+   }
+ 
++  if (rdvio_port_solve::g.on(0)) {  // rdvio_port: termination + hash of the final parameters
++    rdvio_port_solve::Buf b;
++    b.u32(uint32_t(summary->termination_type));
++    b.u32(uint32_t(summary->iterations.size()));
++    b.f64(summary->initial_cost);
++    b.f64(summary->final_cost);
++    b.f64(summary->fixed_cost);
++    std::vector<double*> pbs;
++    problem->GetParameterBlocks(&pbs);
++    uint64_t h = 1469598103934665603ULL;
++    for (double* q : pbs) {
++      const uint64_t hp = rdvio_port_solve::fnvd(q, size_t(problem->ParameterBlockSize(q)));
++      h ^= hp;
++      h *= 1099511628211ULL;
++    }
++    b.u64(h);
++    b.u32(uint32_t(pbs.size()));
++    b.u32(uint32_t(summary->num_successful_steps));
++    b.u32(uint32_t(summary->num_unsuccessful_steps));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_END, b);
++  }
+   summary->total_time_in_seconds = WallTimeInSeconds() - start_time;
+ }
+ 
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/sparse_normal_cholesky_solver.cc ceres-src/internal/ceres/sparse_normal_cholesky_solver.cc
+--- a/internal/ceres/sparse_normal_cholesky_solver.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/sparse_normal_cholesky_solver.cc	2026-10-05 09:11:08.724532753 +0200
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/sparse_normal_cholesky_solver.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -100,11 +101,33 @@
+     A->DeleteRowBlocks(A->block_structure()->cols.size());
+   }
+ 
++  rdvio_port_solve::Buf okb;  // rdvio_port: J^T J (CRS as handed to the sparse Cholesky), rhs
++  const bool okon = rdvio_port_solve::g.on(1);
++  if (okon) {
++    const CompressedRowSparseMatrix* jtj = inner_product_computer_->mutable_result();
++    okb.u32(uint32_t(num_cols)); okb.u32(uint32_t(jtj->num_nonzeros())); okb.u32(uint32_t(jtj->storage_type()));
++    okb.u32(uint32_t(sparse_cholesky_->StorageType()));
++    okb.u64(rdvio_port_solve::fnvd(jtj->values(), size_t(jtj->num_nonzeros())));
++    okb.u64(rdvio_port_solve::fnvd(rhs_.data(), size_t(num_cols)));
++    okb.u64(rdvio_port_solve::fnv(jtj->rows(), 4 * (size_t(jtj->num_rows()) + 1)));
++    okb.u64(rdvio_port_solve::fnv(jtj->cols(), 4 * size_t(jtj->num_nonzeros())));
++    if (rdvio_port_solve::g.on(2)) {
++      okb.i32n(jtj->rows(), size_t(jtj->num_rows()) + 1); okb.i32n(jtj->cols(), size_t(jtj->num_nonzeros()));
++      okb.f64n(jtj->values(), size_t(jtj->num_nonzeros())); okb.f64n(rhs_.data(), size_t(num_cols));
++    }
++  }
+   summary.termination_type = sparse_cholesky_->FactorAndSolve(
+       inner_product_computer_->mutable_result(),
+       rhs_.data(),
+       x,
+       &summary.message);
++  if (okon) {
++    okb.u32(uint32_t(summary.termination_type));
++    const bool ok = summary.termination_type == LinearSolverTerminationType::SUCCESS;
++    okb.u64(ok ? rdvio_port_solve::fnvd(x, size_t(num_cols)) : 0ULL);
++    if (ok && rdvio_port_solve::g.on(2)) okb.f64n(x, size_t(num_cols));
++    rdvio_port_solve::g.write(rdvio_port_solve::R_SPARSE, okb);
++  }
+   event_logger.AddEvent("SparseCholesky::FactorAndSolve");
+   return summary;
+ }
+diff -ruN -x '*.orig' ceres-src-pristine/internal/ceres/trust_region_minimizer.cc ceres-src/internal/ceres/trust_region_minimizer.cc
+--- a/internal/ceres/trust_region_minimizer.cc	2023-10-13 03:12:09.000000000 +0200
++++ b/internal/ceres/trust_region_minimizer.cc	2026-10-05 09:11:08.724532753 +0200
+@@ -29,6 +29,8 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/trust_region_minimizer.h"
++#include "ceres/rdvio_port_solve_hooks.h"  // rdvio_port instrumentation (patch 0006)
++namespace { bool rdvio_port_candidate_valid = false, rdvio_port_delta_valid = false, rdvio_port_step_valid = false; }
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -185,6 +187,7 @@
+   x_cost_ = std::numeric_limits<double>::max();
+   minimum_cost_ = x_cost_;
+   model_cost_change_ = 0.0;
++  rdvio_port_candidate_valid = rdvio_port_delta_valid = rdvio_port_step_valid = false;  // rdvio_port
+ }
+ 
+ // 1. Project the initial solution onto the feasible set if needed.
+@@ -334,6 +337,36 @@
+ 
+   solver_summary_->iterations.push_back(iteration_summary_);
+ 
++  if (rdvio_port_solve::g.on(0)) {  // rdvio_port: per-iteration record (summary + minimizer internals)
++    rdvio_port_solve::Buf b;
++    const IterationSummary& s = iteration_summary_;
++    b.u32(uint32_t(s.iteration)); b.f64(s.cost); b.f64(s.cost_change); b.f64(s.gradient_max_norm); b.f64(s.gradient_norm);
++    b.f64(s.step_norm); b.f64(s.relative_decrease); b.f64(s.trust_region_radius);
++    b.u32(s.step_is_valid ? 1u : 0u); b.u32(s.step_is_successful ? 1u : 0u); b.u32(s.step_is_nonmonotonic ? 1u : 0u);
++    b.f64(model_cost_change_); b.f64(rdvio_port_candidate_valid ? candidate_cost_ : 0.0); b.f64(x_cost_); b.f64(minimum_cost_);
++    b.u32(uint32_t(num_parameters_)); b.u32(uint32_t(num_effective_parameters_)); b.u32(uint32_t(num_residuals_));
++    b.u32(rdvio_port_candidate_valid ? 1u : 0u); b.u32(rdvio_port_delta_valid ? 1u : 0u); b.u32(rdvio_port_step_valid ? 1u : 0u);
++    if (rdvio_port_solve::g.on(1)) {
++      b.u64(rdvio_port_solve::fnvd(x_.data(), size_t(x_.size())));
++      b.u64(rdvio_port_candidate_valid ? rdvio_port_solve::fnvd(candidate_x_.data(), size_t(candidate_x_.size())) : 0ULL);
++      b.u64(rdvio_port_delta_valid ? rdvio_port_solve::fnvd(delta_.data(), size_t(delta_.size())) : 0ULL);
++      b.u64(rdvio_port_step_valid ? rdvio_port_solve::fnvd(trust_region_step_.data(), size_t(trust_region_step_.size())) : 0ULL);
++      b.u64(rdvio_port_solve::fnvd(gradient_.data(), size_t(gradient_.size())));
++      b.u64(rdvio_port_solve::fnvd(jacobian_scaling_.data(), size_t(jacobian_scaling_.size())));
++      b.u64(rdvio_port_solve::fnvd(residuals_.data(), size_t(residuals_.size())));
++    }
++    if (rdvio_port_solve::g.on(2)) {
++      b.f64n(x_.data(), size_t(x_.size()));
++      b.f64n(gradient_.data(), size_t(gradient_.size()));
++      b.f64n(jacobian_scaling_.data(), size_t(jacobian_scaling_.size()));
++      b.f64n(residuals_.data(), size_t(residuals_.size()));
++      if (rdvio_port_step_valid) b.f64n(trust_region_step_.data(), size_t(trust_region_step_.size()));
++      if (rdvio_port_delta_valid) b.f64n(delta_.data(), size_t(delta_.size()));
++      if (rdvio_port_candidate_valid) b.f64n(candidate_x_.data(), size_t(candidate_x_.size()));
++    }
++    rdvio_port_solve::g.write(rdvio_port_solve::R_ITER, b);
++  }
++
+   if (!RunCallbacks(options_, iteration_summary_, solver_summary_)) {
+     return false;
+   }
+@@ -415,6 +448,7 @@
+       LinearSolverTerminationType::FAILURE) {
+     return true;
+   }
++  rdvio_port_step_valid = true;  // rdvio_port: trust_region_step_ written by the strategy
+ 
+   // new_model_cost
+   //  = 1/2 [f + J * step]^2
+@@ -446,6 +480,7 @@
+                    options_.num_threads,
+                    delta_,
+                    (trust_region_step_.array() * jacobian_scaling_.array()));
++    rdvio_port_delta_valid = true;  // rdvio_port
+     num_consecutive_invalid_steps_ = 0;
+   }
+ 
+@@ -770,6 +805,7 @@
+ // consider it to be a point with very high cost. This allows the user to deal
+ // with edge cases/constraints as part of the Manifold and CostFunction objects.
+ void TrustRegionMinimizer::ComputeCandidatePointAndEvaluateCost() {
++  rdvio_port_candidate_valid = true;  // rdvio_port
+   if (!evaluator_->Plus(x_.data(), delta_.data(), candidate_x_.data())) {
+     if (is_not_silent_) {
+       LOG(WARNING) << "x_plus_delta = Plus(x, delta) failed. "
