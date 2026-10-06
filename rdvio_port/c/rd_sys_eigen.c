@@ -139,3 +139,13 @@ double rd_epipolar_dist(const double F[9], const double p[2], const double q[2])
     num = (q[0] * l[0] + q[1] * l[1]) + 1.0 * l[2];
     return fabs(num) / sqrt(l[0] * l[0] + l[1] * l[1]);
 }
+
+double rd_pnp_reproject_error(const double T[16], const double P[3], const double p[2]) {
+    double y[3], d0, d1;
+    int r;
+    for (r = 0; r < 2; ++r) y[r] = ((T[r] * P[0] + T[r + 4] * P[1]) + T[r + 8] * P[2]) + T[r + 12];
+    y[2] = (T[2] * P[0] + (T[6] * P[1] + T[10] * P[2])) + T[14];
+    d0 = p[0] - y[0] / y[2];
+    d1 = p[1] - y[1] / y[2];
+    return d0 * d0 + d1 * d1;
+}

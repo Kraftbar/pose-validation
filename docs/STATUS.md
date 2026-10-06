@@ -73,7 +73,8 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
    - M6 map layer: **done 2026-10-06**, 38.5 M events of MH_01 replayed bit-exact (patch 0009 map log).
    - M9 initializer: **done 2026-10-06** (5cb3df0); the one MH_01 initialization replays bit-exact.
    - M10 sliding-window tracker (`track()`): **done 2026-10-06**. 776 logged calls of MH_01 replay bit-exact stage by stage (patch 0012), with the PARSAC masks taken from the log.
-   - Next: M8 frontend and M11 handler, then the whole C system checked in lock-step against the reference logs and trajectory. EPnP and undistortion are reserved for Codex.
+   - M8 + M11, the whole C system: **done 2026-10-06**. `rdvio_c_euroc` writes the reference MH_01 trajectory byte for byte (3,633 poses, sha256 `f0d60a3e03c1...`). Run it with `tools/check_rdvio_port.py --modules sys`.
+   - Two OpenCV pieces are still outside the port: the undistortion (the system reads a pack of undistorted images) and EPnP (the IMU-PARSAC around it is native C, with EPnP behind a callback). Both are reserved for Codex (M7b).
 4. **Phone stack:**
    - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
    - Indoor-2 live error is still twice the final error.

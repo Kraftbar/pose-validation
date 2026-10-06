@@ -25,4 +25,7 @@ void rd_m3_mul_tinv(const double Mtinv[9], const double B[9], double out[9]);
  * F.leftCols<2>() * p + F.col(2) (rows: (F(i,0) x + F(i,1) y) + F(i,2)); the 1x3 * 3x1 inner product is a vectorized redux of
  * the evaluated [x, y, 1]: (x l0 + y l1) + 1 l2 */
 double rd_epipolar_dist(const double F[9], const double p[2], const double q[2]);
+/* (p - (T.block<3,3>(0,0) * P + T.block<3,1>(0,3)).hnormalized()).squaredNorm() for a Matrix4d T (column-major): the block
+ * product takes rows 0-1 as left folds and row 2 as a0 + (a1 + a2), like a Matrix3d product */
+double rd_pnp_reproject_error(const double T[16], const double P[3], const double p[2]);
 #endif

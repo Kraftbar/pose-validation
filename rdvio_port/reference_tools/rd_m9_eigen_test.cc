@@ -18,7 +18,7 @@ static std::mt19937_64 rng;
 static double U(double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); }
 static double N() { return std::normal_distribution<double>(0, 1)(rng); }
 static int I(int a, int b) { return std::uniform_int_distribution<int>(a, b)(rng); }
-static long bad = 0, tot = 0, bad_qr = 0, bad_svd = 0, bad_q = 0, bad_inv = 0, bad_rt = 0, bad_f = 0, bad_epi = 0;
+static long bad = 0, tot = 0, bad_qr = 0, bad_svd = 0, bad_q = 0, bad_inv = 0, bad_rt = 0, bad_f = 0, bad_epi = 0, bad_pnp = 0;
 static void cmp(const double *a, const double *b, int n, long &cat, const char *what, long idx) {
     for (int i = 0; i < n; ++i) {
         tot++;
@@ -155,6 +155,21 @@ int main(int argc, char **argv) {
                 cmp(&de, &dc, 1, bad_epi, "epipolar", c); cmp(&de2, &dc2, 1, bad_epi, "epipolar_t", c);
             }
         }
+        /* ---- pnp_reproject_error (pnp.h) ---- */
+        {
+            Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+            Eigen::Quaterniond q(N(), N(), N(), N()); q.normalize();
+            T.block<3, 3>(0, 0) = q.toRotationMatrix();
+            T.block<3, 1>(0, 3) = Eigen::Vector3d(N(), N(), N());
+            if (I(0, 3) == 0) for (int i = 0; i < 12; ++i) T(i % 3, i / 3) = (double)(float)N();   /* float-converted like solve_pnp_6pt */
+            for (int k = 0; k < 4; ++k) {
+                Eigen::Vector3d P(N() * 3, N() * 3, U(0.5, 20));
+                Eigen::Vector2d p(U(-1, 1), U(-1, 1));
+                double e = (p - (T.block<3, 3>(0, 0) * P + T.block<3, 1>(0, 3)).hnormalized()).squaredNorm();
+                double cc = rd_pnp_reproject_error(T.data(), P.data(), p.data());
+                cmp(&e, &cc, 1, bad_pnp, "pnp_reproject_error", c);
+            }
+        }
         /* ---- FromTwoVectors ---- */
         {
             Eigen::Vector3d a(N(), N(), N() + (I(0, 1) ? 0 : 9.8)), g(0, 0, -9.80665);
@@ -172,7 +187,7 @@ int main(int argc, char **argv) {
     std::printf("  svd3 solve: %ld cases, %ld mismatching values\n", nsvd, bad_svd);
     std::printf("  FromTwoVectors: %ld cases, %ld mismatching values\n", nq, bad_q);
     std::printf("  Matrix4d::inverse: %ld cases, %ld mismatching values\n", count, bad_inv);
-    std::printf("  predict_RT: %ld cases, %ld mismatching values; F: %ld mismatching; epipolar distance: %ld mismatching\n", count, bad_rt, bad_f, bad_epi);
+    std::printf("  predict_RT: %ld cases, %ld mismatching values; F: %ld mismatching; epipolar distance: %ld mismatching; pnp_reproject_error: %ld mismatching\n", count, bad_rt, bad_f, bad_epi, bad_pnp);
     std::printf("m9eigen: %ld/%ld\n", bad, tot);
     return bad == 0 && tot > 0 ? 0 : 1;
 }

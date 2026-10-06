@@ -4,6 +4,68 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
+## M8 + M11: the whole C system DONE, trajectory byte-identical on MH_01 (2026-10-06, Claude)
+
+The synchronous system now runs in C end to end: Handler -> FeatureTracker -> Frontend -> Initializer / SlidingWindowTracker.
+On MH_01 it writes the reference trajectory byte for byte: 3,633 poses, sha256 `f0d60a3e03c1...`.
+Two pieces of OpenCV are still outside the port until Codex's M7b:
+- the undistortion: the system reads a pack of the undistorted images;
+- EPnP inside `solve_pnp_6pt`.
+
+Everything else runs natively in C, including both PARSACs:
+- the essential-matrix PARSAC of `update_track_status` (module M3);
+- the IMU-PnP PARSAC of `judge_track_status`: `c/rd_imu_parsac.{h,c}`, `find_pnp_matrix_parsac_imu` + `IMU_Parsac`, with
+  EPnP as a callback.
+Each keeps the process-wide `binConfidences` of the C++.
+
+- C sources:
+  - `c/rd_sys.{h,c}` (M8 + M11):
+    - Handler: gyroscope / accelerometer pairing, IMU samples handed to the pending frames, predict_pose / propagate_state;
+    - FeatureTracker::run: CLAHE + pyramid, re-prediction after the latest optimized frame, the IMU sample at the previous
+      image time, LK tracking, the latest state, detection every `sliding_window_tracker_frequent`-th frame, the map trim;
+    - Frontend: initialization attempts, then mirror_frame + track.
+  - The members the synchronous flow never calls are not ported: synchronize_keymap, mirror_map, mirror_lastframe,
+    attach_latest_frame, solve_pnp. The keymap Map is still created (it is a map event).
+  - `c/rd_sys_image.{h,c}`: OpenCvImage on M7. It is now validated through the system.
+  - `c/rd_imu_parsac.{h,c}`: IMU_Parsac = M3's Parsac plus:
+    - the prior-pose inlier set (2x threshold, at least 20 points and 15 %);
+    - the overlap count as the gate (>= 6), the tie-break and the result count;
+    - per-bin weights 1 - 0.2^(0.1 * mean track length);
+    - an all-ones mask without a confidence update on failure.
+    Quirks kept: the weighted draw's bin index is used as a data index; the iteration bound uses ratio^5.
+    `pnp_reproject_error` is `rd_pnp_reproject_error` in `c/rd_sys_eigen.c` (oracle: 0 mismatches).
+  - `c/rd_map`, `c/rd_solver_glue`, `c/rd_yaml`, `c/rd_sys_config`, as described in the M9 / M10 sections.
+- Driver: `c/rdvio_c_euroc.c` (built with `-DRD_PNP_OPENCV` it links `reference_tools/rd_pnp6_opencv.cc`, RD-VIO's own
+  `solve_pnp_6pt` on the real OpenCV, as the EPnP callback; that variant needs no masks):
+  - usage: `rdvio_c_euroc sensor.yaml setting.yaml mav0 out.tum --gray <undistorted pack> [--masks swt.bin] [--max-seconds s]`;
+  - the counterpart of the reference driver: same CSV parsing, gyroscope then accelerometer per IMU row, %.17g TUM lines while
+    tracking, from `Handler::get_latest_state`.
+- Temporary inputs, until Codex's M7b:
+  - `reference_tools/rd_undistort_pack.cc` writes the undistorted gray pack with the real OpenCV, using the driver's exact
+    calls. MH_01 takes 6 s and 1.3 GB, in `runs/rdvio_port/system/`.
+  - EPnP: either the masks or the OpenCV shim.
+    - The masks: patch 0012 with `RDVIO_PORT_SWT_MASKS=1` writes only the PnP / essential masks of every call. MH_01 has
+      4,072 masks (1.2 MB). The pure-C driver uses the 3,632 PnP masks and skips the 440 essential ones
+      (`--logged-essential` takes them too).
+    - The shim: see the driver above. Run: `RDVIO_CV_GRAY=<raw gray pack> RDVIO_PORT_SWT_DIR=runs/rdvio_port/m10masks/MH_01_easy/dump
+    RDVIO_PORT_SWT_MASKS=1 python3 tools/run_rdvio_reference.py MH_01_easy --tag m10masks --stock-binary
+    runs/rdvio_port/m10_reference_build/build/rdvio_ref_driver`.
+- Check: `python3 tools/check_rdvio_port.py --modules sys [--sanitize]`.
+  - It builds the pack tool and the pack if they are missing, then runs two variants:
+    - (a) pure C with the logged PnP masks;
+    - (b) the native IMU-PARSAC with the OpenCV EPnP shim.
+    Each is compared by sha256 with the reference run's `traj.tum`.
+  - MH_01: both IDENTICAL, 3 min 13 s each (the reference takes 1 min 45 s). Both are ASan/UBSan clean; (a) also with
+    leak detection.
+  - Sensitivity: without `--masks` (judge_track_status skipped) the trajectory differs (`69ad74d2...`).
+- Not covered by the trajectory: predict_pose / propagate_state (the driver discards track_*'s return value) and the
+  latest_pose bookkeeping of track_camera.
+- Next:
+  1. M7b (Codex): the C remap replaces the pack, and the C EPnP replaces the shim. After that the system is pure C
+     end to end.
+  2. Other EuRoC sequences.
+  3. Speed.
+
 ## M9 (Initializer) DONE, bit-exact (2026-10-06, Claude)
 
 - C: `c/rd_sys_init.{h,c}`: `Initializer` on the C map.
@@ -77,32 +139,6 @@ reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOV
     - reference observation kept in marginalize: 128 SLIDE.
   - Not observable on MH_01: `0.8 * matches` -> 0.79 (only one keyframe is checked, so the counts are 0 / 1).
 - Not covered here: mirror_frame, the constructor and latest_state. The system harness will cover them.
-
-## M8, M11 (the C system) IN PROGRESS (2026-10-06, Claude): plan and state
-
-Written, compiled, not yet validated (no system harness yet):
-- `c/rd_map.{h,c}`: `rd_frame` carries the system state of `rdvio::Frame`: `t`, a shared refcounted `rd_image`, `sqrt_inv_cov`,
-  motion, `preint` / `kpreint` with their IMU sample lists, owned subframes. `clone` copies what `Frame::clone` copies; the
-  destructor frees the subframes after FRAMEDEL. M6 still passes.
-- `c/rd_solver_glue.{h,c}`: `rdvio::Solver` on the C state.
-  - Parameter blocks are added in call order (= Ceres program order), with the implicit appends of AddResidualBlock and the
-    constant flags of FT_FIX_POSE / FIX_MOTION.
-  - The six factors are built with the payloads and live reads of rd_solve.h; the marginalization factor's frames are found by id.
-  - Solving goes through `rd_sv_solve`, with write-back; `IsSolutionUsable` = CONVERGENCE / NO_CONVERGENCE / USER_SUCCESS.
-- `c/rd_yaml.{h,c}` (the YAML subset reader of okvis_port, own code) and `c/rd_sys_config.{h,c}` (Config defaults + YamlConfig
-  keys, verbatim values). They read `reference/configs/{setting,euroc_sensor}.yaml` correctly.
-
-Still to do:
-1. [written, `c/rd_sys_image.{h,c}`, validated only with the system] The `rd_image` implementation on `rd_cv_*`: preprocess = CLAHE +
-   pyramid, detect_keypoints (static GFTT, response sort, Poisson filter, 20 px border), track_keypoints (forward / backward LK,
-   rd_cv_track_status), release_image_buffer.
-2. [DONE, see M10] `Matrix4d::inverse()` (`predict_RT`).
-3. [M9, M10 DONE; the PARSAC estimators wait for Codex's EPnP: until then the masks come from a log] M8 `FeatureTracker` + `Frontend` (run, synchronize_keymap, mirror_map /
-   mirror_lastframe / attach_latest_frame, the state machine), M11 `Handler` (gyro / accelerometer pairing,
-   propagate_state, predict_pose) + the driver (TUM output of `get_latest_state` with %.17g).
-4. `check_rd_system`: the C system from the undistorted images (until Codex's remap port: a gray pack of the driver's remapped
-   images) + `imu0/data.csv`. Lock-step against map.bin (every map event, digests at the frame ends), solve.bin of tag m5
-   (every 5th Solve: problem snapshot + END), and the canonical trajectory `f0d60a3e03c1...`, byte for byte.
 
 ## Reserved for Codex (queued 2026-10-06): M7b undistortion (initUndistortRectifyMap + remap) and EPnP (solvePnP + Rodrigues)
 

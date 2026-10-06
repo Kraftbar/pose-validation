@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Run the rdvio_port bit-exactness harnesses (tolerance 0, memcmp).
 
-  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5,m6,m7,m9,m10] [--tag m1] [--oracle] [--sanitize]
+  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5,m6,m7,m9,m10,sys] [--tag m1] [--oracle] [--sanitize]
 Per module: compile rdvio_port/c/check_rd_*.c (C99, -ffp-contract=off) together with the port and the okvis_port kernels it reuses,
 replay the dump files of runs/rdvio_port/<tag>/<seq>/dump (reference run with patch 0003) and, with --oracle, the random-input records
 written by the real RD-VIO classes (rdvio_port/reference_tools/rd_imu_oracle.cc, built against the reference build).
+Module sys: the whole C system (rdvio_port/c/rdvio_c_euroc.c) on <seq>, fed the undistorted images (a gray pack made by
+reference_tools/rd_undistort_pack.cc with the real OpenCV), twice: (a) with the PnP PARSAC masks of the reference run (tag --tagsys,
+patch 0012 with RDVIO_PORT_SWT_MASKS=1), (b) with the native IMU-PARSAC and RD-VIO's own OpenCV EPnP behind the C callback
+(reference_tools/rd_pnp6_opencv.cc). Both TUM trajectories must equal the reference trajectory byte for byte.
 Exit status 0 iff there is no mismatch.
 """
 import argparse, subprocess, sys, os
@@ -33,6 +37,71 @@ MODULES = {  # name -> (harness, port sources, oracle source, extra flags, extra
 OK_SRC = ["ok_eigen.c", "ok_dense.c"]
 # dump channels of patches 0003-0005 switched off for the m5 oracle run
 M5_QUIET = "integ pred pie plus rpe rot wahba ess5 hom4 decess dechom tri2 trin trk tang glp slp fess frot fhom pess phom pois".split()
+
+
+SYS_SRC = ["rdvio_c_euroc.c", "rd_sys.c", "rd_imu_parsac.c", "rd_sys_image.c", "rd_sys_swt.c", "rd_sys_init.c", "rd_map.c", "rd_solver_glue.c", "rd_sys_config.c",
+           "rd_yaml.c", "rd_sys_eigen.c", "rd_solve.c", "rd_solve_linear.c", "rd_static.c", "rd_factor.c", "rd_imu.c", "rd_lie.c", "rd_eigen.c",
+           "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_marg.c", "rd_seig.c", "rd_rand.c", "rd_ransac.c", "rd_poisson.c", "rd_cv.c", "rd_cv_gftt.c",
+           "rd_cv_lk.c"]
+
+
+def check_system(a, env):
+    """The C system against the reference trajectory (byte for byte)."""
+    import hashlib
+    sysd = REPO / "runs/rdvio_port/system"
+    sysd.mkdir(parents=True, exist_ok=True)
+    ref = REPO / "runs/rdvio_port" / a.tagsys / a.seq
+    masks, rtraj = ref / "dump/swt.bin", ref / "traj.tum"
+    if not masks.exists() or not rtraj.exists():
+        print(f"sys: missing {masks} / {rtraj} (reference run with RDVIO_PORT_SWT_MASKS=1, see rdvio_port/HANDOVER.md)")
+        return 1
+    sensor, setting = PORT / "reference/configs/euroc_sensor.yaml", PORT / "reference/configs/setting.yaml"
+    und = sysd / f"{a.seq}.undist.gray"
+    if not und.exists():
+        tool = sysd / "rd_undistort_pack"
+        oc, yd = V / "deps/opencv", REPO / "external/vio3/MSCEqF/build/_deps"
+        rpath = ":".join(str(x) for x in (oc / "lib", V / "deps/root/usr/lib/x86_64-linux-gnu", V / "deps/root/usr/lib/x86_64-linux-gnu/openblas-pthread"))
+        run(["g++", "-std=c++17", "-O2", "-isystem", str(oc / "include/opencv4"), "-I" + str(yd / "yaml-cpp-src/include"), "-DYAML_CPP_STATIC_DEFINE",
+             str(PORT / "reference_tools/rd_undistort_pack.cc"), "-o", str(tool), str(yd / "yaml-cpp-build/libyaml-cpp.a"),
+             *[str(oc / "lib" / f"libopencv_{x}.so") for x in ("calib3d", "imgproc", "core")], "-Wl,-rpath," + rpath, "-Wl,--allow-shlib-undefined"], check=True)
+        raw = Path(a.gray) if a.gray else V / "data/okvis_brisk_tmp" / a.seq / "gray/cam0.gray"
+        run([str(tool), str(sensor), str(raw), str(und)], check=True)
+    san = ["-fsanitize=address,undefined", "-g"] if a.sanitize else []
+    srcs = [PORT / "c" / x for x in SYS_SRC] + [OK / x for x in ("ok_kin.c", "ok_blas.c", "ok_sparse.c", "ok_amd.c", "ok_eigen.c", "ok_dense.c")] + \
+           [STELLA / x for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]
+    cflags = ["-std=c99", "-O2", "-ffp-contract=off", "-fno-fast-math", "-Wall", "-Wextra", "-I" + str(OK)] + san
+    data = REPO / "runs/rdvio_port/data" / a.seq / "mav0"
+    h = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    rc = 0
+    # (a) pure C, the PnP PARSAC masks from the reference log
+    exe = BUILD / ("rdvio_c_euroc_san" if a.sanitize else "rdvio_c_euroc")
+    run(["cc", *cflags, "-o", str(exe), *map(str, srcs), "-lm"], check=True)
+    # (b) the native IMU-PARSAC with RD-VIO's own solve_pnp_6pt (real OpenCV EPnP) behind the C callback (reference_tools/rd_pnp6_opencv.cc)
+    ref_src = REPO / "runs/rdvio_port" / ("m10_reference_build" if (REPO / "runs/rdvio_port/m10_reference_build/src").exists() else "reference_build") / "src"
+    od = BUILD / ("sys_pnpcv_san" if a.sanitize else "sys_pnpcv")
+    od.mkdir(parents=True, exist_ok=True)
+    objs = []
+    for c in srcs:
+        o = od / (c.stem + ".o"); objs.append(str(o))
+        run(["cc", *cflags, "-DRD_PNP_OPENCV", "-c", str(c), "-o", str(o)], check=True)
+    inc = [f"-I{ref_src}/src/{m}/include" for m in ("rdvio", "rdvio_geometry", "rdvio_util", "rdvio_map", "rdvio_estimation")]
+    run(["g++", "-c", "-std=gnu++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", "-Wno-ignored-attributes", f"-I{ref_src}/3rd/spdlog/include", *inc,
+         "-isystem", str(V / "deps/opencv/include/opencv4"), "-isystem", str(V / "deps/root/usr/include/eigen3"), "-isystem", str(V / "deps/root/usr/include"),
+         str(PORT / "reference_tools/rd_pnp6_opencv.cc"), "-o", str(od / "rd_pnp6_opencv.o")], check=True)
+    oc = V / "deps/opencv/lib"
+    rpath = ":".join(str(x) for x in (oc, V / "deps/root/usr/lib/x86_64-linux-gnu", V / "deps/root/usr/lib/x86_64-linux-gnu/openblas-pthread"))
+    exe_b = BUILD / ("rdvio_c_euroc_pnpcv_san" if a.sanitize else "rdvio_c_euroc_pnpcv")
+    run(["g++", *san, *objs, str(od / "rd_pnp6_opencv.o"), "-o", str(exe_b), *[str(oc / f"libopencv_{x}.so") for x in ("calib3d", "features2d", "flann", "imgproc", "core")],
+         "-Wl,-rpath," + rpath, "-Wl,--allow-shlib-undefined", "-lm"], check=True)
+    for name, e, extra in (("logged PnP masks", exe, ["--masks", str(masks)]), ("native IMU-PARSAC + OpenCV EPnP", exe_b, [])):
+        out = sysd / a.seq / ("traj.tum" if not extra == [] else "traj_pnpcv.tum")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        r = run([str(e), str(sensor), str(setting), str(data), str(out), "--gray", str(und), *extra], cwd=str(REPO),
+                env=dict(env, ASAN_OPTIONS="detect_leaks=0") if a.sanitize else env)
+        ok = r.returncode == 0 and out.exists() and h(out) == h(rtraj)
+        print(f"== sys ({name}): {a.seq}: C trajectory {h(out)[:12] if out.exists() else '-'}, reference {h(rtraj)[:12]}: {'IDENTICAL' if ok else 'DIFFERENT'}")
+        rc |= 0 if ok else 1
+    return rc
 
 
 def run(cmd, **kw):
@@ -88,6 +157,8 @@ def main():
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--count4", default="300", help="number of random Ceres problems per seed for the m4 oracle (rd_m4_oracle)")
     ap.add_argument("--tag4", default="m5", help="dump run tag for the m4 module (solve.bin of run_rdvio_reference.py --solve-dump)")
+    ap.add_argument("--tagsys", default="m10masks", help="reference run of the sys module (traj.tum + dump/swt.bin with the PARSAC masks)")
+    ap.add_argument("--gray", default=None, help="raw gray pack of <seq> for the sys module (default: external/vio/data/okvis_brisk_tmp/<seq>/gray/cam0.gray)")
     ap.add_argument("--tag10", default="m10", help="tracker-log run tag for the m10 module (swt.bin of patch 0012: RDVIO_PORT_SWT_DIR)")
     ap.add_argument("--tag9", default="m9", help="initializer-log run tag for the m9 module (init.bin of patch 0011: RDVIO_PORT_INIT_DIR)")
     ap.add_argument("--tag6", default="m6", help="map-log run tag for the m6 module (map.bin of patch 0009: RDVIO_PORT_MAP_DIR, see rdvio_port/HANDOVER.md M6)")
@@ -103,6 +174,9 @@ def main():
     root = V / "deps/root/usr"
     env["LD_LIBRARY_PATH"] = f"{root}/lib/x86_64-linux-gnu:{root}/lib/x86_64-linux-gnu/openblas-pthread:{V}/deps/opencv/lib:" + env.get("LD_LIBRARY_PATH", "")
     for m in a.modules.split(","):
+        if m == "sys":
+            rc |= check_system(a, env)
+            continue
         if m == "m7":
             # M7 is a dependency-free leaf with its own image fixtures/build tree.
             cmd = [sys.executable, "-B", str(PORT / "reference_cv/run.py")]

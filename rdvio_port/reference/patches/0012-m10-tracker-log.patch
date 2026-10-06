@@ -1,7 +1,7 @@
 diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_window_tracker.cpp
 --- a/src/rdvio/src/sliding_window_tracker.cpp	2026-10-06 11:29:10.518179286 +0200
-+++ b/src/rdvio/src/sliding_window_tracker.cpp	2026-10-06 11:36:10.669726127 +0200
-@@ -10,7 +10,150 @@
++++ b/src/rdvio/src/sliding_window_tracker.cpp	2026-10-06 11:50:34.303529108 +0200
+@@ -10,7 +10,152 @@
  #include <rdvio/map/map.h>
  #include <rdvio/map/track.h>
  #include <rdvio/util/unique_timer.h>
@@ -15,14 +15,15 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
 +// rdvio_port instrumentation (reference build only, never distributed): the sliding-window tracker log of module M10,
 +// RDVIO_PORT_SWT_DIR (writes <dir>/swt.bin). Logged track() calls: the first RDVIO_PORT_SWT_ALL (default 0), then every
 +// RDVIO_PORT_SWT_EVERY-th (default 1). Stage records carry the FNV-1a 64 hash of their payload, and the payload itself
-+// with RDVIO_PORT_SWT_FULL=1.
++// with RDVIO_PORT_SWT_FULL=1. RDVIO_PORT_SWT_MASKS=1: only the PARSAC mask records (5, 6) of every call (the input of the
++// C system driver until the estimators are ported).
 +// Framed records: u32 tag, u64 bytes, payload. Layouts in rdvio_port/c/check_rd_swt.c. Observation only.
 +namespace {
 +struct PortSwt {
 +    FILE *f = nullptr;
 +    bool checked = false, on = false;
 +    long every = 1, all = 0, calls = 0;
-+    bool full = false;
++    bool full = false, masks = false;
 +    FILE *get() {
 +        if (!checked) {
 +            checked = true;
@@ -30,6 +31,7 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
 +            if (const char *e = std::getenv("RDVIO_PORT_SWT_EVERY")) every = std::max(1L, std::atol(e));
 +            if (const char *e = std::getenv("RDVIO_PORT_SWT_ALL")) all = std::atol(e);
 +            if (const char *e = std::getenv("RDVIO_PORT_SWT_FULL")) full = std::atol(e) != 0;
++            if (const char *e = std::getenv("RDVIO_PORT_SWT_MASKS")) masks = std::atol(e) != 0;
 +        }
 +        return f;
 +    }
@@ -153,12 +155,13 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
  namespace rdvio {
  
  SlidingWindowTracker::SlidingWindowTracker(std::unique_ptr<Map> keyframe_map,
-@@ -78,21 +221,49 @@
+@@ -78,21 +223,50 @@
  }
  
  bool SlidingWindowTracker::track() {
 +    const bool port = g_port_swt.get() != nullptr;
-+    if (port) {   /* 1 IN: u64 call, u32 parsac, [full window], [marg], [ft] */
++    if (port && g_port_swt.masks) g_port_swt.on = true;
++    else if (port) {   /* 1 IN: u64 call, u32 parsac, [full window], [marg], [ft] */
 +        const long call = g_port_swt.calls++;
 +        g_port_swt.on = call < g_port_swt.all || (call % g_port_swt.every) == 0;
 +        PortBuf b; b.u64((uint64_t)(g_port_swt.calls - 1)); b.u32(config->parsac_flag() ? 1u : 0u);
@@ -167,7 +170,7 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
 +        b.write(1);
 +    }
 +    auto port_stage = [&](uint32_t tag, uint32_t v, bool marg, bool ft) {
-+        if (!port) return;
++        if (!port || g_port_swt.masks) return;
 +        PortBuf b; b.u32(v);
 +        if (tag == 11 && v) b.f64(m_th);
 +        port_window(b, map.get(), false);
@@ -204,7 +207,7 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
      }
  
      return true;
-@@ -522,7 +693,9 @@
+@@ -522,7 +696,9 @@
  
      matrix<3> E =
          find_essential_matrix_parsac(pts1, pts2, mask, m_th / frame_i->K(0, 0));
@@ -215,7 +218,7 @@ diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_win
      return true;
  }
  
-@@ -597,7 +770,9 @@
+@@ -597,7 +773,9 @@
      matrix<4> T_IMU =
          find_pnp_matrix_parsac_imu(m_P3D, m_P2D, m_lens, Rcw, tcw, 0.20, 1.0,
                                     mask, 1.0 / curr_frame->K(0, 0));
