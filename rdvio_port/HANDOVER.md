@@ -57,13 +57,18 @@ Each keeps the process-wide `binConfidences` of the C++.
     Each is compared by sha256 with the reference run's `traj.tum`.
   - MH_01: both IDENTICAL, 3 min 13 s each (the reference takes 1 min 45 s). Both are ASan/UBSan clean; (a) also with
     leak detection.
-  - More sequences (2026-10-06): both variants are IDENTICAL on all three.
+  - More sequences (2026-10-06): both variants are IDENTICAL on all seven. The image packs of the last four were deleted
+    after the check (rebuild them with steps 2 and 3).
 
     | sequence     | poses | first pose | sha256       |
     |--------------|------:|-----------:|--------------|
     | MH_01_easy   | 3,633 | 2.46 s     | f0d60a3e03c1 |
     | V1_01_easy   | 2,805 | 5.35 s     | 68215b62b5b4 |
     | MH_03_medium | 2,644 | 2.84 s     | d2a1b0ba6fb8 |
+    | MH_04_difficult | 1,991 | 2.10 s  | 7c55fdaec69e |
+    | MH_05_difficult | 2,191 | 4.10 s  | e3a2c1dd8b5e |
+    | V2_01_easy   | 2,185 | 4.78 s     | d7a680388e05 |
+    | V1_03_difficult | 2,009 | 7.04 s  | 3cfd30858a17 |
 
     Per sequence:
     1. Fetch: `VIO_DATA_ROOT=runs/rdvio_port/data python3 tools/vio_harness/fetch_seq_stream.py <seq>`.
@@ -76,7 +81,7 @@ Each keeps the process-wide `binConfidences` of the C++.
 - Next:
   1. M7b (Codex): the C remap replaces the pack, and the C EPnP replaces the shim. After that the system is pure C
      end to end.
-  2. More EuRoC sequences (MH_01, V1_01, MH_03 done).
+  2. More EuRoC sequences: 7 of 11 done (left: V1_02, V2_02, V2_03, MH_02).
   3. Speed. gprof on the first 60 s of MH_01: about 80 % is in the M7 image leaf:
      - rd_cv_lk: 28 %;
      - rd_cv_build_pyramid: 18 %;
