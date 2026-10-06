@@ -225,6 +225,9 @@ int ok_vg_landmark_find(const ok_vg* g, uint64_t id, ok_vg_lm_view* v);
 int ok_vg_landmark_obs(const ok_vg* g, uint64_t id, ok_vg_kid** kids);    /* in key order; malloc'd */
 int ok_vg_obs_find(const ok_vg* g, ok_vg_kid kid, uint64_t* lm, const ok_reproj_err** err, int* cauchy);
 int ok_vg_anystate_get(const ok_vg* g, uint64_t id, uint64_t* kf, double T7[7], double v3[3]);
+/* anyState_ in ascending id order (ViSlamBackend::writeFinalCsvTrajectory): the reference keyframe (0 if none), time, T_Sk_S, v_Sk */
+int ok_vg_anystate_count(const ok_vg* g);
+int ok_vg_anystate_at(const ok_vg* g, int i, uint64_t* id, uint64_t* kf, ok_time* ts, double T7[7], double v3[3]);
 int ok_vg_imu_use(const ok_vg* g);
 int ok_vg_num_cameras(const ok_vg* g);
 void ok_vg_set_solver_options(ok_vg* g, int linear_solver_type, double function_tolerance);   /* Solver::Options as the OPT record logs them */

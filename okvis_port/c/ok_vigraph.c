@@ -1445,6 +1445,15 @@ int ok_vg_anystate_get(const ok_vg* g, uint64_t id, uint64_t* kf, double T7[7], 
     if (v3) memcpy(v3, a->v_Sk, sizeof a->v_Sk);
     return 1;
 }
+int ok_vg_anystate_count(const ok_vg* g) { return g->anystates.n; }
+int ok_vg_anystate_at(const ok_vg* g, int i, uint64_t* id, uint64_t* kf, ok_time* ts, double T7[7], double v3[3]) {
+    const anystate* a;
+    if (i < 0 || i >= g->anystates.n) return 0;
+    a = (const anystate*)g->anystates.a[i].p;
+    if (id) *id = g->anystates.a[i].k0;
+    if (ts) *ts = a->ts;
+    return ok_vg_anystate_get(g, g->anystates.a[i].k0, kf, T7, v3);
+}
 int ok_vg_imu_use(const ok_vg* g) { return g->imu.use; }
 int ok_vg_num_cameras(const ok_vg* g) { return g->ncam; }
 void ok_vg_set_solver_options(ok_vg* g, int linear_solver_type, double function_tolerance) { g->solver_type = linear_solver_type; g->ftol = function_tolerance; }

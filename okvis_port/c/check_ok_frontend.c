@@ -1,4 +1,4 @@
-/* OK_PORT_SOURCES: check_ok_frontend.c ok_dbow.c ok_place.c ok_place_dist.c ok_opengv.c ok_opengv_gp3p_gen.c ok_opengv_stew_gen.c ok_eigen_eigsolver8.c ok_eigen_eigsolver10.c ok_eigen_cx.c ok_eigen_svd.c ok_eigen_qr.c ok_eigen_fullpivlu.c ok_frontend.c ok_vslam.c ok_vsb_geom.c ok_vsolve.c ok_solve.c ok_solve_linear.c ok_sparse.c ok_amd.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_triangulate.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c */
+/* OK_PORT_SOURCES: check_ok_frontend.c ok_brisk_detector.c ok_brisk_descriptor.c ok_brisk_camera.c ok_dbow.c ok_place.c ok_place_dist.c ok_opengv.c ok_opengv_gp3p_gen.c ok_opengv_stew_gen.c ok_eigen_eigsolver8.c ok_eigen_eigsolver10.c ok_eigen_cx.c ok_eigen_svd.c ok_eigen_qr.c ok_eigen_fullpivlu.c ok_frontend.c ok_vslam.c ok_vsb_geom.c ok_vsolve.c ok_solve.c ok_solve_linear.c ok_sparse.c ok_amd.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_triangulate.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c */
 /* Bit-exactness harness for okvis_port module 7b (the frontend data association: matchToMap, matchMotionStereo,
  * matchStereo, removeOutliers, doWeNeedANewKeyframe, triangulateFast, the OpenGV adapters' correspondence lists).
  *
@@ -21,7 +21,11 @@
 #define OK_VSLAM_AS_LIB
 #include "check_ok_vslam.c"
 #undef main
+#ifdef OK_FRONTEND_AS_LIB                 /* included by check_ok_system.c: keep this harness' main out of the way */
+#define main check_frontend_unused_main
+#endif
 #include "ok_frontend.h"
+#include "ok_brisk.h"
 
 static cnt C_fe, C_fe_args, C_fe_kf, C_fe_ransac, C_fe_ransac_in, C_pl_add, C_pl_query, C_pl_verify;
 static long G_pl_ub_skipped;
@@ -64,6 +68,149 @@ static void aux_hook(uint32_t tag, const unsigned char* p, size_t len) {
         if (G_rqn == G_rqcap) { G_rqcap = G_rqcap ? 2 * G_rqcap : 8; G_rq = (rrec*)realloc(G_rq, sizeof(rrec) * (size_t)G_rqcap); }
         G_rq[G_rqn++] = r;
     }
+}
+
+/* ---- BRISK on the images (OK_BRISK_IMAGES=<dir with cam<i>.gray>, tools/okvis_port_images.py) ----
+ * Frontend::detectAndDescribe of ThreadedSlam::processFrame: ScaleSpaceFeatureDetector<HarrisScoreCalculator>(38, 0, 150,
+ * 700) and the camera-aware BriskDescriptorExtractor (Codex's ok_brisk*) with the awareness maps of each camera and the
+ * extraction direction = gravity in the camera frame, T_WC.inverse().C() * (0, 0, -1) with T_WC = T_WS * T_SC. T_WS is
+ * lastOptimisedState_ (stored AFTER the detection of the previous frame, i.e. the newest state before the previous
+ * addStates) IMU-propagated to the frame time over the IMU deque of that moment (the previous addStates deque + the
+ * measurements popped since); while lastOptimisedState_ is not set (first two frames) ImuError::initPose of the deque.
+ * The keypoints (x, y, size) are compared with ADDSTATES and the descriptors with record 161; then the C outputs, not the
+ * logged ones, go to addStates and to the frontend. */
+typedef struct gpack { FILE* f; uint32_t w, h, n; uint64_t* ts; } gpack;
+static gpack G_gp[OK_FE_MAXCAM];
+static int G_brisk;
+static ok_brisk_context* G_bctx;
+static float* G_rays[OK_FE_MAXCAM]; static float* G_jacs[OK_FE_MAXCAM];
+static uint8_t* G_img;
+static size_t G_bn[OK_FE_MAXCAM]; static float* G_bkp[OK_FE_MAXCAM]; static uint8_t* G_bdesc[OK_FE_MAXCAM];
+static int G_bvalid;
+static cnt C_br_kp, C_br_desc;
+static long G_br_frames, G_br_kp, G_br_maps_failed;
+static int G_snap_have; static double G_snap_T[7], G_snap_sb[9]; static ok_time G_snap_t;
+static ok_imu_meas* G_prev_meas; static size_t G_prev_n;
+
+static int gpack_open(gpack* g, const char* path) {
+    char magic[8];
+    uint32_t i;
+    g->f = fopen(path, "rb");
+    if (!g->f) return 0;
+    if (fread(magic, 8, 1, g->f) != 1 || memcmp(magic, "OKGRAY1", 8) || fread(&g->w, 4, 1, g->f) != 1 ||
+        fread(&g->h, 4, 1, g->f) != 1 || fread(&g->n, 4, 1, g->f) != 1) return 0;
+    g->ts = (uint64_t*)malloc(8 * (size_t)(g->n ? g->n : 1));
+    for (i = 0; i < g->n; ++i) {
+        if (fseek(g->f, 20 + (long)i * (8 + (long)g->w * (long)g->h), SEEK_SET) || fread(&g->ts[i], 8, 1, g->f) != 1) return 0;
+    }
+    return 1;
+}
+
+static int gpack_read(gpack* g, uint64_t ts, uint8_t* out) {
+    uint32_t lo = 0, hi = g->n;
+    while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (g->ts[mid] < ts) lo = mid + 1; else hi = mid; }
+    if (lo == g->n || g->ts[lo] != ts) return 0;
+    if (fseek(g->f, 20 + (long)lo * (8 + (long)g->w * (long)g->h) + 8, SEEK_SET)) return 0;
+    return fread(out, (size_t)g->w * g->h, 1, g->f) == 1;
+}
+
+static void brisk_hook(ok_time t, const ok_imu_meas* meas, size_t n, int ncam, ok_vsb_cam_in* cams) {
+    ok_imu_meas* dq; size_t nd = n, i;
+    double T7[7];
+    ok_tf T_WS;
+    int c;
+    const uint64_t ts = (uint64_t)t.sec * 1000000000ull + (uint64_t)t.nsec;
+    G_bvalid = 0;
+    /* the IMU deque at detection time */
+    if (G_prev_meas) {
+        size_t k = 0;
+        const ok_time last = G_prev_meas[G_prev_n - 1].t;
+        while (k < n && !ok_time_lt(last, meas[k].t)) k++;
+        nd = G_prev_n + (n - k);
+        dq = (ok_imu_meas*)malloc(sizeof *dq * (nd ? nd : 1));
+        memcpy(dq, G_prev_meas, sizeof *dq * G_prev_n);
+        if (n > k) memcpy(dq + G_prev_n, meas + k, sizeof *dq * (n - k));
+    } else {
+        dq = (ok_imu_meas*)malloc(sizeof *dq * (n ? n : 1));
+        memcpy(dq, meas, sizeof *dq * n);
+    }
+    if (!G_snap_have) {
+        ok_imu_init_pose(dq, nd, T7);
+    } else {
+        ok_imu_params ip;
+        double sb[9];
+        ok_tf c0;
+        ok_tf_convert(&c0, G_snap_T);                  /* State::T_WS = estimator.pose(id) (TransformationCacheless) */
+        T7[0] = c0.r[0]; T7[1] = c0.r[1]; T7[2] = c0.r[2];
+        T7[3] = c0.q.x; T7[4] = c0.q.y; T7[5] = c0.q.z; T7[6] = c0.q.w;
+        memcpy(sb, G_snap_sb, sizeof sb);
+        memset(&ip, 0, sizeof ip);
+        ip.sigma_g_c = G_imu_cfg.sigma_g_c; ip.sigma_a_c = G_imu_cfg.sigma_a_c;
+        ip.sigma_gw_c = G_imu_cfg.sigma_gw_c; ip.sigma_aw_c = G_imu_cfg.sigma_aw_c;
+        ip.g = G_imu_cfg.g; ip.g_max = G_imu_cfg.g_max; ip.a_max = G_imu_cfg.a_max;
+        ok_imu_propagation(dq, nd, &ip, T7, sb, G_snap_t, t, NULL, NULL);
+    }
+    ok_tf_set_coeffs(&T_WS, T7, 1);
+    /* lastOptimisedState_ for the NEXT frame: the newest state now, before this addStates */
+    if (ok_vsb_num_frames(V_b) > 0) {
+        const ok_vg* g = ok_vsb_graph(V_b, 0);
+        const uint64_t id = ok_vsb_current_state_id(V_b);
+        ok_vg_state_view sv;
+        ok_vg_pose_values(g, id, G_snap_T);
+        ok_vg_sb_values(g, id, G_snap_sb);
+        ok_vg_state_find(g, id, &sv);
+        G_snap_t = sv.ts;
+        G_snap_have = 1;
+    }
+    free(G_prev_meas);
+    G_prev_meas = (ok_imu_meas*)malloc(sizeof *G_prev_meas * (n ? n : 1));
+    memcpy(G_prev_meas, meas, sizeof *G_prev_meas * n);
+    G_prev_n = n;
+    free(dq);
+
+    if (ncam > OK_FE_MAXCAM) { chk(&C_br_kp, 0); return; }
+    for (c = 0; c < ncam; ++c) {
+        ok_cam cam; cur hc; ok_tf T_SC, T_WC, T_CW;
+        double gW[3] = {0.0, 0.0, -1.0}, d[3];
+        float dir[3];
+        ok_brisk_keypoint* kp = NULL; size_t nk = 0;
+        uint8_t* desc = NULL;
+        hc.p = cams[c].header; hc.off = 0; hc.len = cams[c].hlen; hc.bad = 0;
+        if (!rd_cam(&hc, &cam) || G_gp[c].f == NULL || (int)G_gp[c].w != cam.w || (int)G_gp[c].h != cam.h) {
+            chk(&C_br_kp, 0); DBG("BRISK: camera %d has no matching image pack", c); return;
+        }
+        if (!G_rays[c]) {                                 /* setCameraProperties at the first detectAndDescribe */
+            G_rays[c] = (float*)malloc(sizeof(float) * 3 * (size_t)cam.w * (size_t)cam.h);
+            G_jacs[c] = (float*)malloc(sizeof(float) * 6 * (size_t)cam.w * (size_t)cam.h);
+            G_br_maps_failed += ok_cam_awareness_maps(&cam, G_rays[c], G_jacs[c]);
+        }
+        if (!G_img) G_img = (uint8_t*)malloc((size_t)cam.w * (size_t)cam.h);
+        if (!gpack_read(&G_gp[c], ts, G_img)) { chk(&C_br_kp, 0); DBG("BRISK: no image %llu for camera %d", (unsigned long long)ts, c); return; }
+        ok_tf_set_coeffs(&T_SC, cams[c].T_SC, 1);
+        ok_tf_mul(&T_WS, &T_SC, &T_WC, 1);
+        ok_tf_inverse(&T_WC, &T_CW, 1);
+        ok_m3_mulv(T_CW.C, gW, d);
+        dir[0] = (float)d[0]; dir[1] = (float)d[1]; dir[2] = (float)d[2];
+        if (ok_brisk_detect(G_img, cam.w, cam.h, 38.0, 150, 700, &kp, &nk, NULL) ||
+            ok_brisk_describe(G_bctx, G_img, cam.w, cam.h, G_rays[c], G_jacs[c], (float)cam.fu, dir, kp, &nk, &desc, NULL)) {
+            chk(&C_br_kp, 0); DBG("BRISK failed on camera %d", c); free(kp); return;
+        }
+        free(G_bkp[c]); free(G_bdesc[c]);
+        G_bkp[c] = (float*)malloc(sizeof(float) * 3 * (nk ? nk : 1));
+        for (i = 0; i < nk; ++i) { G_bkp[c][3 * i] = kp[i].x; G_bkp[c][3 * i + 1] = kp[i].y; G_bkp[c][3 * i + 2] = kp[i].size; }
+        G_bdesc[c] = desc; G_bn[c] = nk;
+        free(kp);
+        chk(&C_br_kp, (int)nk == cams[c].nkp);
+        if ((int)nk == cams[c].nkp) {
+            for (i = 0; i < 3 * nk; ++i) chk(&C_br_kp, memcmp(&G_bkp[c][i], &cams[c].kp[i], 4) == 0);
+        } else {
+            DBG("BRISK: frame %llu camera %d: %zu keypoints, the log has %d", (unsigned long long)ts, c, nk, cams[c].nkp);
+        }
+        { static int shown; if (!shown && C_br_kp.bad) { shown = 1; DBG("first BRISK keypoint mismatch at frame %llu camera %d", (unsigned long long)ts, c); } }
+        cams[c].kp = G_bkp[c]; cams[c].nkp = (int)nk;
+        G_br_kp += (long)nk;
+    }
+    G_bvalid = 1; G_br_frames++;
 }
 
 /* ---- the frontend's calls into the backend: compare with the next logged entry record, then execute ---- */
@@ -505,6 +652,22 @@ static void run_frontend(void) {
     const unsigned char* d[OK_FE_MAXCAM];
     if (!G_desc.valid) { chk(&C_fe, 0); DBG("no descriptor record for frame %llu", (unsigned long long)id); return; }
     for (i = 0; i < G_desc.ncam; ++i) d[i] = G_desc.desc[i];
+    if (G_brisk) {
+        int nkp[OK_FE_MAXCAM];
+        if (!G_bvalid) { chk(&C_br_desc, 0); return; }
+        for (i = 0; i < G_desc.ncam; ++i) {
+            size_t k;
+            chk(&C_br_desc, (size_t)G_desc.nkp[i] == G_bn[i]);
+            if ((size_t)G_desc.nkp[i] == G_bn[i]) for (k = 0; k < 48 * G_bn[i]; ++k) chk(&C_br_desc, G_bdesc[i][k] == G_desc.desc[i][k]);
+            d[i] = G_bdesc[i]; nkp[i] = (int)G_bn[i];
+        }
+        { static int shown; if (!shown && C_br_desc.bad) { shown = 1; DBG("first BRISK descriptor mismatch at frame %llu", (unsigned long long)id); } }
+        G_cur_frame = id;
+        ok_fe_add_frame(V_fe, id, G_desc.ncam, nkp, d);
+        ok_fe_data_association(V_fe, id, &akf);
+        G_akf = akf; G_fe_frames++;
+        return;
+    }
     G_cur_frame = id;
     ok_fe_add_frame(V_fe, id, G_desc.ncam, G_desc.nkp, d);
     ok_fe_data_association(V_fe, id, &akf);
@@ -512,20 +675,20 @@ static void run_frontend(void) {
     G_akf = akf; G_fe_frames++;
 }
 
+static long G_extra_bad, G_extra_tot;    /* counters of an including harness (check_ok_system) */
 static int fmismatches(void) {
-    return vmismatches() + (int)(C_fe.bad + C_fe_args.bad + C_fe_kf.bad + C_fe_ransac.bad + C_fe_ransac_in.bad + C_pl_add.bad + C_pl_query.bad + C_pl_verify.bad);
+    return vmismatches() + (int)(G_extra_bad + C_br_kp.bad + C_br_desc.bad + C_fe.bad + C_fe_args.bad + C_fe_kf.bad + C_fe_ransac.bad + C_fe_ransac_in.bad + C_pl_add.bad + C_pl_query.bad + C_pl_verify.bad);
 }
 
-int main(int argc, char** argv) {
-    const char* label = argc > 1 ? argv[1] : "frontend";
-    const char* dir = argc > 3 ? argv[3] : ".";
-    long max_calls = argc > 4 ? atol(argv[4]) : -1;
+/* open the dumps of `dir`, create the C backend V_b with the comparing hooks and fill the frontend's comparing backend-call
+ * table; returns 0 or the exit code */
+static long G_nb_records;
+static int fe_setup(const char* label, const char* dir, ok_fe_est* est_out, ok_fe_params* fp_out) {
     char path[1024];
     ok_vsb_hooks h;
     ok_fe_params fp;
     ok_fe_est est;
     lrec r;
-    long nb_records = 0;
     int ngraph = 0;
     G_debug = getenv("OK_DEBUG") != NULL;
     if (getenv("OK_NATIVE_SOLVE")) { G_native = 1; G_native_every = atol(getenv("OK_NATIVE_SOLVE")); if (G_native_every < 1) G_native_every = 1; }
@@ -535,12 +698,23 @@ int main(int argc, char** argv) {
     if (getenv("OK_RANSAC_ONLY")) {            /* quick mode: only the native re-run of the logged RANSAC runs */
         printf("  runs per kind: %ld %ld %ld %ld, degenerate-sample runs not counted: %ld\n", G_fe_ransac_in[0], G_fe_ransac_in[1], G_fe_ransac_in[2], G_fe_ransac_in[3], G_ub_runs);
         printf("%s: %ld/%ld\n", label, C_fe_ransac_in.bad, C_fe_ransac_in.tot);
-        return C_fe_ransac_in.bad == 0 && C_fe_ransac_in.tot > 0 ? 0 : 1;
+        return C_fe_ransac_in.bad == 0 && C_fe_ransac_in.tot > 0 ? -1 : 1;   /* -1: done, passed */
     }
     snprintf(path, sizeof path, "%s/problem.bin", dir);
     V_f = fopen(path, "rb");
     if (!V_f) { printf("%s: 0/0\n", label); fprintf(stderr, "cannot open %s\n", path); return 1; }
     G_aux_hook = aux_hook; G_setkf_hook = on_setkf;
+    if (getenv("OK_BRISK_IMAGES")) {
+        int c;
+        for (c = 0; c < OK_FE_MAXCAM; ++c) {
+            snprintf(path, sizeof path, "%s/cam%d.gray", getenv("OK_BRISK_IMAGES"), c);
+            if (!gpack_open(&G_gp[c], path)) { if (G_gp[c].f) fclose(G_gp[c].f); memset(&G_gp[c], 0, sizeof G_gp[c]); }
+        }
+        if (!G_gp[0].f) { fprintf(stderr, "OK_BRISK_IMAGES: cannot read %s/cam0.gray\n", getenv("OK_BRISK_IMAGES")); return 1; }
+        G_bctx = ok_brisk_create(NULL);
+        if (!G_bctx) return 1;
+        G_brisk = 1; G_addstates_hook = brisk_hook;
+    }
     while (ngraph < 2 && read_rec(&r)) {
         if (r.tag == OK_M_NEW) {
             cur c; uint64_t gptr; gslot* s; pslot* ps;
@@ -574,6 +748,20 @@ int main(int argc, char** argv) {
         fp.p_dbow = 0.4; fp.drift_percentage = 1.35; fp.realtime_max_iterations = 10;
     }
     est.place_recognition = e_place_recognition;
+    *est_out = est; *fp_out = fp;
+    return 0;
+}
+
+static int fe_report(const char* label);
+int main(int argc, char** argv) {
+    const char* label = argc > 1 ? argv[1] : "frontend";
+    const char* dir = argc > 3 ? argv[3] : ".";
+    long max_calls = argc > 4 ? atol(argv[4]) : -1;
+    ok_fe_params fp;
+    ok_fe_est est;
+    lrec r;
+    long nb_records = 0;
+    { const int rc = fe_setup(label, dir, &est, &fp); if (rc) return rc < 0 ? 0 : rc; }
     V_fe = ok_fe_new(V_b, &fp, &est);
     if (G_place_native && ok_fe_set_vocabulary(V_fe, G_voc, G_voc_len)) { fprintf(stderr, "cannot parse the vocabulary record\n"); return 1; }
     while (get_rec(&r)) {
@@ -589,9 +777,18 @@ int main(int argc, char** argv) {
         lrec_free(&r);
     }
     fclose(V_f);
+    G_nb_records = nb_records;
+    return fe_report(label);
+}
+
+static int fe_report(const char* label) {
 #define PK2(name, c) printf("  %-24s %ld/%ld\n", name, (c).bad, (c).tot)
     printf("  frames run through the C frontend: %ld, frontend backend calls compared: %ld, native RANSAC runs of the frontend: %ld (ransac.bin: %s), logged runs re-run natively on the logged adapter data: kind 0 %ld, 1 %ld, 2 %ld, 3 %ld (of which %ld differ through a degenerate GP3P sample, undefined behaviour upstream, not counted), loop-closure attempts replayed from the log: %ld, other backend records replayed: %ld\n",
-           G_fe_frames, G_fe_calls, G_fe_ransac, G_have_rbin ? "yes" : "no", G_fe_ransac_in[0], G_fe_ransac_in[1], G_fe_ransac_in[2], G_fe_ransac_in[3], G_ub_runs, G_fe_lc, nb_records);
+           G_fe_frames, G_fe_calls, G_fe_ransac, G_have_rbin ? "yes" : "no", G_fe_ransac_in[0], G_fe_ransac_in[1], G_fe_ransac_in[2], G_fe_ransac_in[3], G_ub_runs, G_fe_lc, G_nb_records);
+    if (G_brisk) {
+        printf("  native BRISK on the images: %ld frames, %ld keypoints (awareness-map pixels with a failed projection: %ld)\n", G_br_frames, G_br_kp, G_br_maps_failed);
+        PK2("BRISK keypoints (x y size)", C_br_kp); PK2("BRISK descriptors", C_br_desc);
+    }
     PK2("frontend calls (tag)", C_fe); PK2("frontend call arguments", C_fe_args); PK2("keyframe decision", C_fe_kf);
     PK2("ransac adapter + result", C_fe_ransac); PK2("ransac standalone (logged inputs)", C_fe_ransac_in);
     if (G_place_native) {
@@ -605,10 +802,10 @@ int main(int argc, char** argv) {
     PK2("optimise: states", C_opt_state); PK2("optimise: blocks", C_opt_blocks); PK2("optimise: IMU terms", C_opt_imu);
     PK2("program order", C_program); PK2("structure", C_struct);
     {
-        long tot = C_fe.tot + C_fe_args.tot + C_fe_kf.tot + C_fe_ransac.tot + C_fe_ransac_in.tot + C_pl_add.tot + C_pl_query.tot + C_pl_verify.tot + C_trace.tot + C_args.tot + C_res.tot + C_bres.tot + C_opt_args.tot + C_native.tot
+        long tot = G_extra_tot + C_br_kp.tot + C_br_desc.tot + C_fe.tot + C_fe_args.tot + C_fe_kf.tot + C_fe_ransac.tot + C_fe_ransac_in.tot + C_pl_add.tot + C_pl_query.tot + C_pl_verify.tot + C_trace.tot + C_args.tot + C_res.tot + C_bres.tot + C_opt_args.tot + C_native.tot
                    + C_events.tot + C_opt_state.tot + C_opt_blocks.tot + C_opt_imu.tot + C_program.tot + C_struct.tot;
         printf("%s: %d/%ld\n", label, fmismatches(), tot);
-        ok_fe_free(V_fe);
+        if (V_fe) ok_fe_free(V_fe);
         ok_vsb_free(V_b);
         return fmismatches() == 0 && tot > 0 ? 0 : 1;
     }

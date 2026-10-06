@@ -84,6 +84,10 @@ static void handle_problem_rec(const rec* r) {
  * Records 161 (descriptors) and 162 (RANSAC) of patch 0012 are passed to G_aux_hook (check_ok_frontend) or skipped. */
 static void (*G_aux_hook)(uint32_t tag, const unsigned char* p, size_t len);
 static void (*G_setkf_hook)(uint64_t id, int flag);
+/* called with every ADDSTATES before the C backend's addStates (check_ok_frontend: BRISK on the images may replace the
+ * logged keypoints of cams); G_imu_cfg = the last ADDIMU configuration */
+static void (*G_addstates_hook)(ok_time t, const ok_imu_meas* meas, size_t n, int ncam, ok_vsb_cam_in* cams);
+static ok_vg_imu_cfg G_imu_cfg;
 static lrec* G_q; static int G_qn, G_qcap;
 static int read_rec(lrec* out) {
     rec r;
@@ -330,6 +334,7 @@ static void handle_b(const lrec* r) {
             ic.use = (int)cu32(&a); cf64n(&a, ic.T_BS, 7);
             ic.a_max = cf64(&a); ic.g_max = cf64(&a); ic.sigma_g_c = cf64(&a); ic.sigma_bg = cf64(&a); ic.sigma_a_c = cf64(&a); ic.sigma_ba = cf64(&a);
             ic.sigma_gw_c = cf64(&a); ic.sigma_aw_c = cf64(&a); cf64n(&a, ic.g0, 3); cf64n(&a, ic.a0, 3); ic.g = cf64(&a);
+            G_imu_cfg = ic;
             ok_vsb_add_imu(V_b, &ic);
             break;
         }
@@ -358,6 +363,7 @@ static void handle_b(const lrec* r) {
                 for (k = 0; k < nz; ++k) { nzk[c][k] = cu32(&a); nzi[c][k] = cu64(&a); }
                 cams[c].nz = (int)nz; cams[c].nz_kp = nzk[c]; cams[c].nz_id = nzi[c];
             }
+            if (!a.bad && G_addstates_hook) G_addstates_hook(t, m, n, (int)nc, cams);
             if (!a.bad) ok_vsb_add_states(V_b, t, m, n, as_kf, kptr, (int)nc, cams);
             for (c = 0; c < nc; ++c) { free(hdr[c]); free(kps[c]); free(nzk[c]); free(nzi[c]); }
             free(m);

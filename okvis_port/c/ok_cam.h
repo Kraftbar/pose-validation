@@ -15,7 +15,7 @@
  *
  * C99, <math.h> <stdlib.h> <string.h> <stdint.h> only. Matrices are column-major. Not ported: RadialTangential8
  * (not used by any shipped EuRoC/TUM-VI config), image masks (the reference configs never set one: isMasked ==
- * !isInImage), undistort maps / awareness maps (OpenCV remap, unused by the estimator), the batch variants.
+ * !isInImage), undistort maps (OpenCV remap, unused by the estimator), the batch variants.
  * The "undistortion failed" console message of RadialTangentialDistortion::undistort is not reproduced.
  *
  * Camera dump records (patch 0005; native endian). Common header "cam":
@@ -83,6 +83,13 @@ int ok_cam_back_project(const ok_cam* c, const double ip[2], double dir[3]);
 int ok_cam_back_project_j(const ok_cam* c, const double ip[2], double dir[3], double J[6] /* 3x2 */);
 int ok_cam_back_project_h(const ok_cam* c, const double ip[2], double dir[4]);
 int ok_cam_back_project_h_j(const ok_cam* c, const double ip[2], double dir[4], double J[8] /* 4x2 */);
+
+/* PinholeCamera::initialiseCameraAwarenessMaps (the inputs of BRISK's camera-aware extraction): per pixel (u, v),
+ * row-major, the normalised back-projected ray (zero if back-projection fails) as 3 floats and the 2x3 projection
+ * Jacobian of that ray, row-major, as 6 floats. Upstream leaves a Jacobian uninitialised (cv::Mat) where the
+ * projection fails (border pixels whose ray re-projects outside the image: 309 / 715 on EuRoC cam0 / cam1); the
+ * reference's freshly mmap'd 8.7 MB buffer holds zeros there, which the port writes. Returns the number of such pixels. */
+long ok_cam_awareness_maps(const ok_cam* c, float* rays /* h*w*3 */, float* jacobians /* h*w*6 */);
 
 /* distortion layer (exposed for the random tests): params = k1,k2,p1,p2 (or NULL = the camera's own) */
 int ok_dist_distort(const ok_cam* c, const double* params, const double u[2], double out[2], double J[4], double* Jp);

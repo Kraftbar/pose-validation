@@ -17,7 +17,7 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 | Folder | What | State | Read first |
 |---|---|---|---|
 | `stella_port/` | stella_vslam mono, bit-exact | complete | `stella_port/HANDOVER.md` (top) |
-| `okvis_port/` | OKVIS2 (drone winner), bit-exact | M1–M7d done; backend, solver, frontend, RANSAC and place recognition native | `okvis_port/HANDOVER.md`, `PLAN.md` |
+| `okvis_port/` | OKVIS2 (drone winner), bit-exact | complete for EuRoC: M1–M8 done; `okvis_c_euroc` runs MH_01 mono + stereo from images + IMU csv, trajectories byte-identical to the reference | `okvis_port/HANDOVER.md`, `PLAN.md` |
 | `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | M1–M5 done; window solve fully native | `rdvio_port/HANDOVER.md`, `PLAN.md` |
 | `stella_vio/` | our modified copy of stella_port | re-init, IMU, R-frames, merge, PoseLib-style solvers, gait scale servo (all opt-in beyond defaults) | `stella_vio/README.md`, `RESULTS.md` |
 | `gnss_fusion/` | our C GNSS fusion | smoother, gait speed prior, georef, auto switch, gait regularity gate | `gnss_fusion/README.md` |
@@ -40,7 +40,7 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 ## How to verify (all must pass before committing)
 
 - `python3 tools/check_stella_port.py`: 56/56 PASS.
-- `python3 tools/check_okvis_port.py --tag m8,s8 --native-solve 1 --eigen-tests`: all PASS. The dumps live in `runs/okvis_port/reference_runs/MH_01_easy/{m8,s8}`.
+- `python3 tools/check_okvis_port.py --tag m8,s8 --native-solve 1 --eigen-tests --data external/vio/data/okvis_brisk_tmp`: all PASS. The dumps live in `runs/okvis_port/reference_runs/MH_01_easy/{m8,s8}`; `--data` (images + imu csv from `tools/okvis_port_images.py MH_01_easy`) adds native BRISK and the end-to-end `check_ok_system`.
 - `python3 tools/check_rdvio_port.py --modules m4,m5 --oracle --seeds 1,2,3 --tag4 m5 --tag5 m5`.
   - The m1 row uses tag `m1`.
   - m2/m3 need the `m23` dump regenerated (about 2 min).
@@ -67,11 +67,14 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 ## Open decisions and next steps
 
 1. **Push blocked:** local commit `a2dc6c8` (OKVIS2 M7c–M7d) contains `okvis_port/c/ok_dbow.*`, a DBoW2 source port. DBoW2's licence requires notifying the author on redistribution, and the repo is public. Choose one: notify the author and then push, push without `ok_dbow`, or push and notify afterwards.
-2. **OKVIS2:** hook up Codex's BRISK (`ok_fe_add_frame`), then the system driver, giving a full C run.
+2. **OKVIS2:** done for EuRoC (BRISK hooked up, system driver M8; full suite with `--data` all PASS on 2026-10-05, uncommitted). Open: a PNG decoder (the app reads `.gray` packs), runtime 2–3x the reference, parameter blocks never freed, other sequences.
 3. **RD-VIO:**
-   - M7: OpenCV CLAHE, LK and GFTT. This is the biggest risk.
+   - M7: OpenCV CLAHE, LK and GFTT. This is the biggest risk. **Codex is on it since 2026-10-05** (reserved paths in `rdvio_port/HANDOVER.md`; review its README before relying on it).
    - Then M6 map, M8 frontend, M9 initializer, M10 tracker and M11 handler.
 4. **Phone stack:**
    - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
    - Indoor-2 live error is still twice the final error.
-5. **Optional:** a Basalt port (BSD, fast stereo); your own Android recordings with raw GNSS and RTK ground truth.
+5. **Codex:** at most one job at a time. On 2026-10-05 a fan-out of five jobs stopped at the Codex usage limit and was cancelled; see the `codex-delegation` memory.
+   - Since 2026-10-06, Codex continues **RD-VIO M7** in its warm session `01a10d7f-5d3c-78c1-a199-f300efae2404`. Reserved paths are listed at the top of `rdvio_port/HANDOVER.md`; review its report before relying on it.
+   - Leftovers from the cancelled jobs, unreviewed: `okvis_port/c/ok_png.{c,h}` (a PNG decoder with no harness yet; Claude validates it), `okvis_port/reference_png/fetch.py`, `runs/okvis_port/png/`, and `runs/phone_pipeline/o1_diag/` (27 MB).
+6. **Optional:** a Basalt port (BSD, fast stereo); your own Android recordings with raw GNSS and RTK ground truth.

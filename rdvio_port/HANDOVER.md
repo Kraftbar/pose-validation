@@ -4,6 +4,12 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`. Nothing committed.
 
+## Reserved for Codex: M7 OpenCV image leaf (started 2026-10-05, stopped at the Codex usage limit, resumed 2026-10-06)
+
+Claude does not touch these paths while Codex works; unreviewed until its report. Files so far: `rdvio_port/c/rd_cv.{h,c}`, `rd_cv_lk.c`, `rd_cv_gftt.c`, `check_rd_cv.c`, `check_rd_cv_stream.c`,
+`rdvio_port/reference_cv/` (dump tools, build/run scripts), `rdvio_port/reference/patches/0008-m7-image-stream.patch`, fixtures in
+`runs/rdvio_port/reference_cv/` (~1 GB). The brief it worked from (scope + validation plan) is summarised in PLAN.md section 4.
+
 ## State (2026-10-04)
 
 * Phase 0 done: licence audit, PLAN.

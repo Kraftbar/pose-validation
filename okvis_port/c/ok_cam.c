@@ -334,6 +334,34 @@ int ok_cam_back_project(const ok_cam* c, const double ip[2], double dir[3]) {
     return ok;
 }
 
+long ok_cam_awareness_maps(const ok_cam* c, float* rays, float* jacobians) {
+    long failed = 0;
+    int u, v, i;
+    for (v = 0; v < c->h; ++v) {
+        for (u = 0; u < c->w; ++u) {
+            const size_t px = (size_t)v * (size_t)c->w + (size_t)u;
+            double ip[2], ray[3], pt[2], J[6];   /* J column-major 2x3 */
+            ip[0] = (double)u; ip[1] = (double)v;
+            if (ok_cam_back_project(c, ip, ray)) {
+                double n = (ray[0] * ray[0] + ray[1] * ray[1]) + ray[2] * ray[2];
+                if (n > 0.0) { n = sqrt(n); ray[0] /= n; ray[1] /= n; ray[2] /= n; }   /* Eigen normalize() */
+            } else {
+                ray[0] = 0.0; ray[1] = 0.0; ray[2] = 0.0;
+            }
+            for (i = 0; i < 3; ++i) rays[3 * px + (size_t)i] = (float)ray[i];
+            if (ok_cam_project_j(c, ray, pt, J, NULL) == OK_PROJ_SUCCESSFUL) {
+                float* j = jacobians + 6 * px;
+                j[0] = (float)J[0]; j[1] = (float)J[2]; j[2] = (float)J[4];
+                j[3] = (float)J[1]; j[4] = (float)J[3]; j[5] = (float)J[5];
+            } else {
+                memset(jacobians + 6 * px, 0, 6 * sizeof(float));
+                failed++;
+            }
+        }
+    }
+    return failed;
+}
+
 int ok_cam_back_project_j(const ok_cam* c, const double ip[2], double dir[3], double J[6]) {
     double p2[2], u[2], U[4], O[6];
     int ok, i, j;

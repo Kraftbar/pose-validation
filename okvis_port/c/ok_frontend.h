@@ -14,11 +14,11 @@
  *
  * ---- scope ----
  * `ok_fe_data_association` is Frontend::dataAssociationAndInitialization for the configurations the port targets
- * (radial-tangential / equidistant pinhole, IMU on, 1-4 cameras). BRISK detection / description is Codex's leaf: the
- * descriptors of a frame are handed in with ok_fe_add_frame. The OpenGV RANSAC runs (GP3P absolute pose, rotation-only and
- * Stewenius relative pose; module M7c, ok_opengv.c) are native; what is NOT native yet (reached through the `place_recognition`
- * hook of ok_fe_est, answered by the replay harness from the reference log): place recognition (DBoW2 query,
- * verifyRecognisedPlace) with attemptLoopClosure / addLoopClosureFrame (module M7d).
+ * (radial-tangential / equidistant pinhole, IMU on, 1-4 cameras). BRISK detection / description is Codex's leaf (ok_brisk*,
+ * run by the system driver ok_system.c): the descriptors of a frame are handed in with ok_fe_add_frame. The OpenGV RANSAC runs
+ * (GP3P absolute pose, rotation-only and Stewenius relative pose; module M7c, ok_opengv.c) and, once a vocabulary is set, the
+ * place recognition (DBoW2 query, verifyRecognisedPlace, attemptLoopClosure / addLoopClosureFrame; module M7d) are native;
+ * without a vocabulary the `place_recognition` hook of ok_fe_est is the fallback (the replay harness answers it from the log).
  * The frontend reads the estimator (ViSlamBackend, module 6) through the const accessors of ok_vslam.h and acts on it
  * only through the ok_fe_est table, whose entries mirror the ViSlamBackend methods the frontend calls one to one.
  *

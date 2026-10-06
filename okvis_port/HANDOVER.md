@@ -23,6 +23,33 @@ orientation, descriptor bits). Reserved paths: `okvis_port/c/ok_brisk*.{h,c}`,
 
 ## Status
 
+### 2026-10-05 (Claude): BRISK hooked up (M7a, Codex's leaf) and module 8 (the system driver) DONE: the whole C pipeline runs MH_01 mono and stereo from the images + imu0/data.csv + the YAML config and writes trajectories byte-identical to the reference
+
+Deliverables
+- C (C99): `ok_system.{h,c}` (BSD-3 + MPL: ThreadedSlam init / processFrame / optimisePublishMarginalise / the stopThreading schedule of patches 0001 + 0006 run sequentially: first-frame IMU drop rule, IMU deque pop / prune (`imuTemporalOverlap` 0.02), detection pose = `lastOptimisedState_` (stored AFTER the detection of the previous frame, i.e. the newest state before the previous addStates) IMU-propagated to the frame, `initPose` while it is unset (first TWO frames), Frontend::detectAndDescribe with Codex's `ok_brisk*` (extraction direction `T_WC.inverse().C() * (0,0,-1)` as float, focal `float(fu)`), the `< 15 keypoints` drop, addStates, data association, setKeyframe, optimiseRealtimeGraph, synchronise when a loop closure is available, publish (causal row), applyStrategy, optimiseFullGraph; TrajectoryOutput / writeFinalCsvTrajectory writers incl. the anyState reconstruction `pose(kf) * T_Sk_S` (cacheless) and `C_WSk * v_Sk`); the driver reaches the backend only through an `ok_sys_be` table (direct calls by default) and the frontend through `ok_fe_est`, so a harness can compare every call. `ok_config.{h,c}` (BSD-3: the YAML subset of the OKVIS2 configs, ViParametersReader semantics: T_SC = `Transformation(Matrix4d)` then `Transformation(r, q.normalized())`, booleans as parseEntry, strtod / strtol). `okvis_c_euroc.c` (the app: `okvis_c_euroc <config.yaml> <sequence dir> <vocabulary.bin> <out dir> [max frames]`; DatasetReader order: before each image t the IMU up to the first measurement later than t + Duration(0.021), values through `strtof` like `std::stof`, measurements older than start - 1 s dropped). `ok_cam.c`: `ok_cam_awareness_maps` (PinholeCamera::initialiseCameraAwarenessMaps: normalised back-projected rays + 2x3 projection Jacobians as float). `ok_vigraph.{h,c}`: `ok_vg_anystate_count / _at`.
+- Tools: `okvis_port/reference_tools/okvis_png2gray.cc` (cv::imread IMREAD_GRAYSCALE with the reference's OpenCV 4.6 -> one `.gray` pack per camera: "OKGRAY1", u32 w, h, n, n x {u64 ts, pixels}; the port has no PNG decoder), `tools/okvis_port_images.py <seq>` (fetch cams + imu0 into `external/vio/data/okvis_brisk_tmp/<seq>`, decode, delete the PNGs: 2.7 GB for MH_01 stereo), runner `tools/check_okvis_port.py --data ROOT` (check_ok_frontend runs BRISK natively, check_ok_system runs end to end; without --data check_ok_system is skipped).
+- Harnesses: `check_ok_frontend.c` with `OK_BRISK_IMAGES` (BRISK on the images replaces the logged keypoints / descriptors after comparing them; refactored into `fe_setup` / `fe_report`, includable with `OK_FRONTEND_AS_LIB`), `check_ok_vslam.c` (addStates hook, ADDIMU config captured), new `check_ok_system.c` (the C system from the dataset; the log only CHECKS: every ThreadedSlam backend call (addImu, addCamera, addStates with the IMU deque + keypoints, setKeyframe, optimiseRealtimeGraph, synchronise, applyStrategy, optimiseFullGraph) tag + argument bytes + results, the descriptors of record 161, everything check_ok_frontend compares, the whole log consumed, then `causal.csv` and `final.csv` of the reference run row by row).
+
+Result (tolerance 0, bitwise; native solves)
+
+| check | m8 (mono) | s8 (stereo) |
+|---|---|---|
+| awareness maps vs the real `initialiseCameraAwarenessMaps` (Codex's native dump) | cam0 1,082,880 ray + 2,165,760 Jacobian floats, 0 | cam1 same counts, 0 |
+| check_ok_frontend with native BRISK: keypoints (x y size) / descriptor bytes | 4,884,705 / 78,100,065, 0 | 9,759,951 / 156,048,786, 0 (whole harness 310,055,801, 0) |
+| check_ok_system (C system end to end, 3,681 frames, 1 dropped at startup, 36,817 IMU measurements) | 155,335,661 values, 0; causal.csv + final.csv 7,364 rows identical | 300,332,809 values, 0; 7,364 rows identical |
+| `okvis_c_euroc` standalone (no harness, no log): sha256 of the outputs | final `dfe3b58e...`, causal `cc29a746...` = reference | final `673fa08f...`, causal `04965fdc...` = reference |
+
+The standalone stereo run reproduces the reference although it cannot substitute the 40 degenerate GP3P samples (UB upstream, see the M7c/d entry): the C code skips such a sample and the run still ends in the same trajectory (as two builds of the reference with different UB outcomes did). Runtime: mono 624 s / stereo 1,723 s single-threaded (reference with dumps 278 / 589 s), max RSS 1.2 / 2.4 GB. ASan/UBSan: the app over the first 400 mono frames (incl. loop closures) is clean apart from the known `memcpy(dst, NULL, 0)` of `ok_vsolve.c`; LeakSanitizer reports teardown leaks: `ok_vg_free` never frees parameter blocks (landmark / state blocks, removed or not; pointer identity of the replay bijection), about 1 MB per 400 frames.
+
+Facts found
+- Bug caught by the stereo check only: the camera-model blob buffer of the driver was 64 bytes for an 80-byte header; camera 1's blob overwrote d[2], d[3] of camera 0 (mono unaffected, ASan blind: inside one struct). check_ok_system flagged ADDSTATES byte 996 of the first frame; the standalone run had diverged from row 0 (0.20 m causal / 0.05 m final).
+- The camera awareness Jacobian of the 309 / 715 border pixels whose ray projects outside the image is UNINITIALISED upstream (`cv::Mat` never written there); the reference's fresh 8.7 MB allocation is mmap'd zero pages, so zeros reproduce it.
+- `lastOptimisedState_` lags one frame more than the name suggests: the detection of frame k uses the state of frame k-2 after its full processing, propagated over the deque of addStates(k-1) plus the measurements popped for frame k.
+
+Not ported / next
+- PNG decoding (the gray packs stand in for cv::imread), IMU-less operation, enforce_realtime, CNN, depth cameras, do_final_ba, online extrinsics, multi-session: rejected by `ok_sys_new` / the config reader.
+- Other sequences (only MH_01 has reference dumps), runtime (2-3x the reference), memory (blocks never freed).
+
 ### 2026-10-05 (Claude): modules 7c (OpenGV: GP3P, Stewenius, rotation-only, Ransac with mt19937) and 7d (place recognition: DBoW2, verifyRecognisedPlace, quickSolver) DONE, bit-exact on mono and stereo; the frontend has no log-answered hook left (except the documented UB runs)
 
 Deliverables
