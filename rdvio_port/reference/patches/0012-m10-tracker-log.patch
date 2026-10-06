@@ -1,0 +1,228 @@
+diff -ruN a/src/rdvio/src/sliding_window_tracker.cpp b/src/rdvio/src/sliding_window_tracker.cpp
+--- a/src/rdvio/src/sliding_window_tracker.cpp	2026-10-06 11:29:10.518179286 +0200
++++ b/src/rdvio/src/sliding_window_tracker.cpp	2026-10-06 11:36:10.669726127 +0200
+@@ -10,7 +10,150 @@
+ #include <rdvio/map/map.h>
+ #include <rdvio/map/track.h>
+ #include <rdvio/util/unique_timer.h>
+-
++#include <rdvio/estimation/marginalization_factor.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++// rdvio_port instrumentation (reference build only, never distributed): the sliding-window tracker log of module M10,
++// RDVIO_PORT_SWT_DIR (writes <dir>/swt.bin). Logged track() calls: the first RDVIO_PORT_SWT_ALL (default 0), then every
++// RDVIO_PORT_SWT_EVERY-th (default 1). Stage records carry the FNV-1a 64 hash of their payload, and the payload itself
++// with RDVIO_PORT_SWT_FULL=1.
++// Framed records: u32 tag, u64 bytes, payload. Layouts in rdvio_port/c/check_rd_swt.c. Observation only.
++namespace {
++struct PortSwt {
++    FILE *f = nullptr;
++    bool checked = false, on = false;
++    long every = 1, all = 0, calls = 0;
++    bool full = false;
++    FILE *get() {
++        if (!checked) {
++            checked = true;
++            if (const char *d = std::getenv("RDVIO_PORT_SWT_DIR")) f = std::fopen((std::string(d) + "/swt.bin").c_str(), "wb");
++            if (const char *e = std::getenv("RDVIO_PORT_SWT_EVERY")) every = std::max(1L, std::atol(e));
++            if (const char *e = std::getenv("RDVIO_PORT_SWT_ALL")) all = std::atol(e);
++            if (const char *e = std::getenv("RDVIO_PORT_SWT_FULL")) full = std::atol(e) != 0;
++        }
++        return f;
++    }
++} g_port_swt;
++struct PortBuf {
++    std::vector<unsigned char> b;
++    void raw(const void *p, size_t n) { const unsigned char *c = (const unsigned char *)p; b.insert(b.end(), c, c + n); }
++    void u32(uint32_t v) { raw(&v, 4); }
++    void u64(uint64_t v) { raw(&v, 8); }
++    void f64(double v) { raw(&v, 8); }
++    void f64n(const double *p, size_t n) { raw(p, 8 * n); }
++    void write(uint32_t tag) {
++        FILE *f = g_port_swt.get();
++        if (!f || !g_port_swt.on) return;
++        uint64_t n = b.size();
++        std::fwrite(&tag, 4, 1, f); std::fwrite(&n, 8, 1, f);
++        if (n) std::fwrite(b.data(), 1, n, f);
++        std::fflush(f);
++    }
++    /* a stage record: u64 FNV-1a 64 of the payload, then the payload if RDVIO_PORT_SWT_FULL */
++    void write_stage(uint32_t tag) {
++        uint64_t h = 1469598103934665603ull;
++        for (unsigned char c : b) { h ^= c; h *= 1099511628211ull; }
++        PortBuf o; o.u64(h);
++        if (g_port_swt.full) o.raw(b.data(), b.size());
++        o.write(tag);
++    }
++};
++uint32_t port_ftags(const rdvio::Frame *f) {
++    uint32_t t = 0;
++    for (int k = 0; k <= (int)rdvio::FT_FIX_MOTION; ++k) if (f->tag((rdvio::FrameTag)k)) t |= 1u << k;
++    return t;
++}
++uint32_t port_ttags(const rdvio::Track *tr) {
++    uint32_t t = 0;
++    for (int k = 0; k <= (int)rdvio::TT_TEMP; ++k) if (tr->tag((rdvio::TrackTag)k)) t |= 1u << k;
++    return t;
++}
++/* the protected state of the marginalization factor, read through member pointers (no access to anything else) */
++struct PortMargAccess : rdvio::MarginalizationFactor {
++    typedef rdvio::MarginalizationFactor MF;
++    static const std::vector<rdvio::PoseState> &lp(const MF &m) { return m.*(&PortMargAccess::pose_linearization_point); }
++    static const std::vector<rdvio::MotionState> &lm(const MF &m) { return m.*(&PortMargAccess::motion_linearization_point); }
++    static const rdvio::matrix<> &sic(const MF &m) { return m.*(&PortMargAccess::sqrt_inv_cov); }
++    static const rdvio::vector<> &iv(const MF &m) { return m.*(&PortMargAccess::infovec); }
++};
++void port_pre(PortBuf &b, const rdvio::PreIntegrator &p) {
++    b.f64n(p.cov_w.data(), 9); b.f64n(p.cov_a.data(), 9); b.f64n(p.cov_bg.data(), 9); b.f64n(p.cov_ba.data(), 9);
++    b.f64(p.delta.t); b.f64n(p.delta.q.coeffs().data(), 4); b.f64n(p.delta.p.data(), 3); b.f64n(p.delta.v.data(), 3);
++    b.f64n(p.delta.cov.data(), 225); b.f64n(p.delta.sqrt_inv_cov.data(), 225);
++    b.f64n(p.jacobian.dq_dbg.data(), 9); b.f64n(p.jacobian.dp_dbg.data(), 9); b.f64n(p.jacobian.dp_dba.data(), 9);
++    b.f64n(p.jacobian.dv_dbg.data(), 9); b.f64n(p.jacobian.dv_dba.data(), 9);
++    b.u64(p.data.size());
++    for (const auto &d : p.data) { b.f64(d.t); b.f64n(d.w.data(), 3); b.f64n(d.a.data(), 3); }
++}
++void port_frame(PortBuf &b, const rdvio::Frame *f, bool full) {
++    b.u64(f->id()); b.u32(port_ftags(f));
++    b.f64n(f->pose.q.coeffs().data(), 4); b.f64n(f->pose.p.data(), 3);
++    b.f64n(f->motion.v.data(), 3); b.f64n(f->motion.bg.data(), 3); b.f64n(f->motion.ba.data(), 3);
++    if (!full) return;
++    b.f64(f->image->t); b.f64n(f->K.data(), 9); b.f64n(f->sqrt_inv_cov.data(), 4);
++    b.f64n(f->camera.q_cs.coeffs().data(), 4); b.f64n(f->camera.p_cs.data(), 3);
++    b.f64n(f->imu.q_cs.coeffs().data(), 4); b.f64n(f->imu.p_cs.data(), 3);
++    port_pre(b, f->preintegration);
++    port_pre(b, f->keyframe_preintegration);
++    b.u64(f->keypoint_num());
++    for (size_t k = 0; k < f->keypoint_num(); ++k) {
++        b.f64n(f->get_keypoint(k).data(), 3);
++        const rdvio::Track *t = f->get_track(k);
++        b.u64(t ? t->id() : 0u);
++    }
++}
++/* the window: map frames, each followed by its subframes; the map's tracks in map order, references by frame id */
++void port_window(PortBuf &b, rdvio::Map *map, bool full) {
++    using namespace rdvio;
++    b.u64(map->frame_num());
++    for (size_t i = 0; i < map->frame_num(); ++i) {
++        Frame *f = map->get_frame(i);
++        port_frame(b, f, full);
++        b.u64(f->subframes.size());
++        for (const auto &s : f->subframes) port_frame(b, s.get(), full);
++    }
++    b.u64(map->track_num());
++    for (size_t i = 0; i < map->track_num(); ++i) {
++        Track *t = map->get_track(i);
++        b.u64(t->id()); b.u32(port_ttags(t)); b.f64(t->landmark.inv_depth); b.u64(t->m_life);
++        b.u64(t->keypoint_map().size());
++        for (const auto &[fr, kp] : t->keypoint_map()) { b.u64(fr->id()); b.u64(kp); }
++    }
++}
++void port_marg(PortBuf &b, rdvio::Map *map) {
++    const rdvio::MarginalizationFactor *m = map->marginalization_factor.get();
++    b.u32(m ? 1u : 0u);
++    if (!m) return;
++    const auto &fr = m->linearization_frames();
++    b.u64(fr.size());
++    for (size_t i = 0; i < fr.size(); ++i) {
++        b.u64(fr[i]->id());
++        const auto &p = PortMargAccess::lp(*m)[i];
++        const auto &v = PortMargAccess::lm(*m)[i];
++        b.f64n(p.q.coeffs().data(), 4); b.f64n(p.p.data(), 3);
++        b.f64n(v.v.data(), 3); b.f64n(v.bg.data(), 3); b.f64n(v.ba.data(), 3);
++    }
++    b.f64n(PortMargAccess::sic(*m).data(), (size_t)PortMargAccess::sic(*m).size());
++    b.f64n(PortMargAccess::iv(*m).data(), (size_t)PortMargAccess::iv(*m).size());
++}
++/* the feature-tracking frame with the current frame's id (update_track_status's old_frame): per keypoint 0 = no track,
++   1 = track, 3 = track with TT_STATIC. Found by a plain scan (frame_index_by_id would add an event to the M6 log). */
++void port_ft(PortBuf &b, rdvio::Map *ft, uint64_t id) {
++    rdvio::Frame *of = nullptr;
++    if (ft) for (size_t i = 0; i < ft->frame_num(); ++i) if (ft->get_frame(i)->id() == id) { of = ft->get_frame(i); break; }
++    b.u32(of ? 1u : 0u);
++    if (!of) return;
++    b.u64(of->keypoint_num());
++    for (size_t k = 0; k < of->keypoint_num(); ++k) {
++        const rdvio::Track *t = of->get_track(k);
++        b.u32(t ? (t->tag(rdvio::TT_STATIC) ? 3u : 1u) : 0u);
++    }
++}
++} // namespace
+ namespace rdvio {
+ 
+ SlidingWindowTracker::SlidingWindowTracker(std::unique_ptr<Map> keyframe_map,
+@@ -78,21 +221,49 @@
+ }
+ 
+ bool SlidingWindowTracker::track() {
++    const bool port = g_port_swt.get() != nullptr;
++    if (port) {   /* 1 IN: u64 call, u32 parsac, [full window], [marg], [ft] */
++        const long call = g_port_swt.calls++;
++        g_port_swt.on = call < g_port_swt.all || (call % g_port_swt.every) == 0;
++        PortBuf b; b.u64((uint64_t)(g_port_swt.calls - 1)); b.u32(config->parsac_flag() ? 1u : 0u);
++        port_window(b, map.get(), true); port_marg(b, map.get());
++        port_ft(b, feature_tracking_map.get(), map->get_frame(map->frame_num() - 1)->id());
++        b.write(1);
++    }
++    auto port_stage = [&](uint32_t tag, uint32_t v, bool marg, bool ft) {
++        if (!port) return;
++        PortBuf b; b.u32(v);
++        if (tag == 11 && v) b.f64(m_th);
++        port_window(b, map.get(), false);
++        if (marg) port_marg(b, map.get());
++        if (ft) port_ft(b, feature_tracking_map.get(), map->get_frame(map->frame_num() - 1)->id());
++        b.write_stage(tag);
++    };
+ 
+     if (config->parsac_flag()) {
+-        if (judge_track_status()) {
++        const bool port_judge = judge_track_status();
++        port_stage(11, port_judge, false, false);   /* 11 JUDGE: u32 ok, [f64 m_th], [window] */
++        if (port_judge) {
+             update_track_status();
++            port_stage(12, 0, false, true);          /* 12 UPDATE: [window], [ft] */
+         }
+     }
+ 
+     localize_newframe();
++    port_stage(13, 0, false, false);                 /* 13 LOCALIZE */
+ 
+     if (manage_keyframe()) {
++        port_stage(14, 1, false, false);             /* 14 MANAGE: u32 keyframe */
+         track_landmark();
++        port_stage(15, 0, false, false);             /* 15 LANDMARK */
+         refine_window();
++        port_stage(16, 0, true, false);              /* 16 REFINE: [window], [marg] */
+         slide_window();
++        port_stage(17, 0, true, false);              /* 17 SLIDE: [window], [marg] */
+     } else {
++        port_stage(14, 0, false, false);
+         refine_subwindow();
++        port_stage(18, 0, false, false);             /* 18 SUBWINDOW */
+     }
+ 
+     return true;
+@@ -522,7 +693,9 @@
+ 
+     matrix<3> E =
+         find_essential_matrix_parsac(pts1, pts2, mask, m_th / frame_i->K(0, 0));
+-
++    if (g_port_swt.get()) {   /* 6 ESS: u64 npts, u64 n, n mask bytes */
++        PortBuf b; b.u64(pts1.size()); b.u64(mask.size()); b.raw(mask.data(), mask.size()); b.write(6);
++    }
+     return true;
+ }
+ 
+@@ -597,7 +770,9 @@
+     matrix<4> T_IMU =
+         find_pnp_matrix_parsac_imu(m_P3D, m_P2D, m_lens, Rcw, tcw, 0.20, 1.0,
+                                    mask, 1.0 / curr_frame->K(0, 0));
+-
++    if (g_port_swt.get()) {   /* 5 PNP: u64 npts, u64 n, n mask bytes */
++        PortBuf b; b.u64(m_P2D.size()); b.u64(mask.size()); b.raw(mask.data(), mask.size()); b.write(5);
++    }
+     matrix<3> R;
+     vector<3> t;
+     predict_RT(keyframe, curr_frame, R, t);

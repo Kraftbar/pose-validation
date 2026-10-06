@@ -23,17 +23,19 @@ void rd_frame_set_pose(rd_frame* f, const ok_quat* sensor_q, const double sensor
     rd_quat_rotate(&f->pose_q, sensor_p, r);
     f->pose_p[0] = p[0] - r[0]; f->pose_p[1] = p[1] - r[1]; f->pose_p[2] = p[2] - r[2];
 }
-static void cam_pose(const rd_frame* f, ok_quat* q, double p[3]) { rd_frame_get_pose(&f->pose_q, f->pose_p, &f->cam_q, f->cam_p, q, p); }
+void rd_sys_cam_pose(const rd_frame* f, ok_quat* q, double p[3]) { rd_frame_get_pose(&f->pose_q, f->pose_p, &f->cam_q, f->cam_p, q, p); }
 static void imu_pose(const rd_frame* f, ok_quat* q, double p[3]) { rd_frame_get_pose(&f->pose_q, f->pose_p, &f->imu_q, f->imu_p, q, p); }
 static void obs_of(const rd_frame* f, size_t kp, rd_obs* o) {
     o->pose_q = f->pose_q; memcpy(o->pose_p, f->pose_p, sizeof o->pose_p);
     o->cam_q = f->cam_q; memcpy(o->cam_p, f->cam_p, sizeof o->cam_p);
     memcpy(o->keypoint, f->bearing + 3 * kp, sizeof o->keypoint);
 }
+/* Track::get_landmark_point (first keypoint) */
+void rd_sys_get_landmark_point(const rd_track* t, double p[3]) { rd_obs o; obs_of(t->ref[0].frame, t->ref[0].kp, &o); rd_track_get_landmark_point(&o, t->inv_depth, p); }
 /* Track::set_landmark_point (first keypoint) */
-static void set_landmark_point(rd_track* t, const double p[3]) { rd_obs o; obs_of(t->ref[0].frame, t->ref[0].kp, &o); t->inv_depth = rd_track_set_landmark_point(&o, p); }
+void rd_sys_set_landmark_point(rd_track* t, const double p[3]) { rd_obs o; obs_of(t->ref[0].frame, t->ref[0].kp, &o); t->inv_depth = rd_track_set_landmark_point(&o, p); }
 /* Track::triangulate: observations in keypoint_map order; sets m_life = 1 when valid */
-static int track_triangulate(rd_track* t, double p[3]) {
+int rd_sys_track_triangulate(rd_track* t, double p[3]) {
     rd_obs* o = (rd_obs*)malloc(sizeof(rd_obs) * (t->nref ? t->nref : 1));
     size_t i;
     int ok;
@@ -183,7 +185,7 @@ static int init_sfm(rd_init* in) {
             rd_track* t;
             if (st[best][k] == 0) continue;
             t = fi->track[mi[k]];
-            set_landmark_point(t, pts[best] + 3 * k);
+            rd_sys_set_landmark_point(t, pts[best] + 3 * k);
             set_tag(&t->tags, RD_TT_VALID, 1); set_tag(&t->tags, RD_TT_TRIANGULATED, 1);
         }
     }
@@ -193,7 +195,7 @@ static int init_sfm(rd_init* in) {
         rd_frame* f0 = rd_map_get_frame(m, 0);
         rd_solver* s;
         ok_quat q; double p[3];
-        cam_pose(a, &q, p);
+        rd_sys_cam_pose(a, &q, p);
         rd_frame_set_pose(b, &b->cam_q, b->cam_p, &q, p);
         s = rd_solver_create((int)in->cfg->solver_iteration_limit);
         rd_solver_add_frame_states(s, b, 1);
@@ -210,7 +212,7 @@ static int init_sfm(rd_init* in) {
         rd_track* t = rd_map_get_track(m, i);
         double p[3];
         if (HAS(t, RD_TT_VALID)) continue;
-        if (track_triangulate(t, p)) { set_landmark_point(t, p); set_tag(&t->tags, RD_TT_VALID, 1); set_tag(&t->tags, RD_TT_TRIANGULATED, 1); }
+        if (rd_sys_track_triangulate(t, p)) { rd_sys_set_landmark_point(t, p); set_tag(&t->tags, RD_TT_VALID, 1); set_tag(&t->tags, RD_TT_TRIANGULATED, 1); }
     }
     {   /* [3.1] bundle adjustment */
         rd_solver* s = rd_solver_create((int)in->cfg->solver_iteration_limit);
@@ -305,7 +307,7 @@ static void solve_gravity_scale_velocity(rd_init* in) {
         ok_quat cqi, cqj; double cpi[3], cpj[3], r1[3], r2[3], r3[3];
         const double s0 = -0.5 * d->t * d->t, s1 = -d->t;
         i = j - 1;
-        cam_pose(fi, &cqi, cpi); cam_pose(fj, &cqj, cpj);
+        rd_sys_cam_pose(fi, &cqi, cpi); rd_sys_cam_pose(fj, &cqj, cpj);
         for (r = 0; r < 3; ++r) for (c = 0; c < 3; ++c) {
             const double id = r == c ? 1.0 : 0.0;
             AT(A, rows, i * 6 + r, c) = s0 * id;                     /* -0.5 dt dt * I (off-diagonal -0.0) */
@@ -351,7 +353,7 @@ static void refine_scale_velocity_via_gravity(rd_init* in) {
         ok_quat cqi, cqj; double cpi[3], cpj[3], r1[3], r2[3], r3[3];
         const double s0 = -0.5 * d->t * d->t, s1 = -d->t, s2 = 0.5 * d->t * d->t;
         i = j - 1;
-        cam_pose(fi, &cqi, cpi); cam_pose(fj, &cqj, cpj);
+        rd_sys_cam_pose(fi, &cqi, cpi); rd_sys_cam_pose(fj, &cqj, cpj);
         for (r = 0; r < 3; ++r) {
             for (c = 0; c < 2; ++c) { AT(A, rows, i * 6 + r, c) = s0 * Tg[r + 3 * c]; AT(A, rows, i * 6 + 3 + r, c) = s1 * Tg[r + 3 * c]; }
             AT(A, rows, i * 6 + r, 2) = cpj[r] - cpi[r];
@@ -402,8 +404,8 @@ static int apply_init(rd_init* in) {
     for (i = 0; i < rd_map_track_num(in->map); ++i) {
         rd_track* t = rd_map_get_track(in->map, i);
         double p[3];
-        if (track_triangulate(t, p)) {
-            set_landmark_point(t, p);
+        if (rd_sys_track_triangulate(t, p)) {
+            rd_sys_set_landmark_point(t, p);
             set_tag(&t->tags, RD_TT_VALID, 1); set_tag(&t->tags, RD_TT_TRIANGULATED, 1);
             final_point_num++;
         } else {

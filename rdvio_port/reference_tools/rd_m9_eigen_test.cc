@@ -1,6 +1,7 @@
 // RD-VIO M9 Eigen oracle test (reference tooling): the REAL Eigen 3.4.0 (external/vio/deps, -O2 -DNDEBUG -ffp-contract=off
 // -fno-fast-math) against the C models of rdvio_port/c: FullPivHouseholderQR<MatrixXd>::solve (rd_qr_fullpiv_solve),
-// JacobiSVD<Matrix3d>(FullU|FullV)::solve (rd_svd3_solve), Quaternion::FromTwoVectors (rd_quat_from_two_vectors).
+// JacobiSVD<Matrix3d>(FullU|FullV)::solve (rd_svd3_solve), Quaternion::FromTwoVectors (rd_quat_from_two_vectors),
+// Matrix4d::inverse (rd_m4_inverse), the sliding-window tracker's predict_RT / F / epipolar distance expressions.
 // Tolerance 0 (memcmp). usage: rd_m9_eigen_test [seed] [count]. Last line "m9eigen: <mismatches>/<compared>".
 #include <Eigen/Dense>
 #include <cstdio>
@@ -10,12 +11,14 @@
 extern "C" {
 #include "../c/rd_qr.h"
 #include "../c/rd_sys_eigen.h"
+#include "../c/rd_lie.h"
+#include "../../okvis_port/c/ok_eigen.h"
 }
 static std::mt19937_64 rng;
 static double U(double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); }
 static double N() { return std::normal_distribution<double>(0, 1)(rng); }
 static int I(int a, int b) { return std::uniform_int_distribution<int>(a, b)(rng); }
-static long bad = 0, tot = 0, bad_qr = 0, bad_svd = 0, bad_q = 0;
+static long bad = 0, tot = 0, bad_qr = 0, bad_svd = 0, bad_q = 0, bad_inv = 0, bad_rt = 0, bad_f = 0, bad_epi = 0;
 static void cmp(const double *a, const double *b, int n, long &cat, const char *what, long idx) {
     for (int i = 0; i < n; ++i) {
         tot++;
@@ -90,6 +93,68 @@ int main(int argc, char **argv) {
             cmp(xe.data(), xc.data(), 3, bad_svd, "svd3", c);
             nsvd++;
         }
+        /* ---- Matrix4d::inverse (predict_RT: rigid transforms, plus general matrices) ---- */
+        {
+            Eigen::Matrix4d M;
+            if (I(0, 1)) {
+                M.setIdentity();
+                Eigen::Quaterniond q(N(), N(), N(), N()); q.normalize();
+                M.block<3, 3>(0, 0) = q.toRotationMatrix();
+                M.block<3, 1>(0, 3) = Eigen::Vector3d(N(), N(), N());
+            } else for (int i = 0; i < 16; ++i) M(i) = N() * std::pow(10.0, I(-2, 2));
+            Eigen::Matrix4d ie = M.inverse(), ic;
+            rd_m4_inverse(M.data(), ic.data());
+            cmp(ie.data(), ic.data(), 16, bad_inv, "inverse4", c);
+        }
+        /* ---- predict_RT (sliding_window_tracker.cpp) ---- */
+        {
+            Eigen::Quaterniond q[4];
+            Eigen::Vector3d p[4];
+            for (int k = 0; k < 4; ++k) { q[k] = Eigen::Quaterniond(N(), N(), N(), N()); q[k].normalize(); p[k] = Eigen::Vector3d(N(), N(), N()); }
+            Eigen::Matrix4d Pwc = Eigen::Matrix4d::Identity(), PwI = Eigen::Matrix4d::Identity(), Pwi = Eigen::Matrix4d::Identity(), Pwj = Eigen::Matrix4d::Identity();
+            Pwc.block<3, 3>(0, 0) = q[0].toRotationMatrix(); Pwc.block<3, 1>(0, 3) = p[0];
+            PwI.block<3, 3>(0, 0) = q[1].toRotationMatrix(); PwI.block<3, 1>(0, 3) = p[1];
+            Pwi.block<3, 3>(0, 0) = q[2].toRotationMatrix(); Pwi.block<3, 1>(0, 3) = p[2];
+            Pwj.block<3, 3>(0, 0) = q[3].toRotationMatrix(); Pwj.block<3, 1>(0, 3) = p[3];
+            Eigen::Matrix4d Pji = Pwj.inverse() * Pwi;
+            Eigen::Matrix4d P = (Pwc.inverse() * PwI * Pji * PwI.inverse() * Pwc);
+            double M[4][16], inv[16], a[16], b[16];
+            Eigen::Matrix4d *src[4] = {&Pwc, &PwI, &Pwi, &Pwj};
+            for (int k = 0; k < 4; ++k) std::memcpy(M[k], src[k]->data(), sizeof M[k]);
+            rd_m4_inverse(M[3], inv); rd_m4_mul(inv, M[2], b);                 /* Pji */
+            rd_m4_inverse(M[0], inv); rd_m4_mul(inv, M[1], a);                 /* Pwc^-1 PwI */
+            rd_m4_mul(a, b, a);
+            rd_m4_inverse(M[1], inv); rd_m4_mul(a, inv, a);
+            rd_m4_mul(a, M[0], a);
+            cmp(P.data(), a, 16, bad_rt, "predict_RT", c);
+        }
+        /* ---- F = K^T^-1 E K^-1 (E = [t]x R) and the epipolar distance ---- */
+        {
+            Eigen::Matrix3d K = Eigen::Matrix3d::Identity(), K2 = Eigen::Matrix3d::Identity(), R, tx = Eigen::Matrix3d::Zero();
+            if (I(0, 2)) { K(0, 0) = U(300, 600); K(1, 1) = U(300, 600); K(0, 2) = U(200, 400); K(1, 2) = U(200, 300); K2 = K; }
+            else { for (int i = 0; i < 9; ++i) { K(i) = N(); K2(i) = N(); } }
+            Eigen::Quaterniond q(N(), N(), N(), N()); q.normalize();
+            R = q.toRotationMatrix();
+            Eigen::Vector3d t(N(), N(), N());
+            tx(0, 1) = -t(2); tx(0, 2) = t(1); tx(1, 0) = t(2); tx(1, 2) = -t(0); tx(2, 0) = -t(1); tx(2, 1) = t(0);
+            Eigen::Matrix3d E = tx * R;
+            Eigen::Matrix3d F = K2.transpose().inverse() * E * K.inverse();
+            double Ec[9], Kti[9], Ki[9], Fc[9];
+            ok_m3_mul(tx.data(), R.data(), Ec);
+            rd_inverse3_t(K2.data(), Kti); rd_inverse3(K.data(), Ki);
+            rd_m3_mul_tinv(Kti, Ec, Fc); ok_m3_mul(Fc, Ki, Fc);
+            cmp(F.data(), Fc, 9, bad_f, "F", c);
+            for (int k = 0; k < 4; ++k) {
+                Eigen::Vector2d p1(U(0, 752), U(0, 480)), p2(U(0, 752), U(0, 480));
+                Eigen::Vector3d l = F * p1.homogeneous();
+                double de = std::abs(p2.homogeneous().transpose() * l) / l.segment<2>(0).norm();
+                Eigen::Matrix3d Ft = F.transpose();
+                Eigen::Vector3d l2 = Ft * p2.homogeneous();
+                double de2 = std::abs(p1.homogeneous().transpose() * l2) / l2.segment<2>(0).norm();
+                double dc = rd_epipolar_dist(F.data(), p1.data(), p2.data()), dc2 = rd_epipolar_dist(Ft.data(), p2.data(), p1.data());
+                cmp(&de, &dc, 1, bad_epi, "epipolar", c); cmp(&de2, &dc2, 1, bad_epi, "epipolar_t", c);
+            }
+        }
         /* ---- FromTwoVectors ---- */
         {
             Eigen::Vector3d a(N(), N(), N() + (I(0, 1) ? 0 : 9.8)), g(0, 0, -9.80665);
@@ -106,6 +171,8 @@ int main(int argc, char **argv) {
     std::printf("  fullpiv QR solve: %ld cases, %ld mismatching values\n", nqr, bad_qr);
     std::printf("  svd3 solve: %ld cases, %ld mismatching values\n", nsvd, bad_svd);
     std::printf("  FromTwoVectors: %ld cases, %ld mismatching values\n", nq, bad_q);
+    std::printf("  Matrix4d::inverse: %ld cases, %ld mismatching values\n", count, bad_inv);
+    std::printf("  predict_RT: %ld cases, %ld mismatching values; F: %ld mismatching; epipolar distance: %ld mismatching\n", count, bad_rt, bad_f, bad_epi);
     std::printf("m9eigen: %ld/%ld\n", bad, tot);
     return bad == 0 && tot > 0 ? 0 : 1;
 }

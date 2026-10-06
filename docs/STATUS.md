@@ -71,7 +71,9 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 3. **RD-VIO:**
    - M7 (OpenCV CLAHE / LK / GFTT): **done 2026-10-06**. Codex wrote it and Claude verified it: 70 fixture cases and a full MH_01 stream of 12.15 G bytes, 0 mismatches. The bit-exactness holds for this machine's OpenCV CPU dispatch.
    - M6 map layer: **done 2026-10-06**, 38.5 M events of MH_01 replayed bit-exact (patch 0009 map log).
-   - Next: M8 frontend, M9 initializer, M10 tracker and M11 handler.
+   - M9 initializer: **done 2026-10-06** (5cb3df0); the one MH_01 initialization replays bit-exact.
+   - M10 sliding-window tracker (`track()`): **done 2026-10-06**. 776 logged calls of MH_01 replay bit-exact stage by stage (patch 0012), with the PARSAC masks taken from the log.
+   - Next: M8 frontend and M11 handler, then the whole C system checked in lock-step against the reference logs and trajectory. EPnP and undistortion are reserved for Codex.
 4. **Phone stack:**
    - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
    - Indoor-2 live error is still twice the final error.

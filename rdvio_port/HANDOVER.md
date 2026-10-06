@@ -30,7 +30,55 @@ reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOV
   - Sensitivity: the gyro-bias normal equations as a tree give 2 mismatching records; the triangulation depth limit 100 -> 20 gives 3.
   - Coverage is one successful initialization: other sequences would add more.
 
-## M8, M10, M11 (the C system) IN PROGRESS (2026-10-06, Claude): plan and state
+## M10 (SlidingWindowTracker::track) DONE, bit-exact (2026-10-06, Claude)
+
+- C: `c/rd_sys_swt.{h,c}`: `SlidingWindowTracker` on the C map.
+  - Functions: create (constructor), mirror_frame, track, latest_state.
+  - `rd_swt_marginalize` is the `rd_map_hooks.marginalize` of the keyframe map. It rebuilds what `marginalize(index)` reads:
+    the frames with their keyframe preintegration, and the valid tracks of the victim frame whose first frame is a keyframe
+    (observations in map order).
+  - judge_track_status / update_track_status:
+    - the two PARSAC estimators are hooks (`pnp_mask`, `ess_mask`) and only their masks are used;
+    - the `kj == 0` / `j == 0` skips of `if (size_t kj = ...)` are kept;
+    - the window-start arithmetic is size_t, as in the C++;
+    - refine_subwindow keeps the upstream index mix-up `frame->reprojection_error_factors[k]` (the keyframe's factor at the
+      subframe's keypoint index).
+  - Shared helpers (`rd_sys_cam_pose`, `rd_sys_get/set_landmark_point`, `rd_sys_track_triangulate`) moved public in
+    `rd_sys_init.c`.
+- Eigen (in `c/rd_sys_eigen.c`, oracle in `rd_m9_eigen_test.cc`, 0 mismatches for seeds 1-3):
+  - `Matrix4d::inverse` is a lane-by-lane transcription of `compute_inverse_size4` (SSE2).
+  - `Matrix4d * Matrix4d` folds every entry left to right.
+  - `M.transpose().inverse()` computes its determinant with the unvectorized tree.
+  - New measured rule: `M.transpose().inverse() * B` folds ALL THREE rows left to right. Plain `A * B` keeps row 2 as
+    a0 + (a1 + a2); using that rule gives 18,444 mismatches.
+  - `compute_epipolar_dist`: the homogeneous product is (F00 x + F01 y) + F02, the inner product is (x l0 + y l1) + 1 l2.
+- Reference: patch `0012-m10-tracker-log.patch` (observe-only; `RDVIO_PORT_SWT_DIR`, `swt.bin`; layouts in `c/check_rd_swt.c`).
+  - Per logged `track()` it writes the full window, the marginalization factor and the feature-tracking frame's track /
+    TT_STATIC flags.
+  - It also writes the PnP / essential masks, and a hash (FNV-1a 64) of the state after each of the 8 stages. The full
+    payloads are added with `RDVIO_PORT_SWT_FULL=1`.
+  - `RDVIO_PORT_SWT_ALL=n` logs the first n calls, then every `RDVIO_PORT_SWT_EVERY`-th. Logging everything costs about
+    3.3 MB per call (12 GB for MH_01); do not.
+  - Run: `RDVIO_CV_GRAY=<gray pack> RDVIO_PORT_SWT_DIR=runs/rdvio_port/m10/MH_01_easy/dump RDVIO_PORT_SWT_ALL=300
+    RDVIO_PORT_SWT_EVERY=7 python3 tools/run_rdvio_reference.py MH_01_easy --tag m10 --stock-binary
+    runs/rdvio_port/m10_reference_build/build/rdvio_ref_driver`. This takes 2.2 min and writes 1.65 GB; the trajectory sha256
+    is canonical.
+- Harness: `c/check_rd_swt.c`, runner `--modules m10 [--sanitize]` (`--tag10`).
+  - Every IN is rebuilt: the keyframe map with subframes and tracks, the factor, and a one-frame feature-tracking map. It runs
+    with the logged masks and every stage is compared.
+  - MH_01: 776 calls (134 keyframe, 642 subwindow, 97 PARSAC updates), `swt: 0/19,576,041`, ASan/UBSan clean, 18 s.
+  - Sensitivity: each mutant below is caught at its own stage:
+    - rpe limit 3.0 -> 2.9: 121 REFINE;
+    - F with the row-2 tree: 54 JUDGE;
+    - no kj == 0 skip: 97 ESS;
+    - no TT_STATIC propagation to the FT track: 94 UPDATE;
+    - merge from 10 subframes: 8 SUBWINDOW;
+    - reversed subframe IMU order: 134 REFINE;
+    - reference observation kept in marginalize: 128 SLIDE.
+  - Not observable on MH_01: `0.8 * matches` -> 0.79 (only one keyframe is checked, so the counts are 0 / 1).
+- Not covered here: mirror_frame, the constructor and latest_state. The system harness will cover them.
+
+## M8, M11 (the C system) IN PROGRESS (2026-10-06, Claude): plan and state
 
 Written, compiled, not yet validated (no system harness yet):
 - `c/rd_map.{h,c}`: `rd_frame` carries the system state of `rdvio::Frame`: `t`, a shared refcounted `rd_image`, `sqrt_inv_cov`,
@@ -48,10 +96,8 @@ Still to do:
 1. [written, `c/rd_sys_image.{h,c}`, validated only with the system] The `rd_image` implementation on `rd_cv_*`: preprocess = CLAHE +
    pyramid, detect_keypoints (static GFTT, response sort, Poisson filter, 20 px border), track_keypoints (forward / backward LK,
    rd_cv_track_status), release_image_buffer.
-2. [DONE for the initializer, see M9] The tracker still needs `Matrix4d::inverse()` (`predict_RT`, IMU-PARSAC).
-3. [M9 DONE] M10 `SlidingWindowTracker`
-   (mirror_frame, localize_newframe, manage_keyframe, track_landmark, refine_window, slide_window, refine_subwindow, the
-   IMU-PARSAC status logic: needs Codex's EPnP), M8 `FeatureTracker` + `Frontend` (run, synchronize_keymap, mirror_map /
+2. [DONE, see M10] `Matrix4d::inverse()` (`predict_RT`).
+3. [M9, M10 DONE; the PARSAC estimators wait for Codex's EPnP: until then the masks come from a log] M8 `FeatureTracker` + `Frontend` (run, synchronize_keymap, mirror_map /
    mirror_lastframe / attach_latest_frame, the state machine), M11 `Handler` (gyro / accelerometer pairing,
    propagate_state, predict_pose) + the driver (TUM output of `get_latest_state` with %.17g).
 4. `check_rd_system`: the C system from the undistorted images (until Codex's remap port: a gray pack of the driver's remapped

@@ -37,5 +37,11 @@ rd_map* rd_init_take_map(rd_init* in);
 
 /* Frame::set_pose(sensor, pose): pose.q = q * sensor.q_cs^*, pose.p = p - pose.q * sensor.p_cs */
 void rd_frame_set_pose(rd_frame* f, const ok_quat* sensor_q, const double sensor_p[3], const ok_quat* q, const double p[3]);
+/* shared with module M10: Frame::get_pose(camera); Track::get_landmark_point / set_landmark_point (first keypoint);
+ * Track::triangulate (observations in keypoint_map order; m_life = 1 when valid; returns 0 for std::nullopt) */
+void rd_sys_cam_pose(const rd_frame* f, ok_quat* q, double p[3]);
+void rd_sys_get_landmark_point(const rd_track* t, double p[3]);
+void rd_sys_set_landmark_point(rd_track* t, const double p[3]);
+int rd_sys_track_triangulate(rd_track* t, double p[3]);
 
 #endif
