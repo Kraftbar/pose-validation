@@ -4,7 +4,7 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
-## RD-VIO is pure C99 end to end, byte-identical to the reference (2026-10-06, Claude)
+## RD-VIO is pure C99 end to end, byte-identical to the reference on all 11 EuRoC sequences (2026-10-06, Claude)
 
 `c/rdvio_c_euroc.c` runs without OpenCV or Eigen at runtime:
 - EuRoC PNGs: `okvis_port/c/ok_png.c`, bit-exact with cv::imread;
@@ -23,12 +23,10 @@ It writes the reference trajectory byte for byte.
   - (b) the undistorted pack with the OpenCV EPnP shim.
   All three must equal the reference `traj.tum`.
 - Pure C (c) results:
-  - MH_01, MH_03, V1_01, V1_02, V2_02 and V2_03: IDENTICAL.
+  - All 11 EuRoC sequences: IDENTICAL (table in the next section, same sha256 values).
   - MH_01 under ASan/UBSan with leak detection: 0 reports.
   - The PNG path: the first 14 s of MH_01 (the 300 PNGs on disk): 231 poses equal to the head of the reference trajectory.
 - Variants (a) / (b): IDENTICAL on all 11 EuRoC sequences (table in the next section).
-- The other 5 sequences were checked before M7b existed, so they ran (a) / (b) only. Their packs were deleted; re-fetch
-  them to run (c).
 - Claude re-ran Codex's leaf checks with a fresh oracle (`--modules m7b --oracle`): 0 / 1,577,965,197 bytes differ.
 - Known limits:
   - bit-exactness is tied to this machine's OpenCV dispatch (AVX2/FMA radtan maps), see `reference_cv/README_M7b.md`;

@@ -74,7 +74,7 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
    - M9 initializer: **done 2026-10-06** (5cb3df0); the one MH_01 initialization replays bit-exact.
    - M10 sliding-window tracker (`track()`): **done 2026-10-06**. 776 logged calls of MH_01 replay bit-exact stage by stage (patch 0012), with the PARSAC masks taken from the log.
    - M8 + M11, the whole C system: **done 2026-10-06**. `rdvio_c_euroc` writes the reference trajectory byte for byte on all 11 EuRoC sequences. Run it with `tools/check_rdvio_port.py --modules sys`.
-   - M7b (Codex, verified by Claude): the undistortion and EPnP in C. **RD-VIO is now pure C99 end to end**, from the EuRoC PNGs to a byte-identical trajectory; see the top of `rdvio_port/HANDOVER.md`.
+   - M7b (Codex, verified by Claude): the undistortion and EPnP in C. **RD-VIO is now pure C99 end to end**, from the EuRoC PNGs to a byte-identical trajectory on all 11 EuRoC sequences; see the top of `rdvio_port/HANDOVER.md`.
 4. **Phone stack:**
    - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
    - Indoor-2 live error is still twice the final error.
