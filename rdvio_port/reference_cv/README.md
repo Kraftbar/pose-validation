@@ -1,5 +1,8 @@
 # RD-VIO M7 image leaf — 2026-10-06
 
+The additional undistortion/remap and EPnP/Rodrigues leaf is documented in
+[README_M7b.md](README_M7b.md), including its separate fixtures and system check.
+
 Dependency-free C99 specialization of the OpenCV image functions called by
 RD-VIO (`Jianxff/rd_vio` at `099f5e886ebb9d33ccf0e4b17af7c48c57da69b4`).
 The oracle is the installed **OpenCV 4.6.0** in `external/vio/deps/opencv`.

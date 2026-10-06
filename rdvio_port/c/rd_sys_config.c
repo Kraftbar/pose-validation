@@ -98,6 +98,10 @@ int rd_cfg_load(const char* slam_yaml, const char* device_yaml, rd_cfg* c, char*
     c->K[0] = v[0]; c->K[4] = v[1]; c->K[6] = v[2]; c->K[7] = v[3]; c->K[8] = 1.0;   /* setIdentity, then (0,0) (1,1) (0,2) (1,2) */
     get_v(&r, dev, "cam0.distortion", c->distortion, 4, 1);
     get_z(&r, dev, "cam0.camera_distortion_flag", &c->camera_distortion_flag, 1);
+    {   /* read by the driver, not by rdvio::Config */
+        const char* m = rd_yaml_scalar(rd_yaml_find(dev, "cam0.distortion_model"));
+        c->distortion_equidistant = m && !strcmp(m, "equidistant");
+    }
     get_d(&r, dev, "cam0.time_offset", &c->camera_time_offset, 1);
     { double res[2] = {0, 0}; get_v(&r, dev, "cam0.resolution", res, 2, 1); c->resolution[0] = (int)res[0]; c->resolution[1] = (int)res[1]; }
     get_q(&r, dev, "cam0.extrinsic.q_bc", &c->q_bc, 1);

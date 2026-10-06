@@ -15,6 +15,7 @@ typedef struct rd_cfg {
     double K[9];                               /* camera_intrinsic, column-major */
     double distortion[4];
     size_t camera_distortion_flag;
+    int distortion_equidistant;                /* cam0.distortion_model == "equidistant" (the driver's undistortion; default radtan) */
     double camera_time_offset;
     ok_quat q_bc; double p_bc[3];              /* camera_to_body */
     ok_quat q_bi; double p_bi[3];              /* imu_to_body */

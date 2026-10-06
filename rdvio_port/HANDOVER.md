@@ -4,6 +4,54 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
+## RD-VIO is pure C99 end to end, byte-identical to the reference (2026-10-06, Claude)
+
+`c/rdvio_c_euroc.c` runs without OpenCV or Eigen at runtime:
+- EuRoC PNGs: `okvis_port/c/ok_png.c`, bit-exact with cv::imread;
+- the undistortion: `rd_cv_undist`, Codex's M7b, verified by Claude;
+- EPnP: `rd_cv_pnp6`, also from M7b;
+- everything else: modules M1-M11.
+
+It writes the reference trajectory byte for byte.
+- Run: `rdvio_c_euroc sensor.yaml setting.yaml <mav0> out.tum`.
+  - It reads `<mav0>/cam0/data/*.png`, or `--png-dir <dir>`.
+  - `--gray <raw pack>` reads cv::imread output instead.
+  - `--undistorted` / `--masks` are only diagnostics.
+- Check: `python3 tools/check_rdvio_port.py --modules sys --seq <seq> --gray <raw pack>`. It runs three variants:
+  - (c) pure C from the raw pack;
+  - (a) the undistorted pack with the logged PnP masks;
+  - (b) the undistorted pack with the OpenCV EPnP shim.
+  All three must equal the reference `traj.tum`.
+- Pure C (c) results:
+  - MH_01, MH_03, V1_01, V1_02, V2_02 and V2_03: IDENTICAL.
+  - MH_01 under ASan/UBSan with leak detection: 0 reports.
+  - The PNG path: the first 14 s of MH_01 (the 300 PNGs on disk): 231 poses equal to the head of the reference trajectory.
+- Variants (a) / (b): IDENTICAL on all 11 EuRoC sequences (table in the next section).
+- The other 5 sequences were checked before M7b existed, so they ran (a) / (b) only. Their packs were deleted; re-fetch
+  them to run (c).
+- Claude re-ran Codex's leaf checks with a fresh oracle (`--modules m7b --oracle`): 0 / 1,577,965,197 bytes differ.
+- Known limits:
+  - bit-exactness is tied to this machine's OpenCV dispatch (AVX2/FMA radtan maps), see `reference_cv/README_M7b.md`;
+  - real calls exercised only the 6-point EPnP.
+
+## M7b (Codex): undistortion + EPnP DONE (2026-10-06)
+
+`rd_cv_undist.{h,c}` builds both driver map types and remaps grayscale;
+`rd_cv_pnp{,_math}.{h,c}` exposes `rd_cv_pnp6` with the requested callback and
+column-major pose (also `rd_cv_pnp4`). No system/PARSAC source changed.
+Normal and ASan+UBSan: 104 map/remap cases / 172,281,705 bytes; 3,682 pack
+frames / 1,329,084,196 bytes; 18,000 synthetic EPnP cases / 60,336,000 bytes;
+127,057 real 6-point calls / 16,263,296 bytes: **zero mismatches throughout**.
+The native callback in system variant (b) preserves all 3,633 poses / 584,917
+trajectory bytes, sha256 `f0d60a3e03c1243d750da735a5f5da1ec232237a6d84c4e9a35f15747377a0fe`.
+Patch 0010's own reference run preserves that same hash. GDB/disassembly
+confirm AVX2/FMA radtan maps, baseline SSE remap and baseline double Jacobi
+SVD/MulTransposed. `--modules m7b [--oracle] [--sanitize]` is integrated;
+full system check: `python3 -B rdvio_port/reference_cv/check_m7b_system.py`.
+Commands, dispatch comparison, licences, limits and files:
+[reference_cv/README_M7b.md](reference_cv/README_M7b.md). Normal driver wiring
+remains with Claude; the interfaces are ready. No commits by Codex.
+
 ## M8 + M11: the whole C system DONE, trajectory byte-identical on MH_01 (2026-10-06, Claude)
 
 The synchronous system now runs in C end to end: Handler -> FeatureTracker -> Frontend -> Initializer / SlidingWindowTracker.
@@ -57,7 +105,7 @@ Each keeps the process-wide `binConfidences` of the C++.
     Each is compared by sha256 with the reference run's `traj.tum`.
   - MH_01: both IDENTICAL, 3 min 13 s each (the reference takes 1 min 45 s). Both are ASan/UBSan clean; (a) also with
     leak detection.
-  - More sequences (2026-10-06): both variants are IDENTICAL on all seven. The image packs of the last four were deleted
+  - More sequences (2026-10-06): IDENTICAL on all eleven. The image packs of the last four were deleted
     after the check (rebuild them with steps 2 and 3).
 
     | sequence     | poses | first pose | sha256       |
@@ -69,6 +117,10 @@ Each keeps the process-wide `binConfidences` of the C++.
     | MH_05_difficult | 2,191 | 4.10 s  | e3a2c1dd8b5e |
     | V2_01_easy   | 2,185 | 4.78 s     | d7a680388e05 |
     | V1_03_difficult | 2,009 | 7.04 s  | 3cfd30858a17 |
+    | MH_02_easy   | 2,998 | 2.12 s     | d24c487c2aad |
+    | V1_02_medium | 1,616 | 4.70 s     | 16dd2cc08dcb |
+    | V2_02_medium | 2,276 | 3.63 s     | 847a4ef3ab32 |
+    | V2_03_difficult | 1,808 | 5.70 s  | ee1906110e8b |
 
     Per sequence:
     1. Fetch: `VIO_DATA_ROOT=runs/rdvio_port/data python3 tools/vio_harness/fetch_seq_stream.py <seq>`.
@@ -81,7 +133,7 @@ Each keeps the process-wide `binConfidences` of the C++.
 - Next:
   1. M7b (Codex): the C remap replaces the pack, and the C EPnP replaces the shim. After that the system is pure C
      end to end.
-  2. More EuRoC sequences: 7 of 11 done (left: V1_02, V2_02, V2_03, MH_02).
+  2. EuRoC: all 11 sequences done.
   3. Speed. gprof on the first 60 s of MH_01: about 80 % is in the M7 image leaf:
      - rd_cv_lk: 28 %;
      - rd_cv_build_pyramid: 18 %;
@@ -164,7 +216,7 @@ Each keeps the process-wide `binConfidences` of the C++.
   - Not observable on MH_01: `0.8 * matches` -> 0.79 (only one keyframe is checked, so the counts are 0 / 1).
 - Not covered here: mirror_frame, the constructor and latest_state. The system harness will cover them.
 
-## Reserved for Codex (queued 2026-10-06): M7b undistortion (initUndistortRectifyMap + remap) and EPnP (solvePnP + Rodrigues)
+## [historical, done: see M7b above] Reserved for Codex (queued 2026-10-06): M7b undistortion (initUndistortRectifyMap + remap) and EPnP (solvePnP + Rodrigues)
 
 Paths: `rdvio_port/c/rd_cv_undist*`, `rd_cv_pnp*`, `check_rd_cv_undist*`, `check_rd_cv_pnp*`, additions in `rdvio_port/reference_cv/`,
 a new patch `0010-*`. Claude meanwhile works on the system layer (`rd_sys*`, `rd_solver_glue*`, `rd_map*`).
