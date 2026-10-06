@@ -57,14 +57,33 @@ Each keeps the process-wide `binConfidences` of the C++.
     Each is compared by sha256 with the reference run's `traj.tum`.
   - MH_01: both IDENTICAL, 3 min 13 s each (the reference takes 1 min 45 s). Both are ASan/UBSan clean; (a) also with
     leak detection.
+  - More sequences (2026-10-06): both variants are IDENTICAL on all three.
+
+    | sequence     | poses | first pose | sha256       |
+    |--------------|------:|-----------:|--------------|
+    | MH_01_easy   | 3,633 | 2.46 s     | f0d60a3e03c1 |
+    | V1_01_easy   | 2,805 | 5.35 s     | 68215b62b5b4 |
+    | MH_03_medium | 2,644 | 2.84 s     | d2a1b0ba6fb8 |
+
+    Per sequence:
+    1. Fetch: `VIO_DATA_ROOT=runs/rdvio_port/data python3 tools/vio_harness/fetch_seq_stream.py <seq>`.
+    2. Raw pack: `runs/okvis_port/c_build/okvis_png2gray <mav0>/cam0/data runs/rdvio_port/system/<seq>.raw.gray`.
+    3. The masks-mode reference run with `RDVIO_CV_GRAY` set to that pack.
+    4. `check_rdvio_port.py --modules sys --seq <seq> --gray <raw pack>`.
   - Sensitivity: without `--masks` (judge_track_status skipped) the trajectory differs (`69ad74d2...`).
 - Not covered by the trajectory: predict_pose / propagate_state (the driver discards track_*'s return value) and the
   latest_pose bookkeeping of track_camera.
 - Next:
   1. M7b (Codex): the C remap replaces the pack, and the C EPnP replaces the shim. After that the system is pure C
      end to end.
-  2. Other EuRoC sequences.
-  3. Speed.
+  2. More EuRoC sequences (MH_01, V1_01, MH_03 done).
+  3. Speed. gprof on the first 60 s of MH_01: about 80 % is in the M7 image leaf:
+     - rd_cv_lk: 28 %;
+     - rd_cv_build_pyramid: 18 %;
+     - rd_cv_corner_response: 17 %;
+     - rd_cv_clahe: 5 %.
+     These are scalar emulations of OpenCV's SIMD lanes. The Ceres side (ok_gebp, factors, Schur) is under 15 %, so a
+     speed-up job belongs in M7 and needs the M7 stream check as its gate.
 
 ## M9 (Initializer) DONE, bit-exact (2026-10-06, Claude)
 
