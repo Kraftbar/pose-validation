@@ -132,6 +132,8 @@ ok_vg* ok_vg_new(void);
 void ok_vg_free(ok_vg* g);
 uint64_t ok_vg_problem_events(ok_vg* g, const ok_vg_event** ev, int* n);   /* pending events; ok_vg_events_clear() drops them */
 void ok_vg_events_clear(ok_vg* g);
+/* Enabled by default for replay. Standalone drivers may disable the diagnostic queue. */
+void ok_vg_record_events(ok_vg* g, int enabled);
 const ok_problem* ok_vg_problem(const ok_vg* g);
 
 /* configuration */

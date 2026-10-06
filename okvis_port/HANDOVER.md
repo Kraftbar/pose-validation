@@ -1,5 +1,62 @@
 # OKVIS2 pure-C port — handover
 
+## Performance (Codex) 2026-10-06 — DONE, all gates pass
+
+Artifacts and isolated builds: `runs/okvis_port/perf/codex/` (no commits).
+`perf` is unavailable (`perf_event_paranoid=4`); the baseline `-O2 -g -pg`
+600-frame mono profile is `profile/gprof.txt`. Self samples: matching 64.59%,
+map matching 7.82%, vocabulary transform 2.50%; the Hamming byte-at-a-time
+bit loops dominate the first and third. No floating-point expression or
+accumulation order was changed.
+
+Changes:
+- `ok_hamming.h`: exact, alignment-safe 64-bit integer population counts,
+  shared by `ok_frontend.c` and `ok_dbow.c`. No target-specific compiler flags.
+- `ok_system.c`, `ok_vigraph.{c,h}`: disable replay-event accumulation for a
+  system-owned backend; replay recording remains enabled by default. Complete
+  graph teardown, including parameter blocks retained in an ownership vector.
+  Removed blocks keep their addresses until `ok_vg_free`, so the replay
+  harness pointer bijection and live two-pose references remain valid.
+
+600 mono frames, single-threaded, `-O2 -g -ffp-contract=off -fno-fast-math`:
+
+| Version | Wall seconds | Max RSS KiB | Incremental speedup |
+|---|---:|---:|---:|
+| Baseline | 122.96 | 269780 | — |
+| Hamming only | 40.38 | 269856 | 3.05x |
+| Hamming + event queue / teardown | 40.54 | 101644 | 1.00x (timing noise); 62.3% less RSS |
+
+Both CSV files compare byte-for-byte across all three versions. The Hamming
+kernel also passes 65,536 byte-pair patterns and 100,000 unaligned random
+comparisons with the original loop (`check_hamming.c` in the artifact dir).
+
+Full standalone results (3,681 processed frames each, single-threaded):
+
+| Mode | Before wall s | After wall s | Speedup | Before RSS KiB | After RSS KiB |
+|---|---:|---:|---:|---:|---:|
+| Mono | 626.01 | 302.50 | 2.07x | 1242272 | 243724 |
+| Stereo | 1672.07 | 629.92 | 2.65x | 2415376 | 389568 |
+
+All four canonical final/causal SHA256 hashes pass for both before and after
+(`results.json`, `baseline_*/sums.txt`, `after_*/sums.txt`). The native mono
+system replay passes 155,335,661 comparisons, zero mismatches (`quick_system.log`).
+ASan/UBSan with leak detection passes 400 frames (exit 0, no leaks); its only
+diagnostic is the known `ok_vsolve.c:27` zero-length memcpy with a null source.
+The full runner `tools/check_okvis_port.py --tag m8,s8 --native-solve 1 --eigen-tests --data
+external/vio/data/okvis_brisk_tmp` (re-run by Claude after Codex hit its usage limit;
+`runs/okvis_port/perf/claude_full_suite.log`) passes every row with 0 mismatches, exit 0:
+- all 24 m8 / s8 harnesses, including check_ok_system: 155,335,661 (mono) and 300,332,809
+  (stereo) comparisons;
+- the 14 Eigen / okvis oracle tests.
+Claude reviewed the diff: the SWAR popcount, the event queue switched off only for the
+system-owned backend, and the teardown. Blocks are kept until ok_vg_free, so memory grows
+with the blocks ever created; RSS still falls 80-84 % against the old event queue.
+
+Rebuild with `python3 runs/okvis_port/perf/codex/build.py memory`; the build
+adds `ok_png.c` only because the current app links its PNG fallback (all runs
+here use the gray packs). PNG and BRISK sources are untouched.
+
+
 Goal: clean-room, library-free C99 port of OKVIS2 (BSD-3, `external/vio/okvis2`),
 bit-exact against a deterministic single-threaded reference build, same method
 as `stella_port/` (read `stella_port/HANDOVER.md` for method, conventions and
@@ -20,6 +77,11 @@ Codex owns the BRISK keypoint detector + descriptor as used by OKVIS2
 orientation, descriptor bits). Reserved paths: `okvis_port/c/ok_brisk*.{h,c}`,
 `okvis_port/c/check_ok_brisk*.c`, `okvis_port/reference_brisk/**`,
 `runs/okvis_port/reference_brisk/**`. Claude does not touch these.
+
+## Reserved for Codex (2026-10-06): performance
+
+Codex speeds up the C port without changing an output bit: it owns `okvis_port/c/*.{c,h}` (except `ok_brisk*` and `ok_png*`), with results in
+`runs/okvis_port/perf/`. Claude does not edit `okvis_port/c` while it runs.
 
 ## Status
 

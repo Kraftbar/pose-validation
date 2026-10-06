@@ -5,6 +5,7 @@
  * Eigen 3.4.0 (dot / squaredNorm / norm: left fold, normalized(): x / sqrt(L), Matrix3d * Vector3d: ok_m3_mulv). */
 #include "ok_frontend.h"
 #include "ok_place.h"
+#include "ok_hamming.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,11 +129,7 @@ static int is_observed(const ok_fe* f, uint64_t frame, uint32_t cam, uint32_t kp
     k.frame = frame; k.cam = cam; k.kp = kp;
     return ok_vg_obs_find(G0(f), k, &lm, &e, &c);
 }
-static int hamming48(const unsigned char* a, const unsigned char* b) {              /* brisk::Hamming::PopcntofXORed(a, b, 3) */
-    int i, n = 0;
-    for (i = 0; i < 48; ++i) { unsigned v = (unsigned)(a[i] ^ b[i]); while (v) { n += (int)(v & 1u); v >>= 1; } }
-    return n;
-}
+static int hamming48(const unsigned char* a, const unsigned char* b) { return (int)ok_hamming48(a, b); }
 static double cam_f(const ok_cam* c) { return 0.5 * (c->fu + c->fv); }
 
 /* ------------------------------------------------------------------------------------------------------------------

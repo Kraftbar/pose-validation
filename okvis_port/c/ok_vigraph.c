@@ -170,6 +170,7 @@ struct ok_vg {
     ok_problem pb;
     hmap resid;                 /* residual block handle -> rdesc* */
     ok_vg_event* ev; int nev, capev;
+    int discard_events; ok_vg_event ignored_event;
     /* covisibilities */
     int covis_computed;
     uint64_t (*co_ab)[2]; int* co_cnt; int n_co, cap_co;
@@ -178,7 +179,7 @@ struct ok_vg {
     uint64_t* mst_ids; int n_mst_ids; emap mst_idx; int (*mst_edges)[2]; int n_mst_edges;
     /* the initial-fixation PoseError of ViSlamBackend::optimiseRealtimeGraph */
     ok_pose_err* fix_term; uint64_t fix_rb;
-    emap blkq;
+    ok_vg_blk** blocks; int nblocks, capblocks;   /* retain addresses until graph teardown (replay bijection) */
     int solver_type; double ftol;   /* ceres Solver::Options (linear_solver_type, function_tolerance) as ViGraph::optimise logs them */
 };
 
@@ -188,6 +189,7 @@ static void* xcalloc(size_t n) { void* p = calloc(1, n ? n : 1); return p; }
 /* ---- events ---- */
 static ok_vg_event* ev_new(ok_vg* g, int kind) {
     ok_vg_event* e;
+    if (g->discard_events) { memset(&g->ignored_event, 0, sizeof g->ignored_event); return &g->ignored_event; }
     if (g->nev == g->capev) { g->capev = g->capev ? 2 * g->capev : EVCAP_INIT; g->ev = (ok_vg_event*)realloc(g->ev, sizeof(ok_vg_event) * (size_t)g->capev); }
     e = &g->ev[g->nev++];
     memset(e, 0, sizeof *e);
@@ -196,6 +198,10 @@ static ok_vg_event* ev_new(ok_vg* g, int kind) {
 }
 uint64_t ok_vg_problem_events(ok_vg* g, const ok_vg_event** ev, int* n) { *ev = g->ev; *n = g->nev; return 0; }
 void ok_vg_events_clear(ok_vg* g) { g->nev = 0; }
+void ok_vg_record_events(ok_vg* g, int enabled) {
+    g->discard_events = !enabled;
+    if (!enabled) { free(g->ev); g->ev = NULL; g->nev = g->capev = 0; }
+}
 const ok_problem* ok_vg_problem(const ok_vg* g) { return &g->pb; }
 
 /* ---- Problem wrappers ---- */
@@ -253,15 +259,57 @@ ok_vg* ok_vg_new(void) {
     return g;
 }
 
-static ok_vg_blk* blk_new(int size, uint64_t id, ok_time ts) {
+static ok_vg_blk* blk_new(ok_vg* g, int size, uint64_t id, ok_time ts) {
     ok_vg_blk* b = (ok_vg_blk*)xcalloc(sizeof(ok_vg_blk));
+    if (g->nblocks == g->capblocks) {
+        g->capblocks = g->capblocks ? 2 * g->capblocks : 256;
+        g->blocks = (ok_vg_blk**)realloc(g->blocks, sizeof(*g->blocks) * (size_t)g->capblocks);
+    }
+    g->blocks[g->nblocks++] = b;
     b->size = size; b->id = id; b->ts = ts;
     return b;
 }
 
 void ok_vg_free(ok_vg* g) {
-    int i;
+    int i, j;
     if (!g) return;
+    /* Observations have three indexes but one owner; links have two state references. */
+    for (i = 0; i < g->observations.cap; ++i) if (g->observations.a[i].state == 1) {
+        obs* o = (obs*)g->observations.a[i].p;
+        free(o->err); free(o);
+    }
+    for (i = 0; i < g->states.n; ++i) {
+        state* s = (state*)g->states.a[i].p;
+        imulink* links[2] = { s->prev_imu, s->next_imu };
+        for (j = 0; j < 2; ++j) if (links[j] && --links[j]->refs == 0) {
+            ok_imu_error_free(links[j]->e); free(links[j]->e); free(links[j]);
+        }
+        for (j = 0; j < s->tp.n; ++j) {
+            tplink* l = (tplink*)s->tp.a[j].p;
+            if (--l->refs == 0) { ok_twopose_free(l->term); free(l->term); free(l); }
+        }
+        for (j = 0; j < s->tpc.n; ++j) {
+            tpclink* l = (tpclink*)s->tpc.a[j].p;
+            if (--l->refs == 0) free(l);
+        }
+        for (j = 0; j < s->rel.n; ++j) {
+            rlink* l = (rlink*)s->rel.a[j].p;
+            if (--l->refs == 0) free(l);
+        }
+        emap_free(&s->obs); emap_free(&s->tp); emap_free(&s->tpc); emap_free(&s->rel);
+        free(s->pose_prior); free(s->sb_prior); free(s);
+    }
+    for (i = 0; i < g->landmarks.n; ++i) {
+        landmark* l = (landmark*)g->landmarks.a[i].p;
+        emap_free(&l->obs); free(l);
+    }
+    for (i = 0; i < g->anystates.n; ++i) free(g->anystates.a[i].p);
+    /* Removed blocks are retained too: no address is reused while a harness can refer to it. */
+    for (i = 0; i < g->nblocks; ++i) free(g->blocks[i]);
+    free(g->blocks);
+    emap_free(&g->states); emap_free(&g->landmarks); emap_free(&g->anystates); emap_free(&g->mst_idx);
+    free(g->observations.a); free(g->co_ab); free(g->co_cnt); free(g->visible);
+    free(g->mst_ids); free(g->mst_edges); free(g->fix_term);
     for (i = 0; i < g->resid.cap; ++i) if (g->resid.a[i].state == 1) free(g->resid.a[i].p);
     ok_problem_free(&g->pb);
     free(g->ev); free(g->resid.a);
@@ -309,16 +357,16 @@ uint64_t ok_vg_add_states_initialise(ok_vg* g, ok_time t, const ok_imu_meas* mea
     s->id = id; s->ts = t; s->is_kf = 1;
     /* gravity alignment from the mean accelerometer reading, T_WS.oplus(-poseIncrement) */
     ok_imu_init_pose(meas, n, T7);
-    s->pose = blk_new(7, id, t);
+    s->pose = blk_new(g, 7, id, t);
     memcpy(s->pose->x, T7, sizeof T7);
     for (i = 0; i < 9; ++i) sbv[i] = 0.0;
     for (i = 0; i < 3; ++i) { sbv[6 + i] = g->imu.a0[i]; sbv[3 + i] = g->imu.g0[i]; }
-    s->sb = blk_new(9, id, t);
+    s->sb = blk_new(g, 9, id, t);
     memcpy(s->sb->x, sbv, sizeof sbv);
     p_add_param(g, s->pose, 1);
     p_add_param(g, s->sb, 0);
     for (i = 0; i < g->ncam; ++i) {
-        s->extr[i] = blk_new(7, id, t);
+        s->extr[i] = blk_new(g, 7, id, t);
         memcpy(s->extr[i]->x, T_SC[i], sizeof(double) * 7);
         p_add_param(g, s->extr[i], 1);
     }
@@ -363,9 +411,9 @@ uint64_t ok_vg_add_states_propagate(ok_vg* g, ok_time t, const ok_imu_meas* meas
     T7[3] = T.q.x; T7[4] = T.q.y; T7[5] = T.q.z; T7[6] = T.q.w;
     memcpy(sbv, last->sb->x, sizeof sbv);
     ok_imu_propagation(meas, n, &g->imu_p, T7, sbv, last->ts, t, NULL, NULL);
-    s->pose = blk_new(7, id, t); memcpy(s->pose->x, T7, sizeof T7);
+    s->pose = blk_new(g, 7, id, t); memcpy(s->pose->x, T7, sizeof T7);
     p_add_param(g, s->pose, 1);
-    s->sb = blk_new(9, id, t); memcpy(s->sb->x, sbv, sizeof sbv);
+    s->sb = blk_new(g, 9, id, t); memcpy(s->sb->x, sbv, sizeof sbv);
     p_add_param(g, s->sb, 0);
     L = (imulink*)xcalloc(sizeof(imulink));
     L->e = (ok_imu_error*)xcalloc(sizeof(ok_imu_error));
@@ -386,7 +434,7 @@ uint64_t ok_vg_add_states_propagate(ok_vg* g, ok_time t, const ok_imu_meas* meas
 int ok_vg_add_landmark_id(ok_vg* g, uint64_t id, const double hp[4], int initialised) {
     landmark* l = (landmark*)xcalloc(sizeof(landmark));
     l->id = id; l->classification = -1;
-    l->hp = blk_new(4, id, ok_time_make(0, 0)); memcpy(l->hp->x, hp, sizeof(double) * 4); l->hp->initialised = initialised;
+    l->hp = blk_new(g, 4, id, ok_time_make(0, 0)); memcpy(l->hp->x, hp, sizeof(double) * 4); l->hp->initialised = initialised;
     p_add_param(g, l->hp, 2);
     emap_put(&g->landmarks, id, 0, l);
     return 1;

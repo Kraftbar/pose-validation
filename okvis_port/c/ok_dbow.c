@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* OKVIS2 pure-C port, module 7d (part 1): DBoW2 vocabulary / database / query. See ok_dbow.h for the notices. */
 #include "ok_dbow.h"
+#include "ok_hamming.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,11 +55,7 @@ void ok_dbow_voc_free(ok_dbow_voc* v) {
 }
 
 /* brisk::Hamming::PopcntofXORed(a, b, 3) over the 48 bytes, as double (FBrisk::distance) */
-static double distance48(const unsigned char* a, const unsigned char* b) {
-    int i, n = 0;
-    for (i = 0; i < 48; ++i) { unsigned x = (unsigned)(a[i] ^ b[i]); while (x) { n += (int)(x & 1u); x >>= 1; } }
-    return (double)n;
-}
+static double distance48(const unsigned char* a, const unsigned char* b) { return (double)ok_hamming48(a, b); }
 
 /* TemplatedVocabulary::transform(feature, word_id, weight): descend to the nearest child at every level (first minimum) */
 static void transform_one(const ok_dbow_voc* v, const unsigned char* f, uint32_t* word_id, double* weight) {

@@ -111,6 +111,10 @@ ok_sys* ok_sys_new(const ok_cfg* cfg, ok_vsb* b, const ok_fe_est* est, const ok_
     s = (ok_sys*)calloc(1, sizeof *s);
     s->cfg = *cfg;
     if (b) s->b = b; else { ok_vsb_hooks h; memset(&h, 0, sizeof h); h.solve = ok_vsb_solve_native; s->b = ok_vsb_new(&h); s->own_b = 1; }
+    if (s->own_b) {
+        ok_vg_record_events(ok_vsb_graph(s->b, 0), 0);
+        ok_vg_record_events(ok_vsb_graph(s->b, 1), 0);
+    }
     if (est) s->est = *est;
     else {
         s->est.ctx = s->b;
