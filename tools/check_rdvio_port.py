@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the rdvio_port bit-exactness harnesses (tolerance 0, memcmp).
 
-  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5] [--tag m1] [--oracle] [--sanitize]
+  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5,m7] [--tag m1] [--oracle] [--sanitize]
 Per module: compile rdvio_port/c/check_rd_*.c (C99, -ffp-contract=off) together with the port and the okvis_port kernels it reuses,
 replay the dump files of runs/rdvio_port/<tag>/<seq>/dump (reference run with patch 0003) and, with --oracle, the random-input records
 written by the real RD-VIO classes (rdvio_port/reference_tools/rd_imu_oracle.cc, built against the reference build).
@@ -90,12 +90,22 @@ def main():
     ap.add_argument("--steps5", default="4", help="marginalisations per chain for the m5 oracle")
     ap.add_argument("--modules", default="m1,m2,m3,m4,m5")
     a = ap.parse_args()
-    BUILD.mkdir(parents=True, exist_ok=True)
+    if a.static_test or any(m != "m7" for m in a.modules.split(",")):
+        BUILD.mkdir(parents=True, exist_ok=True)
     rc = static_test() if a.static_test else 0
     env = os.environ.copy()
     root = V / "deps/root/usr"
     env["LD_LIBRARY_PATH"] = f"{root}/lib/x86_64-linux-gnu:{root}/lib/x86_64-linux-gnu/openblas-pthread:{V}/deps/opencv/lib:" + env.get("LD_LIBRARY_PATH", "")
     for m in a.modules.split(","):
+        if m == "m7":
+            # M7 is a dependency-free leaf with its own image fixtures/build tree.
+            cmd = [sys.executable, "-B", str(PORT / "reference_cv/run.py")]
+            if not a.oracle:
+                cmd.append("--reuse")
+            if a.sanitize:
+                cmd.append("--sanitize")
+            rc |= run(cmd).returncode
+            continue
         harness, srcs, oracle_src, xflags, xsrcs = MODULES[m]
         exe = BUILD / harness.replace(".c", "")
         flags = ["-std=c99", "-O2", "-ffp-contract=off", "-Wall", "-Wextra", *xflags] + (["-fsanitize=address,undefined", "-g"] if a.sanitize else [])

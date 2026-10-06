@@ -2,13 +2,58 @@
 
 Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact against a deterministic reference, as references and
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
-`rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`. Nothing committed.
+`rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
-## Reserved for Codex: M7 OpenCV image leaf (started 2026-10-05, stopped at the Codex usage limit, resumed 2026-10-06)
+## M7 (Codex) — image leaf done, bit-exact (2026-10-06)
 
-Claude does not touch these paths while Codex works; unreviewed until its report. Files so far: `rdvio_port/c/rd_cv.{h,c}`, `rd_cv_lk.c`, `rd_cv_gftt.c`, `check_rd_cv.c`, `check_rd_cv_stream.c`,
-`rdvio_port/reference_cv/` (dump tools, build/run scripts), `rdvio_port/reference/patches/0008-m7-image-stream.patch`, fixtures in
-`runs/rdvio_port/reference_cv/` (~1 GB). The brief it worked from (scope + validation plan) is summarised in PLAN.md section 4.
+`c/rd_cv.{h,c}`, `rd_cv_lk.c`, `rd_cv_gftt.c`: dependency-free C99 CLAHE (6,
+8×8), padded optical-flow pyramid/Scharr, both initial-flow LK passes, GFTT
+Harris/min-eigen, RD-VIO's second response sort, Point2f norm and image-side
+status checks. Details, API, limits, licensing and commands:
+[`reference_cv/README.md`](reference_cv/README.md).
+
+| Validation | Cases / calls | Compared bytes | Mismatches |
+|---|---:|---:|---:|
+| Real + synthetic fixtures, normal | 70 | 894,791,369 | 0 |
+| Same fixtures, ASan/UBSan | 70 | 894,791,369 | 0 |
+| Full MH_01 actual image operations | 11,042 | 12,150,696,647 | 0 |
+
+18 API checks and 3 negative fixtures pass in both leaf builds. Full stream:
+3,681 preprocess + 3,681 detect + 3,680 forward/reverse track calls, covering
+all image operations the 3,682-frame driver run executes (last frame stays
+queued). Observe-only patch `reference/patches/0008-m7-image-stream.patch`,
+isolated build `runs/rdvio_port/m7_reference_build/`, tag `m7_stream`.
+Trajectory SHA-256 equals canonical exactly:
+`f0d60a3e03c1243d750da735a5f5da1ec232237a6d84c4e9a35f15747377a0fe`.
+The stream excludes 17,772 unspecified failed-point err bytes; fixtures use
+seeded err buffers and compare every byte. Stream ASan/UBSan smoke: 176 calls,
+194,591,160 bytes, 0 mismatches. No leak-check or new ATE claim.
+
+Verified independently by Claude (2026-10-06):
+- `python3 -B tools/check_rdvio_port.py --modules m7`: 70 cases, 894,791,369 bytes, 0 mismatches.
+- A fresh full stream run, `rdvio_port/reference_cv/run_reference.py --tag m7_stream_claude`, reproduced the table:
+  - kind 1: 3,681 calls, 12,067,584,264 bytes, 0 mismatches
+  - kind 2: 3,681 calls, 41,082,272 bytes, 0 mismatches
+  - kind 3: 3,680 calls, 42,030,111 bytes, 0 mismatches
+  - trajectory sha256: `f0d60a3e03c1...`
+- The excluded err bytes are harmless: `rdvio_extra/src/opencv_image.cpp` never reads `cverr` / `reverse_err`; only the status and the points are used.
+- Caveat: the port reproduces the kernels OpenCV dispatches on THIS x86 CPU (SSE LK, AVX2/FMA Sobel via explicit `fmaf`, AVX Harris). Another CPU or an
+  ARM build of OpenCV may dispatch differently, so the bit-exactness is with respect to this reference machine.
+- Next: M6 (map layer), then M8-M11, which wire `rd_cv_*` into a C system as okvis_port module 8 did.
+
+Dispatch settled: LK is compiled-in SSE/four-lane accumulation, no AVX2 LK
+kernel. Sobel uses AVX2/FMA with unfused scalar tails; Harris uses AVX with
+SSE/scalar remainders; box sums are double. The old CPU-disable string's
+underscored SSE names and wildcard were invalid, though AVX/AVX2/FMA were
+disabled. Correctly disabling them changes corner response bytes while LK
+stays exact on the diagnostic pairs. Port targets default reference dispatch.
+
+Recheck: `python3 -B tools/check_rdvio_port.py --modules m7 [--sanitize]`;
+regenerate fixtures with `--oracle`. Compressed artifacts (~0.46 GiB including
+isolated build) remain under owned `runs/` folders. No commits, shared build
+changes, or OKVIS edits. M6/M8 still need to wire this API, M3 Poisson filtering,
+persistent detector limits and the feature object's ownership. Driver-side
+imread/remap and M8 EPnP/Rodrigues remain outside this leaf.
 
 ## State (2026-10-04)
 
@@ -90,7 +135,7 @@ done with the map layer (M6). Sub-second behaviour is deterministic only because
 * (source reading, not measured) The essential-matrix RANSAC in `Frame::track_keypoints` runs with threshold 1.0 on normalised-plane points (squared Sampson-like error <= 7.68): almost every KLT match is an inlier, so the
   frame-to-frame epipolar check is far weaker than the nominal 1 px; the separate rotation RANSAC (angle threshold) decides the `FT_NO_TRANSLATION` flag.
 
-## Next module: M7 (OpenCV CLAHE / LK / GFTT, the largest bit-exactness risk), then M6 (map layer) / M8-M11; the whole sliding-window refinement (IMU + visual + marginalisation factors, Ceres solve, `marginalize`) is native and exact since M5, see the M5 section at the end.
+## [historical, M7 DONE 2026-10-06] Next module: M7 (OpenCV CLAHE / LK / GFTT, the largest bit-exactness risk), then M6 (map layer) / M8-M11; the whole sliding-window refinement (IMU + visual + marginalisation factors, Ceres solve, `marginalize`) is native and exact since M5, see the M5 section at the end.
 
 ## M4 (the Ceres solver: SPARSE_SCHUR + Dogleg) DONE, bit-exact on every dumped Solve() (2026-10-05)
 

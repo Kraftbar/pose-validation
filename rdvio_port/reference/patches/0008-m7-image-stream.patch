@@ -1,0 +1,103 @@
+--- a/src/rdvio_extra/src/opencv_image.cpp
++++ b/src/rdvio_extra/src/opencv_image.cpp
+@@ -1,4 +1,5 @@
+ #include <rdvio/extra/opencv_image.h>
++#include "port_cv_dump.h"
+ #include <rdvio/extra/poisson_disk_filter.h>
+ 
+ using namespace cv;
+@@ -42,12 +43,16 @@
+     std::vector<KeyPoint> cvkeypoints;
+ 
+     gftt(max_points)->detect(image, cvkeypoints);
++    std::vector<KeyPoint> port_cv_unsorted;
++    if (portcv::file()) port_cv_unsorted = cvkeypoints;
++    if (cvkeypoints.empty()) portcv::detect(image, gftt(max_points)->getMaxFeatures(), port_cv_unsorted, cvkeypoints);
+ 
+     if (cvkeypoints.size() > 0) {
+         std::sort(cvkeypoints.begin(), cvkeypoints.end(),
+                   [](const auto &a, const auto &b) {
+                       return a.response > b.response;
+                   });
++        portcv::detect(image, gftt(max_points)->getMaxFeatures(), port_cv_unsorted, cvkeypoints);
+         std::vector<vector<2>> new_keypoints;
+         for (size_t i = 0; i < cvkeypoints.size(); ++i) {
+             new_keypoints.emplace_back(cvkeypoints[i].pt.x,
+@@ -91,11 +96,13 @@
+     result_status.resize(curr_keypoints.size(), 0);
+     if (next_cvimage && curr_cvpoints.size() > 0) {
+         Mat cvstatus, cverr;
++        portcv::track_begin(image, next_cvimage->image, curr_cvpoints, next_cvpoints);
+         calcOpticalFlowPyrLK(
+             image_pyramid, next_cvimage->image_pyramid, curr_cvpoints,
+             next_cvpoints, cvstatus, cverr, Size(21, 21), (int)level_num(),
+             TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 30, 0.01),
+             OPTFLOW_USE_INITIAL_FLOW);
++        portcv::forward(next_cvpoints, cvstatus, cverr);
+         for (size_t i = 0; i < next_cvpoints.size(); ++i) {
+             result_status[i] = cvstatus.at<unsigned char>((int)i);
+             if (next_cvpoints[i].x < 20 ||
+@@ -132,6 +139,7 @@
+                     }
+                 }
+             }
++            portcv::reverse(reverse_pts, reverse_status, reverse_err, result_status);
+         }
+     }
+ 
+@@ -154,10 +162,13 @@
+ }
+ 
+ void OpenCvImage::preprocess(double clipLimit, int width, int height) {
++    cv::Mat port_cv_input;
++    if (portcv::file()) port_cv_input = image.clone();
+     clahe(clipLimit, width, height)->apply(image, image);
+     image_pyramid.clear();
+     buildOpticalFlowPyramid(image, image_pyramid, Size(21, 21),
+                             (int)level_num(), true);
++    portcv::preprocess(port_cv_input, image, image_pyramid);
+ }
+ 
+ void OpenCvImage::correct_distortion(const matrix<3> &intrinsics,
+--- /dev/null
++++ b/src/rdvio_extra/src/port_cv_dump.h
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: MIT
++// Observe-only M7 stream; copied into the isolated reference by patch 0008.
++#pragma once
++#include <opencv2/opencv.hpp>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++namespace rdvio { namespace extra { namespace portcv {
++inline FILE *file() {
++ static FILE *f=[](){const char *p=std::getenv("RDVIO_CV_STREAM");if(!p)return (FILE*)nullptr;
++   FILE *q=std::fopen(p,"wb");if(!q)std::abort();return q;}();
++ return f;
++}
++inline void raw(const void *p,size_t n) {if(n&&std::fwrite(p,1,n,file())!=n)std::abort();}
++inline void record(const char *s,const void *p,size_t n) {
++ char name[32]={0};std::strncpy(name,s,31);uint32_t z=(uint32_t)n;raw(name,32);raw(&z,4);raw(p,n);
++}
++inline void matrix(const char *s,const cv::Mat &m) {cv::Mat c=m.isContinuous()?m:m.clone();record(s,c.data,c.total()*c.elemSize());}
++template<class T> inline void vector(const char *s,const std::vector<T>&v) {record(s,v.data(),v.size()*sizeof(T));}
++inline void begin(uint32_t kind,const cv::Mat &image) {raw(&kind,4);uint32_t dims[2]={(uint32_t)image.cols,(uint32_t)image.rows};raw(dims,8);}
++inline void done() {if(std::fflush(file()))std::abort();}
++inline void preprocess(const cv::Mat &input,const cv::Mat &output,const std::vector<cv::Mat>&pyr) {
++ if(!file())return;begin(1,input);matrix("input",input);matrix("clahe",output);
++ uint32_t n=(uint32_t)pyr.size()/2;record("levels",&n,4);
++ for(size_t i=0;i<pyr.size();i++) {cv::Mat a=pyr[i];a.adjustROI(21,21,21,21);matrix(i%2?"derivative_padded":"image_padded",a);}done();
++}
++inline void detect(const cv::Mat &image,int max,const std::vector<cv::KeyPoint>&a,const std::vector<cv::KeyPoint>&b) {
++ if(!file())return;begin(2,image);matrix("input",image);record("max_points",&max,4);vector("gftt_harris",a);vector("rdvio_sorted",b);done();
++}
++inline void track_begin(const cv::Mat &a,const cv::Mat &b,const std::vector<cv::Point2f>&pts,const std::vector<cv::Point2f>&initial) {
++ if(!file())return;begin(3,a);matrix("input",a);matrix("input_next",b);vector("points",pts);vector("initial_flow",initial);
++}
++inline void forward(const std::vector<cv::Point2f>&pts,const cv::Mat &s,const cv::Mat&e) {
++ if(!file())return;vector("forward_points",pts);matrix("forward_status",s);matrix("forward_err",e);
++}
++inline void reverse(const std::vector<cv::Point2f>&pts,const std::vector<uchar>&s,const std::vector<float>&e,const std::vector<char>&status) {
++ if(!file())return;vector("reverse_points",pts);vector("reverse_status",s);vector("reverse_err",e);vector("rdvio_status",status);done();
++}
++}}}
