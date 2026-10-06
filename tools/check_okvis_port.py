@@ -186,6 +186,10 @@ def eigen_tests():
                      f"-I{VROOT}/include", f"-I{VROOT}/include/x86_64-linux-gnu"]
             extra_link += [f"{CERES}/lib/libceres.a", f"-L{VROOT}/lib/x86_64-linux-gnu", "-lglog", "-lgflags", "-fopenmp", "-lpthread",
                           f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu"]
+        if "imgcodecs" in libs:  # cv::imencode / imdecode (OpenCV 4.6 of the reference)
+            extra_link += ["-lopencv_imgcodecs"]
+        if "zlib" in libs:  # system zlib, to write test PNGs
+            extra_link += ["-lz"]
         run(["g++", "-std=c++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", *incs, str(src),
              *[str(OKVIS_SRC / s) for s in srcs], *objs, f"-L{OCV}/lib", "-lopencv_core", "-lopencv_imgproc",
              f"-Wl,-rpath,{OCV}/lib", *extra_link, "-lm", "-o", str(exe)])

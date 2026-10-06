@@ -4,8 +4,8 @@
  *
  *   okvis_c_euroc <config.yaml> <sequence dir> <vocabulary.bin> <out dir> [max frames]
  *
- * <sequence dir> holds mav0/imu0/data.csv and gray/cam<i>.gray (the images decoded by tools/okvis_port_images.py; the port
- * has no PNG decoder); <vocabulary.bin> is the DBoW2 payload of tools/convert_okvis_vocabulary.py. Writes
+ * <sequence dir> holds mav0/imu0/data.csv and the images: the EuRoC layout mav0/cam<i>/data.csv + mav0/cam<i>/data/<ts>.png (decoded by
+ * ok_png.c, bit-exact with cv::imread IMREAD_GRAYSCALE), or gray/cam<i>.gray packs (tools/okvis_port_images.py), used if present; <vocabulary.bin> is the DBoW2 payload of tools/convert_okvis_vocabulary.py. Writes
  * <out dir>/causal.csv (the state published after every frame, TrajectoryOutput) and <out dir>/final.csv
  * (ViSlamBackend::writeFinalCsvTrajectory), byte-identical to the deterministic reference build's outputs.
  *
@@ -14,11 +14,13 @@
  * okvis_port/LICENSES/okvis2-BSD-3-Clause.txt).
  */
 #include "ok_system.h"
+#include "ok_png.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct gpack { FILE* f; uint32_t w, h, n; uint64_t* ts; } gpack;
+/* the images of one camera: a gray pack ("OKGRAY1", u32 w, h, n, n x {u64 ts, pixels}) or the EuRoC PNG list of data.csv */
+typedef struct gpack { FILE* f; uint32_t w, h, n; uint64_t* ts; char** names; char dir[1200]; } gpack;
 
 static int gpack_open(gpack* g, const char* path) {
     char magic[8];
@@ -33,12 +35,61 @@ static int gpack_open(gpack* g, const char* path) {
         if (fseek(g->f, 20 + (long)i * (8 + (long)g->w * (long)g->h), SEEK_SET) || fread(&g->ts[i], 8, 1, g->f) != 1) return 0;
     return 1;
 }
+/* DatasetReader: <cam dir>/data.csv lines "timestamp [ns],filename", images in <cam dir>/data/ */
+static int png_list_open(gpack* g, const char* cam_dir, int w, int h) {
+    char path[1200], line[512];
+    FILE* f;
+    uint32_t cap = 0;
+    memset(g, 0, sizeof *g);
+    snprintf(g->dir, sizeof g->dir, "%s/data", cam_dir);
+    snprintf(path, sizeof path, "%s/data.csv", cam_dir);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *comma, *name;
+        size_t n;
+        if (line[0] == '#' || !(comma = strchr(line, ','))) continue;
+        name = comma + 1;
+        while (*name == ' ') name++;
+        n = strlen(name);
+        while (n && (name[n - 1] == '\n' || name[n - 1] == '\r' || name[n - 1] == ' ')) name[--n] = 0;
+        if (g->n == cap) {
+            cap = cap ? 2 * cap : 4096;
+            g->ts = (uint64_t*)realloc(g->ts, 8 * (size_t)cap);
+            g->names = (char**)realloc(g->names, sizeof(char*) * (size_t)cap);
+        }
+        g->ts[g->n] = strtoull(line, NULL, 10);
+        g->names[g->n] = (char*)malloc(n + 1);
+        memcpy(g->names[g->n], name, n + 1);
+        g->n++;
+    }
+    fclose(f);
+    g->w = (uint32_t)w; g->h = (uint32_t)h;
+    return g->n > 0;
+}
 static int gpack_read(gpack* g, uint64_t ts, uint8_t* out) {
     uint32_t lo = 0, hi = g->n;
     while (lo < hi) { const uint32_t mid = lo + (hi - lo) / 2; if (g->ts[mid] < ts) lo = mid + 1; else hi = mid; }
     if (lo == g->n || g->ts[lo] != ts) return 0;
+    if (g->names) {
+        char path[1600];
+        unsigned char* px;
+        int w, h, ok;
+        snprintf(path, sizeof path, "%s/%s", g->dir, g->names[lo]);
+        if (ok_png_read_gray(path, &px, &w, &h) != OK_PNG_OK) return 0;
+        ok = (uint32_t)w == g->w && (uint32_t)h == g->h;
+        if (ok) memcpy(out, px, (size_t)w * (size_t)h);
+        free(px);
+        return ok;
+    }
     if (fseek(g->f, 20 + (long)lo * (8 + (long)g->w * (long)g->h) + 8, SEEK_SET)) return 0;
     return fread(out, (size_t)g->w * g->h, 1, g->f) == 1;
+}
+static void gpack_close(gpack* g) {
+    uint32_t i;
+    if (g->f) fclose(g->f);
+    if (g->names) for (i = 0; i < g->n; ++i) free(g->names[i]);
+    free(g->names); free(g->ts);
 }
 static void on_publish(void* ctx, const ok_sys_state* s) { ok_sys_write_state_csv((FILE*)ctx, s); }
 
@@ -66,7 +117,13 @@ int main(int argc, char** argv) {
     fclose(f);
     for (c = 0; c < cfg.ncam; ++c) {
         snprintf(path, sizeof path, "%s/gray/cam%d.gray", argv[2], c);
-        if (!gpack_open(&gp[c], path) || (int)gp[c].w != cfg.cam[c].w || (int)gp[c].h != cfg.cam[c].h) { fprintf(stderr, "cannot read %s\n", path); return 1; }
+        if (!gpack_open(&gp[c], path)) {
+            char cam_dir[1100];
+            if (gp[c].f) fclose(gp[c].f);
+            snprintf(cam_dir, sizeof cam_dir, "%s/mav0/cam%d", argv[2], c);
+            if (!png_list_open(&gp[c], cam_dir, cfg.cam[c].w, cfg.cam[c].h)) { fprintf(stderr, "no images: neither %s nor %s/data.csv\n", path, cam_dir); return 1; }
+        }
+        if ((int)gp[c].w != cfg.cam[c].w || (int)gp[c].h != cfg.cam[c].h) { fprintf(stderr, "%s: image size differs from the config\n", path); return 1; }
         img[c] = (uint8_t*)malloc((size_t)gp[c].w * gp[c].h);
     }
     snprintf(path, sizeof path, "%s/mav0/imu0/data.csv", argv[2]);
@@ -115,7 +172,7 @@ int main(int argc, char** argv) {
     fclose(f);
     fprintf(stderr, "%ld frames processed, trajectories in %s\n", frames, argv[4]);
     ok_sys_free(sys);
-    for (c = 0; c < cfg.ncam; ++c) { free(img[c]); free(gp[c].ts); fclose(gp[c].f); }
+    for (c = 0; c < cfg.ncam; ++c) { free(img[c]); gpack_close(&gp[c]); }
     fclose(imu);
     free(voc);
     return 0;

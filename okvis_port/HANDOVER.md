@@ -23,6 +23,16 @@ orientation, descriptor bits). Reserved paths: `okvis_port/c/ok_brisk*.{h,c}`,
 
 ## Status
 
+### 2026-10-06: PNG input: `ok_png` (written by Codex, tested and hooked up by Claude); `okvis_c_euroc` reads EuRoC PNGs directly
+
+- `okvis_port/c/ok_png.{h,c}` (MIT, `reference_png/LICENSE`): PNG -> 8-bit gray with the pixels of `cv::imread(path, IMREAD_GRAYSCALE)` of the
+  reference's OpenCV 4.6. Scope and validation are in `okvis_port/reference_png/README.md`.
+- Test: `reference_tools/okvis_png_test.cc`, run by `--eigen-tests`; the runner gained the test libs `imgcodecs` and `zlib`. Against the real
+  `cv::imdecode`, 0 mismatches on 10,514 files: 14 real EuRoC frames, 1,500 `cv::imencode` outputs, 9,000 crafted PNGs (every colour type, bit
+  depth, filter, Adam7, gAMA / sRGB / sBIT / tRNS / PLTE). 3,000 corrupt files never crash. The test is clean under ASan/UBSan.
+- `okvis_c_euroc` uses the `gray/cam<i>.gray` packs if present, otherwise `mav0/cam<i>/data.csv` + `data/<file>`, as DatasetReader does.
+  MH_01 mono from the original PNGs: `final.csv` `dfe3b58e...` and `causal.csv` `cc29a746...`, the reference hashes. 642 s, against 624 s with packs.
+
 ### 2026-10-05 (Claude): BRISK hooked up (M7a, Codex's leaf) and module 8 (the system driver) DONE: the whole C pipeline runs MH_01 mono and stereo from the images + imu0/data.csv + the YAML config and writes trajectories byte-identical to the reference
 
 Deliverables
