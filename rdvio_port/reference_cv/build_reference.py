@@ -9,7 +9,10 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('rd_build',ROOT/'tools/build_rdvio_reference.py')
 b=importlib.util.module_from_spec(spec);spec.loader.exec_module(b)
-b.ROOT=ROOT/'runs/rdvio_port/m7_reference_build';b.SRC=b.ROOT/'src';b.BUILD=b.ROOT/'build'
+# optional: --root <name under runs/rdvio_port> (default m7_reference_build; e.g. m6_reference_build for the M6 map log)
+name='m7_reference_build'
+if '--root' in sys.argv: name=sys.argv[sys.argv.index('--root')+1]
+b.ROOT=ROOT/'runs/rdvio_port'/name;b.SRC=b.ROOT/'src';b.BUILD=b.ROOT/'build'
 b.ROOT.mkdir(parents=True,exist_ok=True)
 s=b.DRIVER.read_text()
 s=s.replace('  string calib = argv[1]', '  cv::setNumThreads(1);\n  string calib = argv[1]')

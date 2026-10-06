@@ -18,7 +18,7 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 |---|---|---|---|
 | `stella_port/` | stella_vslam mono, bit-exact | complete | `stella_port/HANDOVER.md` (top) |
 | `okvis_port/` | OKVIS2 (drone winner), bit-exact | complete for EuRoC: M1–M8 done; `okvis_c_euroc` runs MH_01 mono + stereo from images + IMU csv, trajectories byte-identical to the reference | `okvis_port/HANDOVER.md`, `PLAN.md` |
-| `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | M1–M5 and M7 done; window solve and image functions native | `rdvio_port/HANDOVER.md`, `PLAN.md` |
+| `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | M1–M7 done; window solve, image functions and map layer native | `rdvio_port/HANDOVER.md`, `PLAN.md` |
 | `stella_vio/` | our modified copy of stella_port | re-init, IMU, R-frames, merge, PoseLib-style solvers, gait scale servo (all opt-in beyond defaults) | `stella_vio/README.md`, `RESULTS.md` |
 | `gnss_fusion/` | our C GNSS fusion | smoother, gait speed prior, georef, auto switch, gait regularity gate | `gnss_fusion/README.md` |
 | `phone_pipeline/` | stella_vio → gait → fusion, live | beats GNSS alone outdoors (live 4.31 / 11.33 / 11.82 vs 5.73 / 14.66 / 12.00 m); indoor 0.6–0.8 m with servo | `phone_pipeline/README.md` |
@@ -70,7 +70,8 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 2. **OKVIS2:** done for EuRoC (BRISK hooked up, system driver M8; full suite with `--data` all PASS on 2026-10-05, committed 08a6b38). The app also reads EuRoC PNGs directly (`ok_png`, bit-exact with cv::imread). Open: runtime 2–3x the reference, parameter blocks never freed, other sequences.
 3. **RD-VIO:**
    - M7 (OpenCV CLAHE / LK / GFTT): **done 2026-10-06**. Codex wrote it and Claude verified it: 70 fixture cases and a full MH_01 stream of 12.15 G bytes, 0 mismatches. The bit-exactness holds for this machine's OpenCV CPU dispatch.
-   - Next: M6 map, M8 frontend, M9 initializer, M10 tracker and M11 handler.
+   - M6 map layer: **done 2026-10-06**, 38.5 M events of MH_01 replayed bit-exact (patch 0009 map log).
+   - Next: M8 frontend, M9 initializer, M10 tracker and M11 handler.
 4. **Phone stack:**
    - The Outdoor-1 map-unit blow-up at about 200–260 s is unexplained, and it blocks the servo outdoors.
    - Indoor-2 live error is still twice the final error.

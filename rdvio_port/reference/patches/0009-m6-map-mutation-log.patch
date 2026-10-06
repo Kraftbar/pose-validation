@@ -1,0 +1,393 @@
+diff -ruN a/src/rdvio/src/feature_tracker.cpp b/src/rdvio/src/feature_tracker.cpp
+--- a/src/rdvio/src/feature_tracker.cpp	2024-04-13 20:01:09.000000000 +0200
++++ b/src/rdvio/src/feature_tracker.cpp	2026-10-06 10:15:41.850292934 +0200
+@@ -114,6 +114,7 @@
+     frames.emplace_back(std::move(frame));
+ #ifndef USE_MULTI_THREADING
+     run();
++    Map::port_digest();   // rdvio_port M6: every live map after the frame (RDVIO_PORT_MAP_DIR)
+ #endif
+ }
+ 
+diff -ruN a/src/rdvio_map/include/rdvio/map/map.h b/src/rdvio_map/include/rdvio/map/map.h
+--- a/src/rdvio_map/include/rdvio/map/map.h	2024-04-13 20:01:09.000000000 +0200
++++ b/src/rdvio_map/include/rdvio/map/map.h	2026-10-06 10:13:53.265449483 +0200
+@@ -43,6 +43,7 @@
+     void prune_tracks(const std::function<bool(const Track *)> &condition);
+ 
+     Track *get_track_by_id(size_t id) const;
++    static void port_digest();   // rdvio_port M6 instrumentation (RDVIO_PORT_MAP_DIR)
+ 
+     std::unique_lock<std::mutex> lock() const {
+         return std::unique_lock(map_mutex);
+diff -ruN a/src/rdvio_map/include/rdvio/map/port_maplog.h b/src/rdvio_map/include/rdvio/map/port_maplog.h
+--- a/src/rdvio_map/include/rdvio/map/port_maplog.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/rdvio_map/include/rdvio/map/port_maplog.h	2026-10-06 10:13:10.429906863 +0200
+@@ -0,0 +1,58 @@
++#pragma once
++// rdvio_port instrumentation (reference build only, never distributed): the map-layer mutation log of module M6.
++// Enabled by RDVIO_PORT_MAP_DIR (writes <dir>/map.bin). Pure observation: reads state, never modifies it.
++// Framed records: u32 tag, u32 payload bytes, payload (native endian). Layouts: rdvio_port/c/rd_map.h.
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <vector>
++namespace rdvio {
++namespace portmap {
++enum : uint32_t {
++    MAPNEW = 1, MAPDEL, FRAMENEW, FRAMEDEL, ATTACH, DETACH, UNTRACK, ERASEFRAME, MARGFRAME, FIDX, CREATETRACK, ERASETRACK, PRUNE,
++    RECYCLE, ADDKP, RMKP, APPENDKP, DETECT, TRACKKP, DIGEST
++};
++struct Log {
++    FILE *f = nullptr;
++    bool checked = false;
++    uint32_t next_map = 0, next_frame = 0;
++    std::map<const void *, uint32_t> maps, frames;   // live object -> serial
++    std::map<uint32_t, const void *> map_by_serial;  // ascending serial (digest order)
++};
++inline Log &log() {
++    static Log l;
++    if (!l.checked) {
++        l.checked = true;
++        if (const char *d = std::getenv("RDVIO_PORT_MAP_DIR")) l.f = std::fopen((std::string(d) + "/map.bin").c_str(), "wb");
++    }
++    return l;
++}
++inline bool on() { return log().f != nullptr; }
++struct Rec {
++    uint32_t tag;
++    std::vector<unsigned char> b;
++    explicit Rec(uint32_t t) : tag(t) {}
++    Rec &raw(const void *p, size_t n) { const unsigned char *c = (const unsigned char *)p; b.insert(b.end(), c, c + n); return *this; }
++    Rec &u32(uint32_t v) { return raw(&v, 4); }
++    Rec &u64(uint64_t v) { return raw(&v, 8); }
++    Rec &f64(double v) { return raw(&v, 8); }
++    Rec &f64n(const double *p, size_t n) { return raw(p, 8 * n); }
++    ~Rec() {
++        Log &l = log();
++        if (!l.f) return;
++        uint32_t n = (uint32_t)b.size();
++        std::fwrite(&tag, 4, 1, l.f); std::fwrite(&n, 4, 1, l.f);
++        if (n) std::fwrite(b.data(), 1, n, l.f);
++    }
++};
++inline uint32_t map_serial(const void *m) { auto &s = log().maps; auto it = s.find(m); return it == s.end() ? 0u : it->second; }
++inline uint32_t frame_serial(const void *f) { auto &s = log().frames; auto it = s.find(f); return it == s.end() ? 0u : it->second; }
++inline uint32_t new_map(const void *m) { Log &l = log(); const uint32_t s = ++l.next_map; l.maps[m] = s; l.map_by_serial[s] = m; return s; }
++inline void del_map(const void *m) { Log &l = log(); auto it = l.maps.find(m); if (it != l.maps.end()) { l.map_by_serial.erase(it->second); l.maps.erase(it); } }
++inline uint32_t new_frame(const void *f) { Log &l = log(); const uint32_t s = ++l.next_frame; l.frames[f] = s; return s; }
++inline void del_frame(const void *f) { log().frames.erase(f); }
++inline void flush() { if (log().f) std::fflush(log().f); }
++} // namespace portmap
++} // namespace rdvio
+diff -ruN a/src/rdvio_map/src/frame.cpp b/src/rdvio_map/src/frame.cpp
+--- a/src/rdvio_map/src/frame.cpp	2024-04-13 20:01:09.000000000 +0200
++++ b/src/rdvio_map/src/frame.cpp	2026-10-06 10:20:54.168983603 +0200
+@@ -4,17 +4,23 @@
+ #include <rdvio/map/map.h>
+ #include <rdvio/map/track.h>
+ #include <rdvio/util/poisson_disk_filter.h>
+-
++#include <rdvio/map/port_maplog.h>
+ namespace rdvio {
+ 
+ struct Frame::construct_by_frame_t {};
+ 
+-Frame::Frame() : map(nullptr) {}
++Frame::Frame() : map(nullptr) {
++    if (portmap::on()) portmap::Rec(portmap::FRAMENEW).u32(portmap::new_frame(this)).u64(id()).u32(0u);
++}
+ 
+ Frame::Frame(const Frame &frame, const construct_by_frame_t &construct_by_frame)
+-    : Tagged(frame), Identifiable(frame), map(nullptr) {}
++    : Tagged(frame), Identifiable(frame), map(nullptr) {
++    if (portmap::on()) portmap::Rec(portmap::FRAMENEW).u32(portmap::new_frame(this)).u64(id()).u32(portmap::frame_serial(&frame));
++}
+ 
+-Frame::~Frame() = default;
++Frame::~Frame() {
++    if (portmap::on()) { portmap::Rec(portmap::FRAMEDEL).u32(portmap::frame_serial(this)); portmap::del_frame(this); }
++}
+ 
+ std::unique_ptr<Frame> Frame::clone() const {
+     std::unique_ptr<Frame> frame =
+@@ -39,6 +45,7 @@
+     bearings.emplace_back(keypoint);
+     tracks.emplace_back(nullptr);
+     reprojection_error_factors.emplace_back(nullptr);
++    if (portmap::on()) portmap::Rec(portmap::APPENDKP).u32(portmap::frame_serial(this)).f64n(keypoint.data(), 3);
+ }
+ 
+ Track *Frame::get_track(size_t keypoint_index, Map *allocation_map) {
+@@ -69,6 +76,12 @@
+     for (size_t i = old_keypoint_num; i < pkeypoints.size(); ++i) {
+         bearings[i] = remove_k(pkeypoints[i], K);
+     }
++    if (portmap::on()) {   /* K, the pixel positions handed to the detector, the new ones it returned, the new bearings */
++        portmap::Rec r(portmap::DETECT);
++        r.u32(portmap::frame_serial(this)).f64n(K.data(), 9).u64(old_keypoint_num).u64(pkeypoints.size());
++        for (const auto &p : pkeypoints) r.f64n(p.data(), 2);
++        for (size_t i = old_keypoint_num; i < pkeypoints.size(); ++i) r.f64n(bearings[i].data(), 3);
++    }
+ }
+ 
+ void Frame::track_keypoints(Frame *next_frame, Config *config) {
+@@ -93,8 +106,10 @@
+     }
+ 
+     std::vector<char> status, mask;
++    std::vector<vector<2>> port_predicted = next_keypoints;
+     image->track_keypoints(next_frame->image.get(), curr_keypoints,
+                            next_keypoints, status);
++    std::vector<char> port_lk_status = status;
+ 
+     std::vector<vector<2>> curr_keypoints_h, next_keypoints_h;
+     std::vector<vector<3>> next_bearings;
+@@ -160,6 +175,29 @@
+         }
+     }
+ 
++    if (portmap::on()) {
++        /* inputs: K of both frames, the extrinsics + preintegrated rotation of the IMU prediction, the config, the predicted
++         * and the tracked pixel positions with the LK status; results: no-translation flag and the final status */
++        portmap::Rec r(portmap::TRACKKP);
++        r.u32(portmap::frame_serial(this)).u32(portmap::frame_serial(next_frame)).u64(curr_keypoints.size())
++         .f64n(K.data(), 9).f64n(next_frame->K.data(), 9)
++         .f64n(camera.q_cs.coeffs().data(), 4).f64n(imu.q_cs.coeffs().data(), 4)
++         .f64n(next_frame->preintegration.delta.q.coeffs().data(), 4)
++         .f64n(next_frame->imu.q_cs.coeffs().data(), 4).f64n(next_frame->camera.q_cs.coeffs().data(), 4)
++         .u32(config->feature_tracker_predict_keypoints() ? 1u : 0u)
++         .f64(config->rotation_ransac_threshold()).f64(config->rotation_misalignment_threshold())
++         .f64(config->feature_tracker_min_keypoint_distance())
++         .u64(port_predicted.size());
++        for (const auto &p : port_predicted) r.f64n(p.data(), 2);
++        for (const auto &p : next_keypoints) r.f64n(p.data(), 2);
++        for (char c : port_lk_status) r.u32((uint32_t)(unsigned char)c);
++        for (size_t i = 0; i < curr_keypoints.size(); ++i) {   /* 2 = no track, else the track's TT_TRASH tag */
++            const Track *t = get_track(i);
++            r.u32(t ? (t->tag(TT_TRASH) ? 1u : 0u) : 2u);
++        }
++        r.u32(next_frame->tag(FT_NO_TRANSLATION) ? 1u : 0u);
++        for (char c : status) r.u32((uint32_t)(unsigned char)c);
++    }
+     for (size_t curr_keypoint_index = 0;
+          curr_keypoint_index < curr_keypoints.size(); ++curr_keypoint_index) {
+         if (status[curr_keypoint_index]) {
+diff -ruN a/src/rdvio_map/src/map.cpp b/src/rdvio_map/src/map.cpp
+--- a/src/rdvio_map/src/map.cpp	2024-04-13 20:01:09.000000000 +0200
++++ b/src/rdvio_map/src/map.cpp	2026-10-06 10:20:54.168983603 +0200
+@@ -3,14 +3,18 @@
+ #include <rdvio/map/map.h>
+ #include <rdvio/map/track.h>
+ #include <rdvio/util/debug.h>
+-
++#include <rdvio/map/port_maplog.h>
+ namespace rdvio {
+ 
+ struct Map::construct_by_map_t {};
+ 
+-Map::Map() = default;
++Map::Map() {
++    if (portmap::on()) portmap::Rec(portmap::MAPNEW).u32(portmap::new_map(this));
++}
+ 
+-Map::~Map() = default;
++Map::~Map() {
++    if (portmap::on()) { portmap::Rec(portmap::MAPDEL).u32(portmap::map_serial(this)); portmap::del_map(this); }
++}
+ 
+ void Map::clear() {
+     frames.clear();
+@@ -19,21 +23,27 @@
+ 
+ void Map::attach_frame(std::unique_ptr<Frame> frame, size_t position) {
+     frame->map = this;
++    const uint32_t port_obj = portmap::on() ? portmap::frame_serial(frame.get()) : 0u;
+     if (position == nil()) {
+         frames.emplace_back(std::move(frame));
+     } else {
+         frames.emplace(frames.begin() + position, std::move(frame));
+     }
++    if (portmap::on())
++        portmap::Rec(portmap::ATTACH).u32(portmap::map_serial(this)).u32(port_obj).u64(position).u64(frames.size());
+ }
+ 
+ std::unique_ptr<Frame> Map::detach_frame(size_t index) {
+     std::unique_ptr<Frame> frame = std::move(frames[index]);
+     frames.erase(frames.begin() + index);
+     frame->map = nullptr;
++    if (portmap::on())
++        portmap::Rec(portmap::DETACH).u32(portmap::map_serial(this)).u64(index).u32(portmap::frame_serial(frame.get()));
+     return frame;
+ }
+ 
+ void Map::untrack_frame(Frame *frame) {
++    if (portmap::on()) portmap::Rec(portmap::UNTRACK).u32(portmap::map_serial(this)).u32(portmap::frame_serial(frame));
+     for (size_t i = 0; i < frame->keypoint_num(); ++i) {
+         if (Track *track = frame->get_track(i)) {
+             track->remove_keypoint(frame);
+@@ -43,6 +53,8 @@
+ 
+ void Map::erase_frame(size_t index) {
+     Frame *frame = frames[index].get();
++    if (portmap::on())
++        portmap::Rec(portmap::ERASEFRAME).u32(portmap::map_serial(this)).u64(index).u32(portmap::frame_serial(frame));
+     untrack_frame(frame);
+     detach_frame(index);
+ }
+@@ -53,6 +65,8 @@
+                    "marginalization_factor is not initialized yet");
+     marginalization_factor->marginalize(index);
+     Frame *frame = frames[index].get();
++    if (portmap::on())
++        portmap::Rec(portmap::MARGFRAME).u32(portmap::map_serial(this)).u64(index).u32(portmap::frame_serial(frame));
+     for (size_t i = 0; i < frame->keypoint_num(); ++i) {
+         if (Track *track = frame->get_track(i)) {
+             track->remove_keypoint(frame);
+@@ -70,11 +84,15 @@
+     };
+     auto it = std::lower_bound(frames.begin(), frames.end(), id,
+                                std::less<FrameID>());
++    size_t port_result;
+     if (it == frames.end())
+-        return nil();
+-    if (id < (*it)->id())
+-        return nil();
+-    return std::distance(frames.begin(), it);
++        port_result = nil();
++    else if (id < (*it)->id())
++        port_result = nil();
++    else
++        port_result = std::distance(frames.begin(), it);
++    if (portmap::on()) portmap::Rec(portmap::FIDX).u32(portmap::map_serial(this)).u64(id).u64(port_result);
++    return port_result;
+ }
+ 
+ Track *Map::create_track() {
+@@ -83,10 +101,13 @@
+     track->map_index = tracks.size();
+     track->map = this;
+     track_id_map[track->id()] = track.get();
++    if (portmap::on())
++        portmap::Rec(portmap::CREATETRACK).u32(portmap::map_serial(this)).u64(track->id()).u64(track->map_index);
+     return tracks.emplace_back(std::move(track)).get();
+ }
+ 
+ void Map::erase_track(Track *track) {
++    if (portmap::on()) portmap::Rec(portmap::ERASETRACK).u32(portmap::map_serial(this)).u64(track->id());
+     while (track->keypoint_num() > 0) {
+         track->remove_keypoint(track->keypoint_map().begin()->first, false);
+     }
+@@ -100,6 +121,11 @@
+             tracks_to_prune.push_back(track);
+         }
+     }
++    if (portmap::on()) {
++        portmap::Rec r(portmap::PRUNE);
++        r.u32(portmap::map_serial(this)).u32((uint32_t)tracks_to_prune.size());
++        for (const auto &t : tracks_to_prune) r.u64(t->id());
++    }
+     for (const auto &track : tracks_to_prune) {
+         erase_track(track);
+     }
+@@ -114,6 +140,9 @@
+ }
+ 
+ void Map::recycle_track(Track *track) {
++    if (portmap::on())
++        portmap::Rec(portmap::RECYCLE).u32(portmap::map_serial(this)).u64(track->id()).u64(track->map_index)
++            .u64(track->map_index != tracks.back()->map_index ? tracks.back()->id() : 0u);
+     if (track->map_index != tracks.back()->map_index) {
+         tracks[track->map_index].swap(tracks.back());
+         tracks[track->map_index]->map_index = track->map_index;
+@@ -122,4 +151,31 @@
+     tracks.pop_back();
+ }
+ 
++/* every live map (ascending serial): frames (object, id, track id per keypoint) and tracks in vector order (id, map_index, the
++ * keypoint references, m_life, tag bits, inverse depth) */
++void Map::port_digest() {
++    if (!portmap::on()) return;
++    static uint64_t calls = 0, every = std::getenv("RDVIO_PORT_MAP_DIGEST_EVERY") ? std::strtoull(std::getenv("RDVIO_PORT_MAP_DIGEST_EVERY"), nullptr, 10) : 1;
++    if (every == 0 || calls++ % every != 0) return;
++    portmap::Log &l = portmap::log();
++    portmap::Rec r(portmap::DIGEST);
++    r.u32((uint32_t)l.map_by_serial.size());
++    for (const auto &[serial, mp] : l.map_by_serial) {
++        const Map *m = (const Map *)mp;
++        r.u32(serial).u64(m->frames.size());
++        for (const auto &f : m->frames) {
++            r.u32(portmap::frame_serial(f.get())).u64(f->id()).u64(f->tracks.size());
++            for (const Track *t : f->tracks) r.u64(t ? t->id() : 0u);
++        }
++        r.u64(m->tracks.size());
++        for (const auto &t : m->tracks) {
++            uint32_t tags = 0;
++            for (int k = 0; k <= (int)TT_TEMP; ++k) if (t->tag((TrackTag)k)) tags |= 1u << k;
++            r.u64(t->id()).u64(t->map_index).u64(t->keypoint_refs.size());
++            for (const auto &[fr, kp] : t->keypoint_refs) r.u32(portmap::frame_serial(fr)).u64(kp);
++            r.u64(t->m_life).u32(tags).f64(t->landmark.inv_depth);
++        }
++    }
++}
++
+ } // namespace rdvio
+diff -ruN a/src/rdvio_map/src/track.cpp b/src/rdvio_map/src/track.cpp
+--- a/src/rdvio_map/src/track.cpp	2026-10-06 10:12:27.084370429 +0200
++++ b/src/rdvio_map/src/track.cpp	2026-10-06 10:13:53.265449483 +0200
+@@ -2,6 +2,7 @@
+ #include <rdvio/geometry/stereo.h>
+ #include <rdvio/map/track.h>
+ #include <rdvio/estimation/port_dump.h>
++#include <rdvio/map/port_maplog.h>
+ 
+ namespace rdvio {
+ 
+@@ -21,11 +22,16 @@
+         m_life++;
+     else
+         m_life = 1;
++    if (portmap::on())
++        portmap::Rec(portmap::ADDKP).u64(id()).u32(portmap::frame_serial(frame)).u64(keypoint_index)
++            .u32(this->tag(TT_TRIANGULATED) ? 1u : 0u).u64(m_life);
+ }
+ 
+ void Track::remove_keypoint(Frame *frame, bool suicide_if_empty) {
+     size_t keypoint_index = keypoint_refs.at(frame);
+     std::optional<vector<3>> landmark;
++    const bool port_first = frame == first_frame();
++    const double port_inv_depth_before = landmark.has_value() ? 0.0 : this->landmark.inv_depth;
+     if (frame == first_frame()) {
+         landmark = get_landmark_point();
+     }
+@@ -38,10 +44,26 @@
+         }
+     } else {
+         tag(TT_VALID) = false;
+-        if (suicide_if_empty) {
+-            map->recycle_track(this);
++    }
++    if (portmap::on()) {   /* written before a recycle_track destroys this track */
++        portmap::Rec r(portmap::RMKP);
++        r.u64(id()).u32(portmap::frame_serial(frame)).u64(keypoint_index).u32(suicide_if_empty ? 1u : 0u).u32(port_first ? 1u : 0u)
++            .u64(keypoint_refs.size()).u32(tag(TT_VALID) ? 1u : 0u);
++        if (port_first && keypoint_refs.size() > 0) {
++            /* the re-anchoring inputs (old first frame pose / camera, inverse depth) and its result */
++            const auto [nf, nk] = first_keypoint();
++            r.f64n(frame->pose.q.coeffs().data(), 4).f64n(frame->pose.p.data(), 3)
++             .f64n(frame->camera.q_cs.coeffs().data(), 4).f64n(frame->camera.p_cs.data(), 3)
++             .f64(port_inv_depth_before)
++             .u32(portmap::frame_serial(nf)).u64(nk)
++             .f64n(nf->pose.q.coeffs().data(), 4).f64n(nf->pose.p.data(), 3)
++             .f64n(nf->camera.q_cs.coeffs().data(), 4).f64n(nf->camera.p_cs.data(), 3)
++             .f64(this->landmark.inv_depth);
+         }
+     }
++    if (keypoint_refs.size() == 0 && suicide_if_empty) {
++        map->recycle_track(this);
++    }
+ }
+ 
+ static void dump_obs(portdump::Chan *pc, Frame *frame, size_t keypoint_index) {

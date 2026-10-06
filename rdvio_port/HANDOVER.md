@@ -4,6 +4,61 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
+## M6 (map layer: Frame / Track / Map + the keypoint logic of detect / track_keypoints) DONE, bit-exact (2026-10-06, Claude)
+
+Deliverables
+- C (C99): `c/rd_map.{h,c}`.
+  - The map layer: frames, tracks, maps, ids, ordering, clone, attach / detach / untrack / erase / marginalize, create / erase /
+    prune / recycle tracks, add / remove keypoint with the landmark re-anchoring (via M2's `rd_track_get/set_landmark_point`).
+  - `Frame::detect_keypoints` (apply_k / remove_k around the image detector).
+  - `Frame::track_keypoints`: IMU-predicted initial flow, essential + rotation RANSAC (M3), the 70 % rotation misalignment, the
+    track-length sort, the Poisson-disk filter (M3), the appends.
+  - `rd_std_sort`: a generic SGI-STL / libstdc++ introsort; the track-length sort has ties and its tie order decides the filter.
+  - The image functions themselves are M7's `rd_cv_*`; here they enter through callbacks.
+- Reference: patch `0009-m6-map-mutation-log.patch` (observe-only; `RDVIO_PORT_MAP_DIR`, `RDVIO_PORT_MAP_DIGEST_EVERY`). It logs
+  every map mutation with the inputs the map layer does not own, plus a structural DIGEST of every live map after each frame.
+  Record layouts are in `rd_map.h`.
+- Build and run with the gray-stream driver in its own tree: `python3 -B rdvio_port/reference_cv/build_reference.py --root m6_reference_build`,
+  then `RDVIO_CV_GRAY=<.../gray/cam0.gray> RDVIO_PORT_MAP_DIR=runs/rdvio_port/m6/MH_01_easy/dump RDVIO_PORT_MAP_DIGEST_EVERY=10
+  python3 tools/run_rdvio_reference.py MH_01_easy --tag m6 --stock-binary runs/rdvio_port/m6_reference_build/build/rdvio_ref_driver`.
+  This takes 2.3 min and writes 1.1 GB of `map.bin`. Trajectory sha256 `f0d60a3e03c1...` = canonical.
+- Harness: `c/check_rd_map.c`, runner `python3 tools/check_rdvio_port.py --modules m6 [--sanitize]` (`--tag6`, default `m6`).
+  - Only the top-level operations are replayed. Every event the C code reports, nested ones included, is compared byte for byte
+    with the next record.
+  - `prepare` hooks inject what other modules own: poses / extrinsics / inverse depth before a re-anchoring, TT_TRIANGULATED before
+    add_keypoint, K / extrinsics / preintegrated rotation / config / LK result / TT_TRASH before track_keypoints, the detector output.
+  - The replay stops at the first divergence.
+
+Result (tolerance 0): `m6: 0/38,553,560`, also under ASan/UBSan.
+
+| events compared on MH_01 | count | mismatches |
+|---|---:|---:|
+| add / remove keypoint (with 3,061,901 removals, re-anchorings included) | 3,109,287 / 3,061,901 | 0 |
+| append keypoint / create track / recycle track / erase track | 1,506,600 / 89,570 / 80,383 / 6,301 | 0 |
+| frames new / delete / attach / detach / untrack / erase / marginalize / frame_index_by_id | 11,057 / 10,997 / 7,469 / 6,716 / 6,644 / 3,661 / 617 / 11,385 | 0 |
+| detect keypoints (apply_k inputs + remove_k) / track keypoints (predicted flow, no-translation flag, final status) | 3,681 / 3,680 | 0 |
+| digests (every 10th frame: every live map, frames with track ids, tracks in vector order with references and m_life) | 368 | 0 |
+
+Sensitivity: each mutation is caught at its first effect.
+- Ties of the track-length sort broken by keypoint index: frame 64, 85 mismatches until the stop.
+- Order-preserving track removal instead of swap-with-last: the first erase.
+- No re-anchoring: 172 removals.
+
+Facts found
+- Three map instances live at once: the feature tracker's `map` and `keymap`, the sliding-window map, and the initializer's map
+  while initialising. They are 16 over the run.
+- `Track::keypoint_refs` is keyed by FRAME ID, but `remove_keypoint`'s first-frame test compares POINTERS. `keymap` clones keep the
+  ids, so the same id lives in two maps at once.
+- `Map::marginalize_frame` erases the frame without `detach_frame`.
+- `prune_tracks` collects first, then erases; the erases recycle with swap-with-last, so `Map::tracks` order (which the next prune
+  iterates) depends on the whole removal history.
+- `Frame::track_keypoints` decides `FT_NO_TRANSLATION` from the 70th percentile of the rotation-RANSAC inlier angles (after
+  `std::sort`). Its Poisson filter runs over the tracked keypoints in DESCENDING track length (unstable `std::sort`, so the libstdc++
+  tie order matters), skipping TT_TRASH tracks.
+
+Next: the system modules M8 (feature tracker + frontend), M9 (initializer), M10 (sliding-window tracker), M11 (handler / config).
+They drive `rd_map` exactly as the log shows; its DIGEST records are the checkpoints for the system port.
+
 ## M7 (Codex) — image leaf done, bit-exact (2026-10-06)
 
 `c/rd_cv.{h,c}`, `rd_cv_lk.c`, `rd_cv_gftt.c`: dependency-free C99 CLAHE (6,
