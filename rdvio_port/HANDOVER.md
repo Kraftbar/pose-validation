@@ -4,6 +4,65 @@ Goal: dependency-free C99 port of RD-VIO (Jianxff/rd_vio, Apache-2.0), bit-exact
 reusable pieces. Method and rules: `okvis_port/HANDOVER.md`, `stella_port/HANDOVER.md`. Plan, module table, OpenCV list, "why it scores what it scores":
 `rdvio_port/PLAN.md`. Licences: `docs/rdvio_license_audit.md`.
 
+## M9 (Initializer) DONE, bit-exact (2026-10-06, Claude)
+
+- C: `c/rd_sys_init.{h,c}`: `Initializer` on the C map.
+  - mirror_keyframe_map;
+  - init_sfm: H / E RANSAC with config.random(); 8 (R, T) hypotheses scored by two-view triangulation; PnP of the middle frames
+    through Ceres RPP factors; more triangulation; the visual BA; the prune;
+  - init_imu: gyro bias, gravity / scale / velocities, refinement, apply_init;
+  - the visual-inertial BA.
+  It uses `c/rd_solver_glue` (native Ceres via M4 + M5), `c/rd_sys_eigen.{h,c}` (MPL: JacobiSVD<Matrix3d>::solve,
+  Quaternion::FromTwoVectors), and `rd_qr_fullpiv_solve` in `c/rd_qr.c` (FullPivHouseholderQR<MatrixXd>::solve).
+- Eigen oracle: `reference_tools/rd_m9_eigen_test.cc` against the real Eigen 3.4.0. Random + initializer-shaped (42 x 28 / 42 x 27
+  with the -0.0 pattern) + rank-deficient FullPivHouseholderQR, JacobiSVD3 solve and FromTwoVectors. 20,000 / 50,000 cases per
+  seed, seeds 1-4: 0 mismatches.
+  Sensitivity: a reversed GEMV fold gives 31,758 mismatches; t / s instead of (1 / s) t gives 3,865.
+- Reference: patch `0011-m9-initializer-log.patch` (observe-only; `RDVIO_PORT_INIT_DIR`, `init.bin`; layouts in `c/check_rd_init.c`).
+  - At every `initialize()` it writes the full input map (frames with K / extrinsics / noise / IMU samples / bearings / track links;
+    tracks with tags / inverse depth / life / references), the state after init_sfm, the init_imu results and the final state.
+  - Build: `python3 -B rdvio_port/reference_cv/build_reference.py --root m9_reference_build`.
+  - Run: `RDVIO_CV_GRAY=<gray pack> RDVIO_PORT_INIT_DIR=runs/rdvio_port/m9/MH_01_easy/dump python3 tools/run_rdvio_reference.py
+    MH_01_easy --tag m9 --stock-binary runs/rdvio_port/m9_reference_build/build/rdvio_ref_driver`. Trajectory sha256 canonical.
+- Harness: `c/check_rd_init.c`, runner `--modules m9 [--oracle] [--sanitize]`. Every logged map is rebuilt in C and initialized,
+  then compared byte for byte.
+  - MH_01: 49 calls, 14 with a map (13 fail in init_sfm, 1 succeeds), `init: 0/55,879`, ASan/UBSan clean.
+  - Sensitivity: the gyro-bias normal equations as a tree give 2 mismatching records; the triangulation depth limit 100 -> 20 gives 3.
+  - Coverage is one successful initialization: other sequences would add more.
+
+## M8, M10, M11 (the C system) IN PROGRESS (2026-10-06, Claude): plan and state
+
+Written, compiled, not yet validated (no system harness yet):
+- `c/rd_map.{h,c}`: `rd_frame` carries the system state of `rdvio::Frame`: `t`, a shared refcounted `rd_image`, `sqrt_inv_cov`,
+  motion, `preint` / `kpreint` with their IMU sample lists, owned subframes. `clone` copies what `Frame::clone` copies; the
+  destructor frees the subframes after FRAMEDEL. M6 still passes.
+- `c/rd_solver_glue.{h,c}`: `rdvio::Solver` on the C state.
+  - Parameter blocks are added in call order (= Ceres program order), with the implicit appends of AddResidualBlock and the
+    constant flags of FT_FIX_POSE / FIX_MOTION.
+  - The six factors are built with the payloads and live reads of rd_solve.h; the marginalization factor's frames are found by id.
+  - Solving goes through `rd_sv_solve`, with write-back; `IsSolutionUsable` = CONVERGENCE / NO_CONVERGENCE / USER_SUCCESS.
+- `c/rd_yaml.{h,c}` (the YAML subset reader of okvis_port, own code) and `c/rd_sys_config.{h,c}` (Config defaults + YamlConfig
+  keys, verbatim values). They read `reference/configs/{setting,euroc_sensor}.yaml` correctly.
+
+Still to do:
+1. [written, `c/rd_sys_image.{h,c}`, validated only with the system] The `rd_image` implementation on `rd_cv_*`: preprocess = CLAHE +
+   pyramid, detect_keypoints (static GFTT, response sort, Poisson filter, 20 px border), track_keypoints (forward / backward LK,
+   rd_cv_track_status), release_image_buffer.
+2. [DONE for the initializer, see M9] The tracker still needs `Matrix4d::inverse()` (`predict_RT`, IMU-PARSAC).
+3. [M9 DONE] M10 `SlidingWindowTracker`
+   (mirror_frame, localize_newframe, manage_keyframe, track_landmark, refine_window, slide_window, refine_subwindow, the
+   IMU-PARSAC status logic: needs Codex's EPnP), M8 `FeatureTracker` + `Frontend` (run, synchronize_keymap, mirror_map /
+   mirror_lastframe / attach_latest_frame, the state machine), M11 `Handler` (gyro / accelerometer pairing,
+   propagate_state, predict_pose) + the driver (TUM output of `get_latest_state` with %.17g).
+4. `check_rd_system`: the C system from the undistorted images (until Codex's remap port: a gray pack of the driver's remapped
+   images) + `imu0/data.csv`. Lock-step against map.bin (every map event, digests at the frame ends), solve.bin of tag m5
+   (every 5th Solve: problem snapshot + END), and the canonical trajectory `f0d60a3e03c1...`, byte for byte.
+
+## Reserved for Codex (queued 2026-10-06): M7b undistortion (initUndistortRectifyMap + remap) and EPnP (solvePnP + Rodrigues)
+
+Paths: `rdvio_port/c/rd_cv_undist*`, `rd_cv_pnp*`, `check_rd_cv_undist*`, `check_rd_cv_pnp*`, additions in `rdvio_port/reference_cv/`,
+a new patch `0010-*`. Claude meanwhile works on the system layer (`rd_sys*`, `rd_solver_glue*`, `rd_map*`).
+
 ## M6 (map layer: Frame / Track / Map + the keypoint logic of detect / track_keypoints) DONE, bit-exact (2026-10-06, Claude)
 
 Deliverables

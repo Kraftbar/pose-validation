@@ -35,11 +35,33 @@ static void* grow(void* p, size_t* cap, size_t need, size_t elem) {
     return realloc(p, *cap * elem);
 }
 
+rd_image* rd_image_retain(rd_image* im) { if (im) im->refs++; return im; }
+void rd_image_release(rd_image* im) { if (im && --im->refs == 0 && im->destroy) im->destroy(im); }
+void rd_imu_list_insert(rd_imu_sample** a, size_t* n, size_t* cap, size_t at, const rd_imu_sample* src, size_t count) {
+    if (!count) return;
+    *a = (rd_imu_sample*)grow(*a, cap, *n + count, sizeof(rd_imu_sample));
+    memmove(*a + at + count, *a + at, (*n - at) * sizeof(rd_imu_sample));
+    memcpy(*a + at, src, count * sizeof(rd_imu_sample));
+    *n += count;
+}
+void rd_frame_sub_push(rd_frame* f, rd_frame* sub) {
+    f->sub = (rd_frame**)grow(f->sub, &f->csub, f->nsub + 1, sizeof(rd_frame*));
+    f->sub[f->nsub++] = sub;
+}
+rd_frame* rd_frame_sub_pop(rd_frame* f) { return f->nsub ? f->sub[--f->nsub] : NULL; }
+rd_frame* rd_frame_sub_take(rd_frame* f, size_t i) {
+    rd_frame* s = f->sub[i];
+    memmove(f->sub + i, f->sub + i + 1, (f->nsub - i - 1) * sizeof(rd_frame*));
+    f->nsub--;
+    return s;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ Frame */
 rd_frame* rd_frame_new(void) {
     rd_frame* f = (rd_frame*)calloc(1, sizeof *f);
     f->id = ++G_frame_id;
     f->pose_q.w = 1.0; f->cam_q.w = 1.0; f->imu_q.w = 1.0; f->delta_q.w = 1.0;
+    rd_pi_reset(&f->preint); rd_pi_reset(&f->kpreint);
     emit(3, NULL, f, NULL, f->id, 0, 0);
     return f;
 }
@@ -53,6 +75,13 @@ rd_frame* rd_frame_clone(const rd_frame* src) {
     f->cam_q = src->cam_q; memcpy(f->cam_p, src->cam_p, sizeof f->cam_p);
     f->imu_q = src->imu_q; memcpy(f->imu_p, src->imu_p, sizeof f->imu_p);
     f->delta_q = src->delta_q;
+    f->t = src->t;
+    f->image = rd_image_retain(src->image);
+    memcpy(f->sqrt_inv_cov, src->sqrt_inv_cov, sizeof f->sqrt_inv_cov);
+    f->motion = src->motion;
+    f->preint = src->preint;
+    rd_imu_list_insert(&f->data, &f->ndata, &f->cdata, 0, src->data, src->ndata);
+    rd_pi_reset(&f->kpreint);
     f->nkp = src->nkp; f->cap = src->nkp;
     f->bearing = (double*)malloc(sizeof(double) * 3 * (src->nkp ? src->nkp : 1));
     if (src->nkp) memcpy(f->bearing, src->bearing, sizeof(double) * 3 * src->nkp);
@@ -60,8 +89,12 @@ rd_frame* rd_frame_clone(const rd_frame* src) {
     return f;
 }
 void rd_frame_free(rd_frame* f) {
+    size_t i;
     if (!f) return;
     emit(4, NULL, f, NULL, 0, 0, 0);
+    for (i = 0; i < f->nsub; ++i) rd_frame_free(f->sub[i]);   /* member destruction after the destructor body */
+    rd_image_release(f->image);
+    free(f->sub); free(f->data); free(f->kdata);
     free(f->bearing); free(f->track); free(f);
 }
 static void frame_reserve(rd_frame* f, size_t n) {
@@ -495,4 +528,14 @@ static void map_recycle_track(rd_map* m, rd_track* t) {
     if (lo < m->nid && m->by_id[lo] == t) { memmove(m->by_id + lo, m->by_id + lo + 1, (m->nid - lo - 1) * sizeof(rd_track*)); m->nid--; }
     m->ntracks--;                                /* tracks.pop_back() destroys t */
     free(t->ref); free(t);
+}
+
+void rd_map_set_track_id(rd_map* m, rd_track* t, uint64_t id) {
+    size_t i, k;
+    for (i = 0; i < m->nid; ++i) if (m->by_id[i] == t) break;
+    if (i < m->nid) { memmove(m->by_id + i, m->by_id + i + 1, (m->nid - i - 1) * sizeof(rd_track*)); m->nid--; }
+    t->id = id;
+    for (k = 0; k < m->nid && m->by_id[k]->id < id; ++k) {}
+    memmove(m->by_id + k + 1, m->by_id + k, (m->nid - k) * sizeof(rd_track*));
+    m->by_id[k] = t; m->nid++;
 }

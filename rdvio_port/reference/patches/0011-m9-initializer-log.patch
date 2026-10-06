@@ -1,0 +1,132 @@
+diff -ruN a/src/rdvio/src/initializer.cpp b/src/rdvio/src/initializer.cpp
+--- a/src/rdvio/src/initializer.cpp	2026-10-06 10:12:27.097370289 +0200
++++ b/src/rdvio/src/initializer.cpp	2026-10-06 11:12:57.583135318 +0200
+@@ -10,7 +10,87 @@
+ #include <rdvio/map/frame.h>
+ #include <rdvio/map/map.h>
+ #include <rdvio/map/track.h>
+-
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++// rdvio_port instrumentation (reference build only, never distributed): the initializer log of module M9, RDVIO_PORT_INIT_DIR
++// (writes <dir>/init.bin). Framed records: u32 tag, u64 bytes, payload. Layouts in rdvio_port/c/check_rd_init.c. Observation only.
++namespace {
++struct PortInit {
++    FILE *f = nullptr;
++    bool checked = false;
++    FILE *get() {
++        if (!checked) {
++            checked = true;
++            if (const char *d = std::getenv("RDVIO_PORT_INIT_DIR")) f = std::fopen((std::string(d) + "/init.bin").c_str(), "wb");
++        }
++        return f;
++    }
++} g_port_init;
++struct PortBuf {
++    std::vector<unsigned char> b;
++    void raw(const void *p, size_t n) { const unsigned char *c = (const unsigned char *)p; b.insert(b.end(), c, c + n); }
++    void u32(uint32_t v) { raw(&v, 4); }
++    void u64(uint64_t v) { raw(&v, 8); }
++    void f64(double v) { raw(&v, 8); }
++    void f64n(const double *p, size_t n) { raw(p, 8 * n); }
++    void write(uint32_t tag) {
++        FILE *f = g_port_init.get();
++        if (!f) return;
++        uint64_t n = b.size();
++        std::fwrite(&tag, 4, 1, f); std::fwrite(&n, 8, 1, f);
++        if (n) std::fwrite(b.data(), 1, n, f);
++        std::fflush(f);
++    }
++};
++uint32_t port_ftags(const rdvio::Frame *f) {
++    uint32_t t = 0;
++    for (int k = 0; k <= (int)rdvio::FT_FIX_MOTION; ++k) if (f->tag((rdvio::FrameTag)k)) t |= 1u << k;
++    return t;
++}
++uint32_t port_ttags(const rdvio::Track *tr) {
++    uint32_t t = 0;
++    for (int k = 0; k <= (int)rdvio::TT_TEMP; ++k) if (tr->tag((rdvio::TrackTag)k)) t |= 1u << k;
++    return t;
++}
++size_t port_frame_index(rdvio::Map *map, const rdvio::Frame *f) {
++    for (size_t i = 0; i < map->frame_num(); ++i) if (map->get_frame(i) == f) return i;
++    return (size_t)-1;
++}
++/* full = the input map (everything the C initializer reads); otherwise the state the initializer writes */
++void port_snapshot(PortBuf &b, rdvio::Map *map, bool full) {
++    using namespace rdvio;
++    b.u64(map->frame_num());
++    for (size_t i = 0; i < map->frame_num(); ++i) {
++        Frame *f = map->get_frame(i);
++        b.u64(f->id()); b.u32(port_ftags(f));
++        b.f64n(f->pose.q.coeffs().data(), 4); b.f64n(f->pose.p.data(), 3);
++        b.f64n(f->motion.v.data(), 3); b.f64n(f->motion.bg.data(), 3); b.f64n(f->motion.ba.data(), 3);
++        if (!full) continue;
++        b.f64(f->image->t); b.f64n(f->K.data(), 9); b.f64n(f->sqrt_inv_cov.data(), 4);
++        b.f64n(f->camera.q_cs.coeffs().data(), 4); b.f64n(f->camera.p_cs.data(), 3);
++        b.f64n(f->imu.q_cs.coeffs().data(), 4); b.f64n(f->imu.p_cs.data(), 3);
++        b.f64n(f->preintegration.cov_w.data(), 9); b.f64n(f->preintegration.cov_a.data(), 9);
++        b.f64n(f->preintegration.cov_bg.data(), 9); b.f64n(f->preintegration.cov_ba.data(), 9);
++        b.u64(f->preintegration.data.size());
++        for (const auto &d : f->preintegration.data) { b.f64(d.t); b.f64n(d.w.data(), 3); b.f64n(d.a.data(), 3); }
++        b.u64(f->keypoint_num());
++        for (size_t k = 0; k < f->keypoint_num(); ++k) {
++            b.f64n(f->get_keypoint(k).data(), 3);
++            const Track *t = f->get_track(k);
++            b.u64(t ? t->id() : 0u);
++        }
++    }
++    b.u64(map->track_num());
++    for (size_t i = 0; i < map->track_num(); ++i) {
++        Track *t = map->get_track(i);
++        b.u64(t->id()); b.u32(port_ttags(t)); b.f64(t->landmark.inv_depth); b.u64(t->m_life);
++        b.u64(t->keypoint_map().size());
++        for (const auto &[fr, kp] : t->keypoint_map()) { b.u64(port_frame_index(map, fr)); b.u64(kp); }
++    }
++}
++} // namespace
+ namespace rdvio {
+ 
+ Initializer::Initializer(std::shared_ptr<Config> config) : config(config) {}
+@@ -74,11 +154,29 @@
+ }
+ 
+ std::unique_ptr<SlidingWindowTracker> Initializer::initialize() {
++    const bool port = g_port_init.get() != nullptr;
++    if (port) {   /* 1 INIT_IN: u32 has_map, [full snapshot] */
++        PortBuf b; b.u32(map ? 1u : 0u);
++        if (map) port_snapshot(b, map.get(), true);
++        b.write(1);
++    }
+     if (!map)
+         return nullptr;
+-    if (!init_sfm())
++    if (!init_sfm()) {
++        if (port) { PortBuf b; b.u32(0); b.write(2); }
+         return nullptr;
+-    if (!init_imu())
++    }
++    if (port) { PortBuf b; b.u32(1); port_snapshot(b, map.get(), false); b.write(2); }   /* 2 SFM: ok, [state] */
++    const bool port_imu_ok = init_imu();
++    if (port) {   /* 3 IMU: ok, bg, ba, gravity, scale, n, velocities, [state] */
++        PortBuf b; b.u32(port_imu_ok ? 1u : 0u);
++        b.f64n(bg.data(), 3); b.f64n(ba.data(), 3); b.f64n(gravity.data(), 3); b.f64(scale);
++        b.u64(velocities.size());
++        for (const auto &v : velocities) b.f64n(v.data(), 3);
++        if (port_imu_ok) port_snapshot(b, map.get(), false);
++        b.write(3);
++    }
++    if (!port_imu_ok)
+         return nullptr;
+ 
+     map->get_frame(0)->tag(FT_FIX_POSE) = true;
+@@ -131,6 +229,7 @@
+         map->get_frame(i)->tag(FT_KEYFRAME) = true;
+     }
+ 
++    if (port) { PortBuf b; port_snapshot(b, map.get(), false); b.write(4); }   /* 4 OUT: [state] */
+     std::unique_ptr<SlidingWindowTracker> tracker =
+         std::make_unique<SlidingWindowTracker>(std::move(map), config);
+     return tracker;

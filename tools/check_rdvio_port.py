@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the rdvio_port bit-exactness harnesses (tolerance 0, memcmp).
 
-  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5,m6,m7] [--tag m1] [--oracle] [--sanitize]
+  python3 tools/check_rdvio_port.py [--modules m1,m2,m3,m4,m5,m6,m7,m9] [--tag m1] [--oracle] [--sanitize]
 Per module: compile rdvio_port/c/check_rd_*.c (C99, -ffp-contract=off) together with the port and the okvis_port kernels it reuses,
 replay the dump files of runs/rdvio_port/<tag>/<seq>/dump (reference run with patch 0003) and, with --oracle, the random-input records
 written by the real RD-VIO classes (rdvio_port/reference_tools/rd_imu_oracle.cc, built against the reference build).
@@ -25,7 +25,8 @@ MODULES = {  # name -> (harness, port sources, oracle source, extra flags, extra
     "m3": ("check_rd_m3.c", ["rd_rand.c", "rd_ransac.c", "rd_poisson.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], "rd_m3_oracle.cc", [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
     "m4": ("check_rd_solve.c", M4_SRC, "rd_m4_oracle.cc", ["-I" + str(OK_DIR)], [str(OK_DIR / x) for x in ("ok_blas.c", "ok_sparse.c", "ok_amd.c")] + [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
     "m5": ("check_rd_m5.c", ["rd_marg.c", "rd_seig.c", "rd_imu.c", "rd_factor.c", "rd_lie.c", "rd_eigen.c"], "rd_m5_oracle.cc", [], []),
-    "m6": ("check_rd_map.c", ["rd_map.c", "rd_rand.c", "rd_ransac.c", "rd_poisson.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], None, [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
+    "m9": ("check_rd_init.c", ["rd_sys_init.c", "rd_map.c", "rd_solver_glue.c", "rd_sys_config.c", "rd_yaml.c", "rd_sys_eigen.c", "rd_solve.c", "rd_solve_linear.c", "rd_static.c", "rd_factor.c", "rd_imu.c", "rd_lie.c", "rd_eigen.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_marg.c", "rd_seig.c", "rd_rand.c", "rd_ransac.c", "rd_poisson.c"], None, ["-I" + str(OK_DIR)], [str(OK_DIR / x) for x in ("ok_kin.c", "ok_blas.c", "ok_sparse.c", "ok_amd.c")] + [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
+    "m6": ("check_rd_map.c", ["rd_map.c", "rd_imu.c", "rd_eigen.c", "rd_rand.c", "rd_ransac.c", "rd_poisson.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], None, [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
     "m2": ("check_rd_m2.c", ["rd_factor.c", "rd_geom.c", "rd_svd.c", "rd_qr.c", "rd_lie.c"], "rd_m2_oracle.cc", [], [str(STELLA / x) for x in ("sv_eigen_svd.c", "sv_eigen_qr.c", "sv_eigen_eigensolver.c")]),
 }
 OK_SRC = ["ok_eigen.c", "ok_dense.c"]
@@ -86,6 +87,7 @@ def main():
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--count4", default="300", help="number of random Ceres problems per seed for the m4 oracle (rd_m4_oracle)")
     ap.add_argument("--tag4", default="m5", help="dump run tag for the m4 module (solve.bin of run_rdvio_reference.py --solve-dump)")
+    ap.add_argument("--tag9", default="m9", help="initializer-log run tag for the m9 module (init.bin of patch 0011: RDVIO_PORT_INIT_DIR)")
     ap.add_argument("--tag6", default="m6", help="map-log run tag for the m6 module (map.bin of patch 0009: RDVIO_PORT_MAP_DIR, see rdvio_port/HANDOVER.md M6)")
     ap.add_argument("--tag5", default="m5", help="dump run tag for the m5 module (marg.bin, run_rdvio_reference.py --dump --dump-every marg=3 ...)")
     ap.add_argument("--chains5", default="40", help="number of random marginalisation chains per seed for the m5 oracle (rd_m5_oracle)")
@@ -113,7 +115,7 @@ def main():
         flags = ["-std=c99", "-O2", "-ffp-contract=off", "-Wall", "-Wextra", *xflags] + (["-fsanitize=address,undefined", "-g"] if a.sanitize else [])
         run(["cc", *flags, "-o", str(exe), str(PORT / "c" / harness), *[str(PORT / "c" / x) for x in srcs], *[str(OK / x) for x in OK_SRC], *xsrcs, "-lm"], check=True)
         dirs = []
-        dd = REPO / "runs/rdvio_port" / (a.tag if m == "m1" else a.tag2 if m == "m2" else a.tag3 if m == "m3" else a.tag4 if m == "m4" else a.tag6 if m == "m6" else a.tag5) / a.seq / "dump"
+        dd = REPO / "runs/rdvio_port" / (a.tag if m == "m1" else a.tag2 if m == "m2" else a.tag3 if m == "m3" else a.tag4 if m == "m4" else a.tag6 if m == "m6" else a.tag9 if m == "m9" else a.tag5) / a.seq / "dump"
         if dd.exists():
             dirs.append(("dump " + str(dd), dd))
         if a.oracle and oracle_src:
@@ -131,8 +133,20 @@ def main():
                 dirs.append((f"oracle seed {sd} x{a.count4 if m == 'm4' else a.count}", od))
         for name, d in dirs:
             print(f"== {m}: {name}")
-            r = run([str(exe), str(d)])
+            r = run([str(exe), str(d)], cwd=str(REPO))
             rc |= r.returncode
+        if m == "m9" and a.oracle:   # the Eigen kernels of the initializer against the real Eigen 3.4.0 (rd_m9_eigen_test.cc)
+            objs = []
+            for c in ("rd_qr.c", "rd_sys_eigen.c"):
+                o = BUILD / (c[:-2] + ".m9.o"); run(["cc", "-std=c99", "-O2", "-ffp-contract=off", "-fno-fast-math", "-c", str(PORT / "c" / c), "-o", str(o)], check=True); objs.append(str(o))
+            for c in (STELLA / "sv_eigen_svd.c", STELLA / "sv_eigen_qr.c", OK_DIR / "ok_eigen.c"):
+                o = BUILD / (c.stem + ".m9.o"); run(["cc", "-std=c99", "-O2", "-ffp-contract=off", "-fno-fast-math", "-c", str(c), "-o", str(o)], check=True); objs.append(str(o))
+            et = BUILD / "rd_m9_eigen_test"
+            run(["g++", "-std=c++17", "-O2", "-DNDEBUG", "-ffp-contract=off", "-fno-fast-math", "-I" + str(V / "deps/root/usr/include/eigen3"),
+                 str(PORT / "reference_tools/rd_m9_eigen_test.cc"), *objs, "-o", str(et)], check=True)
+            for sd in a.seeds.split(","):
+                print(f"== m9: Eigen oracle seed {sd}")
+                rc |= run([str(et), sd, "20000"]).returncode
     sys.exit(rc)
 
 

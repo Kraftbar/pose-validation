@@ -63,6 +63,13 @@ void rd_qr_colpiv(double *qr, int rows, int cols,
 void rd_qr_colpiv_householderq_full(const double *qr, int rows, int cols,
                                            const double *hcoeffs, double *Q, int dot_mode);
 
+/* Eigen::FullPivHouseholderQR<MatrixXd>(A).solve(b) for a vector b (RD-VIO Initializer::solve_gravity_scale_velocity /
+ * refine_scale_velocity_via_gravity). A: rows x cols column-major (copied), b: rows, x: cols. Pivot = the largest |a_ij| of the
+ * remaining corner (Eigen's maxCoeff visitor order: column 0 top to bottom, then the next columns, strict '>'), row swap of the
+ * row TAILS only, rank threshold |maxpivot| * epsilon * min(rows, cols), Householder vectors applied to the right-hand side with
+ * the inner-product kernel (one column), blocked upper-triangular solve (panels of 8, column-major GEMV updates). Returns the
+ * rank. */
+int rd_qr_fullpiv_solve(const double* A, int rows, int cols, const double* b, double* x);
 #ifdef __cplusplus
 }
 #endif

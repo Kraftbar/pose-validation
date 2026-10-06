@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../../okvis_port/c/ok_eigen.h"
+#include "rd_imu.h"
 
 #define RD_NIL ((size_t)-1)
 
@@ -54,6 +55,11 @@ enum { RD_TT_VALID = 0, RD_TT_TRIANGULATED, RD_TT_FIX_INVD, RD_TT_TRASH, RD_TT_S
 
 typedef struct rd_map rd_map;
 typedef struct rd_track rd_track;
+
+/* std::shared_ptr<Image>: the owner embeds this as the first member of its image object; clones share it */
+typedef struct rd_image { int refs; double t; void (*destroy)(struct rd_image* im); } rd_image;
+rd_image* rd_image_retain(rd_image* im);
+void rd_image_release(rd_image* im);
 
 typedef struct rd_frame {
     uint64_t id;
@@ -67,9 +73,23 @@ typedef struct rd_frame {
     ok_quat pose_q; double pose_p[3];
     ok_quat cam_q; double cam_p[3];        /* camera.q_cs, p_cs */
     ok_quat imu_q; double imu_p[3];        /* imu.q_cs, p_cs */
-    ok_quat delta_q;                       /* preintegration.delta.q */
-    void* user;                    /* the owner's per-frame data (later modules) */
+    ok_quat delta_q;                       /* preintegration.delta.q (the M6 replay sets it; the system uses preint.delta.q) */
+    void* user;                    /* the replay harness' object serial */
+    /* the system state of rdvio::Frame (modules M8-M11) */
+    double t;                              /* image->t */
+    rd_image* image;                       /* shared with clones */
+    double sqrt_inv_cov[4];                /* 2x2, column-major */
+    rd_motion motion;
+    rd_preint preint, kpreint;             /* preintegration, keyframe_preintegration (delta / jacobian / covariances) */
+    rd_imu_sample* data; size_t ndata, cdata;      /* preintegration.data */
+    rd_imu_sample* kdata; size_t nkdata, ckdata;   /* keyframe_preintegration.data */
+    struct rd_frame** sub; size_t nsub, csub;      /* subframes (owned) */
 } rd_frame;
+/* the IMU sample lists (std::vector<ImuData> insert / assign) */
+void rd_imu_list_insert(rd_imu_sample** a, size_t* n, size_t* cap, size_t at, const rd_imu_sample* src, size_t count);
+void rd_frame_sub_push(rd_frame* f, rd_frame* sub);           /* subframes.emplace_back */
+rd_frame* rd_frame_sub_pop(rd_frame* f);                      /* std::move(subframes.back()); subframes.pop_back() */
+rd_frame* rd_frame_sub_take(rd_frame* f, size_t i);           /* move out and erase element i (subframes.erase) */
 
 typedef struct rd_kref { rd_frame* frame; size_t kp; } rd_kref;
 
@@ -108,8 +128,10 @@ void rd_map_reset_ids(void);                       /* restart the Frame / Track 
 
 /* ---- Frame ---- */
 rd_frame* rd_frame_new(void);
-rd_frame* rd_frame_clone(const rd_frame* src);     /* Frame::clone: same id and tags, K / poses / extrinsics / delta / bearings; no tracks */
-void rd_frame_free(rd_frame* f);                   /* the destructor (reports FRAMEDEL) */
+rd_frame* rd_frame_clone(const rd_frame* src);     /* Frame::clone: same id and tags, K, sqrt_inv_cov, image (shared), pose, motion,
+                                                      camera, imu, preintegration (with its data), bearings; no tracks, no
+                                                      keyframe_preintegration, no subframes */
+void rd_frame_free(rd_frame* f);                   /* the destructor: reports FRAMEDEL, then destroys the subframes in order */
 void rd_frame_append_keypoint(rd_frame* f, const double b[3]);
 rd_track* rd_frame_get_track(rd_frame* f, size_t kp, rd_map* allocation_map);   /* allocates in allocation_map (NULL: f->map) */
 void rd_apply_k(const double b[3], const double K[9], double px[2]);
@@ -151,6 +173,8 @@ rd_track* rd_map_create_track(rd_map* m);
 void rd_map_erase_track(rd_map* m, rd_track* t);
 void rd_map_prune_tracks(rd_map* m, int (*condition)(void* ctx, const rd_track* t), void* ctx);
 rd_track* rd_map_get_track_by_id(const rd_map* m, uint64_t id);
+/* replay harnesses: give a track a logged id (re-sorts the id index) */
+void rd_map_set_track_id(rd_map* m, rd_track* t, uint64_t id);
 
 /* std::sort(first, last, comp) of libstdc++ (introsort: median of 3, unguarded partition, depth 2 log2 n, insertion sort below
  * 16); comp(a, b) = a strictly before b. Exposed for the later modules (sorts with ties). */

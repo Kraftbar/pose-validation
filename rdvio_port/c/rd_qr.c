@@ -340,3 +340,95 @@ void rd_qr_colpiv_householderq_full(const double *qr, int rows, int cols,
     free(scaled);
     free(essential);
 }
+
+/* --------------------------------------------------------------------
+ * FullPivHouseholderQR<MatrixXd>::computeInPlace + _solve_impl (vector rhs).
+ * -------------------------------------------------------------------- */
+int rd_qr_fullpiv_solve(const double *A, int rows, int cols, const double *b, double *x) {
+    const int size = rows < cols ? rows : cols;
+    double *qr = (double *)malloc(sizeof(double) * (size_t)rows * (size_t)cols);
+    double *hc = (double *)calloc((size_t)(size ? size : 1), sizeof(double));
+    double *tmp = (double *)calloc((size_t)(cols + 1), sizeof(double));
+    double *sess = (double *)calloc((size_t)(rows + 1), sizeof(double));
+    double *c = (double *)malloc(sizeof(double) * (size_t)(rows ? rows : 1));
+    int *rt = (int *)calloc((size_t)(size ? size : 1), sizeof(int));
+    int *ct = (int *)calloc((size_t)(size ? size : 1), sizeof(int));
+    int *perm = (int *)malloc(sizeof(int) * (size_t)(cols ? cols : 1));
+    int k, i, j, nonzero = size, rank = 0;
+    double biggest = 0.0, maxpivot = 0.0;
+    const double precision = SV_EPS * (double)size;
+    memcpy(qr, A, sizeof(double) * (size_t)rows * (size_t)cols);
+    for (k = 0; k < size; ++k) {
+        /* maxCoeff(&row, &col) over |corner|: init with (0,0), then column 0 rows 1.., then the other columns; strict '>' */
+        int br = k, bc = k;
+        double best = fabs(qr[(size_t)k * rows + k]), beta;
+        for (j = k; j < cols; ++j)
+            for (i = (j == k ? k + 1 : k); i < rows; ++i) {
+                const double v = fabs(qr[(size_t)j * rows + i]);
+                if (v > best) { best = v; br = i; bc = j; }
+            }
+        if (k == 0) biggest = best;
+        if (best <= biggest * precision) {     /* isMuchSmallerThan(biggest_in_corner, biggest, precision) */
+            nonzero = k;
+            for (i = k; i < size; ++i) { rt[i] = i; ct[i] = i; hc[i] = 0.0; }
+            break;
+        }
+        rt[k] = br; ct[k] = bc;
+        if (k != br)
+            for (j = k; j < cols; ++j) { const double t = qr[(size_t)j * rows + k]; qr[(size_t)j * rows + k] = qr[(size_t)j * rows + br]; qr[(size_t)j * rows + br] = t; }
+        if (k != bc)
+            for (i = 0; i < rows; ++i) { const double t = qr[(size_t)k * rows + i]; qr[(size_t)k * rows + i] = qr[(size_t)bc * rows + i]; qr[(size_t)bc * rows + i] = t; }
+        beta = make_householder_in_place(qr, rows, k, k, rows - k, &hc[k]);
+        qr[(size_t)k * rows + k] = beta;
+        if (fabs(beta) > maxpivot) maxpivot = fabs(beta);
+        if (cols - k - 1 > 0)
+            apply_householder_left(qr, rows, k, k + 1, rows - k, cols - k - 1, qr + (size_t)k * rows + k + 1, hc[k], tmp, sess, 0);
+    }
+    for (j = 0; j < cols; ++j) perm[j] = j;                       /* m_cols_permutation: transpositions on the right */
+    for (k = 0; k < size; ++k) { const int t = perm[k]; perm[k] = perm[ct[k]]; perm[ct[k]] = t; }
+    {   /* rank() */
+        const double thr = fabs(maxpivot) * (SV_EPS * (double)size);
+        for (i = 0; i < nonzero; ++i) rank += fabs(qr[(size_t)i * rows + i]) > thr;
+    }
+    if (rank == 0) {
+        for (j = 0; j < cols; ++j) x[j] = 0.0;
+    } else {
+        memcpy(c, b, sizeof(double) * (size_t)rows);
+        for (k = 0; k < rank; ++k) {
+            const int rem = rows - k;
+            { const double t = c[k]; c[k] = c[rt[k]]; c[rt[k]] = t; }
+            /* c.bottomRightCorner(rem, 1).applyHouseholderOnTheLeft(qr.col(k).tail(rem - 1), h_k, temp): one column, inner product */
+            apply_householder_left(c, rows, k, 0, rem, 1, qr + (size_t)k * rows + k + 1, hc[k], tmp, sess, 0);
+        }
+        {   /* triangular_solve_vector<OnTheLeft, Upper, ColMajor> on c.topRows(rank): panels of 8 from the bottom */
+            const int n = rank;
+            int pi;
+            for (pi = n; pi > 0; pi -= 8) {
+                const int pw = pi < 8 ? pi : 8, start = pi - pw;
+                int kk;
+                for (kk = 0; kk < pw; ++kk) {
+                    const int ii = pi - kk - 1;
+                    if (c[ii] != 0.0) {
+                        const int r = pw - kk - 1, s0 = ii - r;
+                        int q;
+                        c[ii] /= qr[(size_t)ii * rows + ii];
+                        for (q = 0; q < r; ++q) c[s0 + q] -= c[ii] * qr[(size_t)ii * rows + s0 + q];
+                    }
+                }
+                if (start > 0) {                                /* res(0..start) += -1 * L(0..start, start..pi) * c(start..pi) */
+                    int row;
+                    for (row = 0; row < start; ++row) {
+                        double acc = 0.0;
+                        int col;
+                        for (col = start; col < pi; ++col) acc += qr[(size_t)col * rows + row] * c[col];
+                        c[row] = c[row] + acc * -1.0;
+                    }
+                }
+            }
+        }
+        for (i = 0; i < rank; ++i) x[perm[i]] = c[i];
+        for (i = rank; i < cols; ++i) x[perm[i]] = 0.0;
+    }
+    free(qr); free(hc); free(tmp); free(sess); free(c); free(rt); free(ct); free(perm);
+    return rank;
+}
