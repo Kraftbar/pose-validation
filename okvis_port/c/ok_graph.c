@@ -3,6 +3,7 @@
 #include "ok_graph.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ok_cam.h"
@@ -88,6 +89,95 @@ void ok_graph_update_landmark(double hp[4], const ok_lm_obs* obs, int nobs, doub
     }
     *initialised_out = isInitialised;
     *quality_out = (0.0 < quality) ? quality : 0.0;
+}
+
+/* OKVIS2-X: quality = ((dirs.colwise() - dirs.rowwise().mean()).square().rowwise().sum()).sqrt().norm() over the o
+ * inlier ray directions (3 x o, column-major). Measured against Eigen 3.4.0 (okvis_graph_x_test.cc):
+ * - the mean is a partial redux into a 3-vector temporary whose packet rows start at `mean_pkt` (the runtime alignment
+ *   of that temporary: 1 in the oracle). The two packet rows are summed by packetwise_redux (first column, groups of
+ *   four as (a + b) + (c + d), then the rest one by one); the other row is a scalar left fold. Then each is divided by o.
+ * - the outer rowwise().sum() of the squared deviations is a scalar left fold in every row.
+ * o == 0: the sums are 0 and the quality is 0. */
+int ok_graph_x_mean_pkt = 1;
+int ok_graph_okvis2x = 0;
+static double rs_left(const double* v, int o, int r) { double s = v[r]; int i; for (i = 1; i < o; ++i) s = s + v[r + 3 * i]; return s; }
+static double rs_packet(const double* v, int o, int r) {
+    double s = v[r];
+    int i = 1;
+    const int size4 = (o - 1) & ~3;
+    for (; i < size4; i += 4) s = s + ((v[r + 3 * i] + v[r + 3 * (i + 1)]) + (v[r + 3 * (i + 2)] + v[r + 3 * (i + 3)]));
+    for (; i < o; ++i) s = s + v[r + 3 * i];
+    return s;
+}
+double ok_graph_dir_std_quality(const double* dirs, int o) {
+    double mean[3], sd[3];
+    int r, i;
+    if (o == 0) return 0.0;
+    for (r = 0; r < 3; ++r) {
+        const int pkt = r == ok_graph_x_mean_pkt || r == ok_graph_x_mean_pkt + 1;
+        mean[r] = (pkt ? rs_packet(dirs, o, r) : rs_left(dirs, o, r)) / (double)o;
+    }
+    for (r = 0; r < 3; ++r) {
+        double d = dirs[r] - mean[r], s = d * d;
+        for (i = 1; i < o; ++i) { d = dirs[r + 3 * i] - mean[r]; s = s + d * d; }
+        sd[r] = sqrt(s);
+    }
+    return ok_v3_norm(sd);
+}
+
+/* OKVIS2-X ViGraph::updateLandmarks for one landmark: as OKVIS2, but pos_Ci is dehomogenised BEFORE the direction is
+ * taken, the residual is evaluated without Jacobians, no Hessian / minimum depth, and quality = the direction standard
+ * deviation above (initialised if > 0.04; no "behind" zeroing; quality stored as is). */
+void ok_graph_update_landmark_x(double hp[4], const ok_lm_obs* obs, int nobs, double* quality_out, int* initialised_out) {
+    const int num = nobs;
+    int isInitialised = 0, behind = 0, o, k = 0;
+    double quality = 0.0, best_err = 1.0e12, best_pos[4] = {0.0, 0.0, 0.0, 0.0}, hp_W[4];
+    double* dirs = (double*)malloc(sizeof(double) * 3 * (size_t)(num > 0 ? num : 1));
+    memcpy(hp_W, hp, sizeof hp_W);
+    if (num > 0) {
+        for (o = 0; o < num; ++o) {
+            const ok_lm_obs* ob = &obs[o];
+            ok_tf T_WS, T_SCi, T_WCi, T_CiW;
+            double pos_Ci[4], dir[3], dir_W[3], err[2], err_norm;
+            double* jac[3] = {NULL, NULL, NULL};
+            double* jacmin[3] = {NULL, NULL, NULL};
+            const double* params[3];
+            ok_tf_convert(&T_WS, ob->pose);
+            ok_tf_convert(&T_SCi, ob->extr);
+            ok_tf_mul(&T_WS, &T_SCi, &T_WCi, 1);
+            ok_tf_inverse(&T_WCi, &T_CiW, 1);
+            ok_tf_mul_v4(&T_CiW, hp_W, pos_Ci, 1);
+            if (fabs(pos_Ci[3]) > 1.0e-12) {
+                const double w = pos_Ci[3];
+                pos_Ci[0] = pos_Ci[0] / w; pos_Ci[1] = pos_Ci[1] / w; pos_Ci[2] = pos_Ci[2] / w; pos_Ci[3] = pos_Ci[3] / w;
+            }
+            ok_m3_mulv(T_WCi.C, pos_Ci, dir);
+            ok_v3_normalized(dir, dir_W);
+            if (pos_Ci[2] < 0.1) behind = 1;
+            if (pos_Ci[2] < 0.0) { dir_W[0] = -dir_W[0]; dir_W[1] = -dir_W[1]; dir_W[2] = -dir_W[2]; }
+            params[0] = ob->pose; params[1] = hp; params[2] = ob->extr;
+            ok_reproj_err_evaluate(&ob->err, params, err, jac, jacmin);
+            err_norm = sqrt(err[0] * err[0] + err[1] * err[1]);
+            if (err_norm > 2.5) continue;
+            if (err_norm < best_err && ok_v4_norm(pos_Ci) > 0.0001) {
+                const double nrm = ok_v4_norm(pos_Ci);
+                const double dist = (0.1 < nrm) ? nrm : 0.1;
+                best_pos[0] = T_WCi.r[0] + dist * dir_W[0];
+                best_pos[1] = T_WCi.r[1] + dist * dir_W[1];
+                best_pos[2] = T_WCi.r[2] + dist * dir_W[2];
+                best_pos[3] = 1.0;
+                best_err = err_norm;
+            }
+            memcpy(dirs + 3 * k, dir_W, sizeof dir_W);
+            ++k;
+        }
+        quality = ok_graph_dir_std_quality(dirs, k);
+        if (quality > 0.04) isInitialised = 1;
+        else if (behind && ok_v4_norm(best_pos) > 1.0e-12) memcpy(hp, best_pos, sizeof best_pos);
+    }
+    free(dirs);
+    *initialised_out = isInitialised;
+    *quality_out = quality;
 }
 
 /* ---- dump readers ---- */

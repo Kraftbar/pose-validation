@@ -3,6 +3,7 @@
  * Every function mirrors the C++ method of the same name; every call into one of the two graphs is reported to
  * hooks.trace in the layout of the patch-0010 record (arguments and results, pointer fields zeroed). */
 #include "ok_vslam.h"
+#include "ok_vggps.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,7 @@ typedef struct aux {           /* AuxiliaryState */
 typedef struct backlog { ok_time t; uint64_t id; ok_imu_meas* meas; size_t n; } backlog;
 typedef struct relinfo { double T[7]; double info[36]; uint64_t pi, pj; } relinfo;
 typedef struct elimpair { uint64_t id, ref; } elimpair;
+typedef struct gpsbl { uint64_t id; ok_gps_fix f; ok_imu_meas* imu; size_t nimu; int reinit; } gpsbl;   /* AddGpsBacklog */
 
 struct ok_vsb {
     ok_vsb_hooks h;
@@ -67,6 +69,8 @@ struct ok_vsb {
     relinfo* rel; int nrel, caprel;
     uint64_t last_freeze;
     int needs_full, is_loop_closing, is_loop_closure_available;
+    int gps_on, gps_observable;                 /* OKVIS2-X: addGps was called; ViSlamBackend::gpsObservability_ */
+    gpsbl* gbl; int ngbl, capgbl;               /* addGpsBacklog_ */
 };
 
 #define NOW_LOOP(b) ((b)->is_loop_closing || (b)->is_loop_closure_available)
@@ -283,6 +287,8 @@ static void reset_state(ok_vsb* b) {
     idset_clear(&b->imu_frames); idset_clear(&b->key_frames); idset_clear(&b->lc_frames); idset_clear(&b->cur_lc_frames);
     idset_clear(&b->touched_states); idset_clear(&b->touched_landmarks); idset_clear(&b->updated_lc_attempt);
     for (i = 0; i < b->nbl; ++i) free(b->bl[i].meas);
+    for (i = 0; i < b->ngbl; ++i) free(b->gbl[i].imu);
+    b->ngbl = 0;
     b->nbl = 0; b->nelim = 0; b->nrel = 0; b->last_freeze = 0;
     b->needs_full = b->is_loop_closing = b->is_loop_closure_available = 0;
 }
@@ -292,7 +298,7 @@ void ok_vsb_free(ok_vsb* b) {
     reset_state(b);
     ok_vg_free(b->g[0]); ok_vg_free(b->g[1]);
     for (i = 0; i < OK_VSB_MAXCAM; ++i) free(b->cam_header[i]);
-    free(b->frames); free(b->aux); free(b->elim); free(b->bl); free(b->rel);
+    free(b->frames); free(b->aux); free(b->elim); free(b->bl); free(b->rel); free(b->gbl);
     ok_idset_free(&b->aux_ids); ok_idset_free(&b->imu_frames); ok_idset_free(&b->key_frames); ok_idset_free(&b->lc_frames);
     ok_idset_free(&b->cur_lc_frames); ok_idset_free(&b->touched_states); ok_idset_free(&b->touched_landmarks); ok_idset_free(&b->updated_lc_attempt);
     free(b);
@@ -605,6 +611,10 @@ int ok_vsb_clean_unobserved_landmarks(ok_vsb* b) {
     return removed1;
 }
 
+/* OKVIS2-X: applyStrategy no longer clears the images of frames converted to the pose graph, so overlapFraction keeps
+ * seeing them (matchMotionStereo then matches against them) */
+int ok_vsb_okvis2x = 0;
+
 double ok_vsb_overlap_fraction(const ok_vsb* b, uint64_t ida, uint64_t idb) {
     const vframe* fa = (ida < (uint64_t)b->nframes_alloc && b->frames[ida].alive) ? &b->frames[ida] : NULL;
     const vframe* fb = (idb < (uint64_t)b->nframes_alloc && b->frames[idb].alive) ? &b->frames[idb] : NULL;
@@ -799,7 +809,22 @@ int ok_vsb_optimise_realtime(ok_vsb* b, int num_iter, int num_threads, int verbo
         ok_vg_state_at(rt, i, &v);
         if (v.pose_fixed && v.sb_fixed) break;
         if (!ok_idset_has(&b->updated_lc_attempt, v.id)) push_id(updated, nupdated, &cap, v.id);
-        if (!NOW_LOOP(b)) copy_state_to_full(b, v.id);
+        if (!NOW_LOOP(b)) {
+            copy_state_to_full(b, v.id);
+            if (b->gps_on) { double tg[7]; ok_vg_gps_get_T_GW(rt, tg); ok_vg_gps_set_T_GW(b->g[1], tg); }   /* fullState.T_GW->setEstimate(riter T_GW) */
+        }
+    }
+    if (b->gps_on) {                                    /* "Check if GPS Trafo observable" */
+        double tg[7];
+        if (!b->gps_observable) {                       /* not yet observable: copy the estimate to the full graph if it is accessible */
+            if (!NOW_LOOP(b)) { ok_vg_gps_get_T_GW(rt, tg); ok_vg_gps_set_T_GW(b->g[1], tg); }
+        } else if (!ok_vgps_is_fixed(rt)) {             /* observable: freeze both once the full graph is accessible */
+            if (!NOW_LOOP(b)) {
+                ok_vgps_freeze(rt);
+                ok_vg_gps_get_T_GW(rt, tg); ok_vg_gps_set_T_GW(b->g[1], tg);
+                ok_vgps_freeze(b->g[1]);
+            }
+        }
     }
     idset_clear(&b->updated_lc_attempt);
     if (!NOW_LOOP(b)) {
@@ -1107,7 +1132,7 @@ int ok_vsb_apply_strategy(ok_vsb* b, size_t num_kf, size_t num_lc, size_t num_im
                 continue;
             }
             convert_to_pose_graph_mst(b, &convert, &consider, &affected);
-            for (i = 0; i < convert.n; ++i) {                    /* free image memory now */
+            for (i = 0; i < convert.n && !ok_vsb_okvis2x; ++i) { /* free image memory now (OKVIS2-X keeps the images) */
                 vframe* f = fr_get(b, convert.a[i]);
                 if (f) { int c; for (c = 0; c < f->ncam; ++c) f->cam[c].images_cleared = 1; }
             }
@@ -1588,6 +1613,32 @@ int ok_vsb_synchronise(ok_vsb* b, uint64_t** updated_out, int* nupdated) {
         }
     }
 
+    /* ----- gps stuff begin ----- */
+    if (b->gps_on) {
+        for (i = 0; i < b->ngbl; ++i) {                 /* process buffered gps measurements */
+            const gpsbl* gl = &b->gbl[i];
+            if (ok_vg_state_find(full, gl->id, NULL)) {
+                if (gl->reinit) ok_vgps_reinit(full);
+                ok_vgps_add_measurement(full, gl->id, &gl->f, gl->imu, gl->nimu);
+                ok_gnss_logf("BL processed sid=%llu\n", (unsigned long long)gl->id);
+            }
+        }
+        for (i = 0; i < b->ngbl; ++i) free(b->gbl[i].imu);
+        b->ngbl = 0;
+        if (!ok_vgps_is_fixed(full)) {                  /* only if fullGraph_.T_GW has not yet been fixed */
+            double tg[7];
+            ok_vg_gps_get_T_GW(full, tg);               /* fullGraph optimisation result */
+            ok_vg_gps_set_T_GW(rt, tg);
+            ok_gnss_logf("TG %d copy-from-full %.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g obs=%d\n", 0, tg[0], tg[1], tg[2], tg[3], tg[4], tg[5], tg[6], b->gps_observable);
+            if (b->gps_observable) {                    /* copy results and FIX */
+                ok_vg_gps_set_T_GW(rt, tg);
+                ok_vgps_freeze(full);
+                ok_vgps_freeze(rt);
+            }
+        }
+    }
+    /* ----- gps stuff end ----- */
+
     /* copy the result over now */
     for (i = ok_vg_state_count(full) - 1; i >= 0; --i) {
         ok_vg_state_view fv, rv;
@@ -1706,6 +1757,298 @@ int ok_vsb_synchronise(ok_vsb* b, uint64_t** updated_out, int* nupdated) {
  * clear / doFinalBa
  * ---------------------------------------------------------------------------------------------------------------- */
 int ok_vsb_clear(ok_vsb* b) { (void)b; return 0; }          /* ViGraphEstimator::clear is not ported (never exercised) */
+/* ------------------------------------------------------------------------------------------------------------------
+ * OKVIS2-X GNSS (ViSlamBackend.cpp:52-166, 1545, 2557, 2663)
+ * ---------------------------------------------------------------------------------------------------------------- */
+int ok_vsb_add_gps(ok_vsb* b, const double r_SA[3], double yaw_error_threshold, int robust) {
+    int w;
+    for (w = 1; w >= 0; --w) {                          /* fullGraph_ first, then realtimeGraph_ */
+        if (ok_vgps_add_gps(b->g[w], r_SA, yaw_error_threshold, robust)) return -1;
+        ok_vgps_set_name(b->g[w], w);
+    }
+    b->gps_on = 1;
+    return 0;
+}
+int ok_vsb_gps_enabled(const ok_vsb* b) { return b->gps_on; }
+void ok_vsb_T_GW(const ok_vsb* b, double T7[7]) { ok_vg_gps_get_T_GW(b->g[0], T7); }
+
+/* addGpsAlignmentFrame(gpsLossFrameId) */
+static void add_gps_alignment_frame(ok_vsb* b, uint64_t loss_id) {
+    ok_vg* full = b->g[1];
+    ok_vg_state_view sv;
+    ok_time oldest_t;
+    int idx, ctr = 0;
+    ok_gnss_logf("AF start=%llu\n", (unsigned long long)loss_id);
+    ok_vg_state_find(full, loss_id, &sv);
+    oldest_t = sv.ts;
+    idx = ok_vg_state_index(full, loss_id);
+    for (;; --idx) {
+        if (ctr == 12 || idx == 0) {
+            ok_vg_state_at(full, idx, &sv);
+            while (ok_duration_to_sec(ok_time_sub(oldest_t, sv.ts)) < 2.0) {
+                if (idx == 0) break;
+                --idx;
+                ok_vg_state_at(full, idx, &sv);
+            }
+            w_unfreeze_poses(b, 1, sv.id);
+            if (idx != 0) w_freeze_poses(b, 1, sv.id, 0);
+            w_unfreeze_sb(b, 1, sv.id);
+            if (idx != 0) w_freeze_sb(b, 1, sv.id, 0);
+            break;
+        }
+        ctr++;                                           /* count states that will be optimised during global alignment */
+    }
+    b->needs_full = 1;                                   /* needsFullGraphOptimisation_ = true */
+}
+
+static void cached_pose(const ok_vg* g, uint64_t id, ok_tf* T) { double c[7]; ok_vg_pose_values(g, id, c); ok_tf_convert(T, c); }
+
+/* attemptFullGpsAlignment(pose_i, pose_j, T_GW_new) */
+static int attempt_full_gps_alignment(ok_vsb* b, uint64_t pose_i, uint64_t pose_j, const double T_GW_new7[7]) {
+    ok_vg* rt = b->g[0];
+    ok_tf T_GW_old, T_GW_new, T_GW_old_inv, T_Wold_Wnew_final, T_WSj, T_WSj_old, T_WW, T_WS_prev, T_WS;
+    double tg[7], aa_angle, axis[3], dr_W[3], distance_travelled = 0.0, *distances;
+    int ns, idx_i, i, ctr = 0, num_variable;
+    ok_quat q;
+    ok_vg_state_view v;
+    if (!ok_vg_state_find(rt, pose_i, NULL)) return 0;
+    if (!ok_vg_state_find(rt, pose_j, NULL)) return 0;
+    ok_vg_gps_get_T_GW(rt, tg); ok_tf_convert(&T_GW_old, tg);               /* realtimeGraph_.T_GW(pose_i) */
+    ok_tf_convert(&T_GW_new, T_GW_new7);
+    cached_pose(rt, pose_j, &T_WSj);
+    ok_tf_inverse(&T_GW_old, &T_GW_old_inv, 1);
+    ok_tf_mul(&T_GW_old_inv, &T_GW_new, &T_Wold_Wnew_final, 1);
+    ok_tf_mul(&T_Wold_Wnew_final, &T_WSj, &T_WSj_old, 1);
+    ns = ok_vg_state_count(rt);
+    idx_i = ok_vg_state_index(rt, pose_i);
+    num_variable = ns - idx_i;
+    distances = (double*)malloc(sizeof(double) * (size_t)(ns + 1));
+    {   ok_tf Ti, Tj;
+        cached_pose(rt, pose_i, &Ti);
+        for (i = idx_i + 1; i < ns; ++i) {
+            double dv[3], ds;
+            ok_vg_state_at(rt, i, &v);
+            cached_pose(rt, v.id, &Tj);
+            dv[0] = Tj.r[0] - Ti.r[0]; dv[1] = Tj.r[1] - Ti.r[1]; dv[2] = Tj.r[2] - Ti.r[2];
+            ds = ok_v3_norm(dv);
+            distances[ctr++] = ds;
+            distance_travelled += ds;
+            Ti = Tj;
+        }
+    }
+    /* rotation increment for the later averaging */
+    ok_quat_to_angle_axis(&T_Wold_Wnew_final.q, &aa_angle, axis);
+    aa_angle = aa_angle * (1.0 / (double)num_variable);
+    q = ok_quat_from_angle_axis(aa_angle, axis);
+    { const double zero[3] = {0.0, 0.0, 0.0}; ok_tf_from_rq(&T_WW, zero, &q, 1); }
+    cached_pose(rt, pose_i, &T_WS_prev);
+    cached_pose(rt, pose_i, &T_WS);
+    for (i = idx_i + 1; i < ns; ++i) {
+        ok_tf T_WSk_old, prev_inv, T_SS, t1;
+        ok_vg_state_at(rt, i, &v);
+        cached_pose(rt, v.id, &T_WSk_old);
+        ok_tf_inverse(&T_WS_prev, &prev_inv, 1);
+        ok_tf_mul(&prev_inv, &T_WSk_old, &T_SS, 1);
+        T_WS_prev = T_WSk_old;
+        ok_tf_mul(&T_WW, &T_WS, &t1, 1);
+        ok_tf_mul(&t1, &T_SS, &T_WS, 1);                 /* T_WS = T_WW * T_WS * T_SS */
+    }
+    for (i = 0; i < 3; ++i) dr_W[i] = T_WSj_old.r[i] - T_WS.r[i];
+    /* full adjustments */
+    cached_pose(rt, pose_i, &T_WS_prev);
+    cached_pose(rt, pose_i, &T_WS);
+    ctr = 0;
+    {
+        double r = 0.0;
+        for (i = idx_i + 1; i < ns; ++i) {
+            ok_tf T_WSk_old, prev_inv, T_SS, t1, T_WS_set, T_Wnew_Wold, old_inv;
+            double sb[9], v_new[3], c7[7], set7[7], rr[3];
+            ok_quat qq;
+            ok_vg_state_at(rt, i, &v);
+            cached_pose(rt, v.id, &T_WSk_old);
+            ok_tf_inverse(&T_WS_prev, &prev_inv, 1);
+            ok_tf_mul(&prev_inv, &T_WSk_old, &T_SS, 1);
+            T_WS_prev = T_WSk_old;
+            r += distances[ctr] / distance_travelled;
+            ok_tf_mul(&T_WW, &T_WS, &t1, 1);
+            ok_tf_mul(&t1, &T_SS, &T_WS, 1);
+            ++ctr;
+            rr[0] = r * dr_W[0]; rr[1] = r * dr_W[1]; rr[2] = r * dr_W[2];
+            c7[0] = T_WS.r[0] + rr[0]; c7[1] = T_WS.r[1] + rr[1]; c7[2] = T_WS.r[2] + rr[2];
+            qq = T_WS.q;
+            ok_tf_from_rq(&T_WS_set, c7, &qq, 1);
+            ok_tf_inverse(&T_WSk_old, &old_inv, 1);
+            ok_tf_mul(&T_WS_set, &old_inv, &T_Wnew_Wold, 1);
+            ok_vg_sb_values(rt, v.id, sb);
+            ok_m3_mulv(T_Wnew_Wold.C, sb, v_new);
+            sb[0] = v_new[0]; sb[1] = v_new[1]; sb[2] = v_new[2];
+            tf_to_coeffs(&T_WS_set, set7);
+            w_set_pose(b, 0, v.id, set7);
+            w_set_pose(b, 1, v.id, set7);
+            w_set_sb(b, 0, v.id, sb);
+            w_set_sb(b, 1, v.id, sb);
+        }
+    }
+    {   const int nl = ok_vg_landmark_count(rt);           /* update landmarks */
+        for (i = 0; i < nl; ++i) {
+            ok_vg_lm_view lv; double hn[4];
+            ok_vg_landmark_find(rt, ok_vg_landmark_id_at(rt, i), &lv);
+            ok_tf_mul_v4(&T_Wold_Wnew_final, lv.hp, hn, 1);
+            w_set_landmark_full(b, 0, lv.id, hn, lv.initialised);
+            w_set_landmark_full(b, 1, lv.id, hn, lv.initialised);
+        }
+    }
+    free(distances);
+    ok_gnss_logf("AL full i=%llu j=%llu nvar=%d dist=%.17g\n", (unsigned long long)pose_i, (unsigned long long)pose_j, num_variable, distance_travelled);
+    return 1;
+}
+
+/* attemptPosGpsAlignment(pose_i, pose_j, posAlignVec) */
+static int attempt_pos_gps_alignment(ok_vsb* b, uint64_t pose_i, uint64_t pose_j, const double r_Wold_Wnew[3]) {
+    ok_vg* rt = b->g[0];
+    ok_vg_state_view v;
+    int ns, idx_i, i, counter = 0;
+    uint64_t last_id = pose_i;
+    double full_distance = 0.0, distance_travelled = 0.0, *distances;
+    if (!ok_vg_state_find(rt, pose_i, NULL)) return 0;
+    if (!ok_vg_state_find(rt, pose_j, NULL)) return 0;
+    w_unfreeze_poses(b, 1, pose_i);
+    w_freeze_poses(b, 1, pose_i, 0);
+    w_unfreeze_sb(b, 1, pose_i);
+    w_freeze_sb(b, 1, pose_i, 0);
+    ns = ok_vg_state_count(rt);
+    idx_i = ok_vg_state_index(rt, pose_i);
+    distances = (double*)malloc(sizeof(double) * (size_t)(ns + 1));
+    {   int nd = 0;
+        for (i = idx_i + 1; i < ns; ++i) {
+            double pa[7], pb[7], dv[3], ds;
+            ok_vg_state_at(rt, i, &v);
+            if (v.id > pose_j) break;
+            ok_vg_pose_values(rt, v.id, pa); ok_vg_pose_values(rt, last_id, pb);
+            { ok_tf A, B; ok_tf_convert(&A, pa); ok_tf_convert(&B, pb);
+              dv[0] = A.r[0] - B.r[0]; dv[1] = A.r[1] - B.r[1]; dv[2] = A.r[2] - B.r[2]; }
+            ds = ok_v3_norm(dv);
+            distances[nd++] = ds;
+            last_id = v.id;
+            full_distance += ds;
+        }
+    }
+    for (i = idx_i + 1; i < ns; ++i) {
+        ok_tf T_WS, T_WS_set;
+        double dr[3], c7[7], set7[7];
+        ok_quat qq;
+        ok_vg_state_at(rt, i, &v);
+        cached_pose(rt, v.id, &T_WS);
+        if (v.id <= pose_j) {
+            const double f = (distance_travelled += distances[counter]) / full_distance;      /* distanceTravelled/fullDistanceTravelled * r */
+            dr[0] = f * r_Wold_Wnew[0]; dr[1] = f * r_Wold_Wnew[1]; dr[2] = f * r_Wold_Wnew[2];
+            counter += 1;
+        } else {
+            dr[0] = r_Wold_Wnew[0]; dr[1] = r_Wold_Wnew[1]; dr[2] = r_Wold_Wnew[2];
+        }
+        c7[0] = T_WS.r[0] + dr[0]; c7[1] = T_WS.r[1] + dr[1]; c7[2] = T_WS.r[2] + dr[2];
+        qq = T_WS.q;
+        ok_tf_from_rq(&T_WS_set, c7, &qq, 1);
+        tf_to_coeffs(&T_WS_set, set7);
+        w_set_pose(b, 0, v.id, set7);
+        w_set_pose(b, 1, v.id, set7);
+    }
+    {   const int nl = ok_vg_landmark_count(rt);
+        for (i = 0; i < nl; ++i) {
+            ok_vg_lm_view lv; double hn[4];
+            ok_vg_landmark_find(rt, ok_vg_landmark_id_at(rt, i), &lv);
+            hn[0] = r_Wold_Wnew[0] + lv.hp[0]; hn[1] = r_Wold_Wnew[1] + lv.hp[1]; hn[2] = r_Wold_Wnew[2] + lv.hp[2]; hn[3] = 0.0 + lv.hp[3];
+            w_set_landmark_full(b, 0, lv.id, hn, lv.initialised);
+            w_set_landmark_full(b, 1, lv.id, hn, lv.initialised);
+        }
+    }
+    free(distances);
+    ok_gnss_logf("AL pos i=%llu j=%llu\n", (unsigned long long)pose_i, (unsigned long long)pose_j);
+    return 1;
+}
+
+/* tryGpsAlignment() */
+static int try_gps_alignment(ok_vsb* b) {
+    ok_vg* rt = b->g[0]; ok_vg* full = b->g[1];
+    uint64_t drop = 0, align = 0;
+    double T_GW_new[7], pos[3], tg[7];
+    if (ok_vgps_needs_initial_alignment(rt)) {
+        ok_vg_gps_get_T_GW(rt, tg); ok_vg_gps_set_T_GW(full, tg);
+        add_gps_alignment_frame(b, 1);
+        ok_vgps_reset_initial_alignment(rt);
+        ok_vgps_reset_initial_alignment(full);
+        return 1;
+    }
+    (void)ok_vgps_needs_full_alignment(full, &drop, &align, T_GW_new);
+    if (ok_vgps_needs_full_alignment(rt, &drop, &align, T_GW_new)) {
+        uint64_t* up = NULL; int nu = 0;
+        attempt_full_gps_alignment(b, drop, align, T_GW_new);
+        ok_vsb_optimise_realtime(b, 50, 1, 0, 0, 1, &up, &nu);                 /* brief realtime optimisation and synchronisation */
+        free(up);
+        add_gps_alignment_frame(b, drop);
+        ok_vgps_reset_full_alignment(rt);
+        ok_vgps_reset_full_alignment(full);
+        return 1;
+    }
+    if (ok_vgps_needs_pos_alignment(rt, &drop, &align, pos)) {
+        attempt_pos_gps_alignment(b, drop, align, pos);
+        add_gps_alignment_frame(b, drop);
+        ok_vgps_reset_pos_alignment(rt);
+        ok_vgps_reset_pos_alignment(full);
+        return 1;
+    }
+    return 0;
+}
+
+int ok_vsb_add_gps_measurements(ok_vsb* b, const ok_gps_fix* m_in, int n, const ok_imu_meas* imu, size_t nimu) {
+    ok_vg* rt = b->g[0]; ok_vg* full = b->g[1];
+    int needs_reinit, i;
+    double T_GW_init[7];
+    const ok_gps_fix* m = m_in;
+    ok_gps_fix* valid = NULL;
+    if (!b->gps_on) return 0;
+    if (n <= 0) return 0;
+    if (ok_vg_gps_robust(rt)) {                          /* checkValidGpsMeasurements (the output deque is in reverse order) */
+        valid = (ok_gps_fix*)malloc(sizeof(ok_gps_fix) * (size_t)n);
+        n = ok_vgps_check_valid_measurements(rt, m_in, n, valid);
+        m = valid;
+        if (n <= 0) { free(valid); return 0; }
+    }
+    needs_reinit = ok_vgps_needs_reinit(rt);
+    if (needs_reinit) ok_vgps_reinit(rt);
+    ok_vgps_set_status(full, ok_vgps_status(rt));
+    if (!NOW_LOOP(b)) {
+        ok_vgps_add_measurements(rt, m, n, imu, nimu, NULL, NULL);
+        ok_vgps_add_measurements(full, m, n, imu, nimu, NULL, NULL);
+    } else {
+        uint64_t* sids = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)n);
+        int ns = 0;
+        ok_vgps_add_measurements(rt, m, n, imu, nimu, sids, &ns);
+        for (i = 0; i < n; ++i) {                         /* GPS MEASUREMENTS BUFFERING (sids.at(i)) */
+            gpsbl* gl;
+            if (i >= ns) break;
+            if (b->ngbl == b->capgbl) { b->capgbl = b->capgbl ? 2 * b->capgbl : 8; b->gbl = (gpsbl*)realloc(b->gbl, sizeof(gpsbl) * (size_t)b->capgbl); }
+            gl = &b->gbl[b->ngbl++];
+            gl->id = sids[i]; gl->f = m[i]; gl->nimu = nimu; gl->reinit = needs_reinit;
+            gl->imu = (ok_imu_meas*)malloc(sizeof(ok_imu_meas) * (nimu ? nimu : 1));
+            memcpy(gl->imu, imu, sizeof(ok_imu_meas) * nimu);
+            ok_gnss_logf("BL push sid=%llu reinit=%d\n", (unsigned long long)gl->id, needs_reinit);
+        }
+        free(sids);
+    }
+    if (ok_vgps_initialization_strategy(rt, T_GW_init)) {
+        ok_vgps_add_init_factors(rt);
+        ok_vgps_add_init_factors(full);
+        ok_vg_gps_set_T_GW(rt, T_GW_init);
+        ok_vg_gps_set_T_GW(full, T_GW_init);
+        ok_gnss_logf("TG both set(init-strategy) %.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n", T_GW_init[0], T_GW_init[1], T_GW_init[2], T_GW_init[3], T_GW_init[4], T_GW_init[5], T_GW_init[6]);
+    }
+    if (!NOW_LOOP(b)) (void)try_gps_alignment(b);
+    if (!b->gps_observable) b->gps_observable = ok_vgps_is_observable(rt);
+    free(valid);
+    return 1;
+}
+
 int ok_vsb_do_final_ba(ok_vsb* b, int num_iter, double ext_pos_unc, double ext_ori_unc) {
     ok_vg* full = b->g[1];
     int i;

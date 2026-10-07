@@ -3,7 +3,8 @@
  * OKVIS2 pure-C port, module 4: the nonlinear least-squares solver OKVIS2 runs through Ceres Solver 2.2.0
  * (okvis::ViGraph::optimise -> ::ceres::Solve): problem reduction and reordering, block-sparse Jacobian
  * evaluation with the OKVIS manifolds and the Cauchy loss, Jacobi scaling, the trust-region minimizer with the
- * traditional Dogleg strategy, the DENSE_SCHUR linear solver (Schur elimination + Eigen dense LLT, realtime
+ * traditional Dogleg strategy (and, for OKVIS2-X Align4DoF_Ceres, LEVENBERG_MARQUARDT with DENSE_QR on a single parameter
+ * block: ok_align4.h), the DENSE_SCHUR linear solver (Schur elimination + Eigen dense LLT, realtime
  * graph) and the SPARSE_NORMAL_CHOLESKY linear solver (J^T J + Eigen SimplicialLDLT, full/pose graph).
  *
  * Derived from Ceres Solver (http://ceres-solver.org), Copyright 2023 Google Inc. All rights reserved,
@@ -93,20 +94,26 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include "ok_err.h"
+#include "ok_gps.h"
 #include "ok_imu.h"
 #include "ok_param.h"
 #include "ok_twopose.h"
 
 #define OK_SV_MAXB 8
+struct ok_align4_term;
 
 uint64_t ok_fnv(const void* p, size_t n);                 /* FNV-1a 64 */
 uint64_t ok_fnv_combine(uint64_t h, uint64_t block_hash); /* h ^= block; h *= prime */
 
 enum { OK_SV_T_UNKNOWN = 0, OK_SV_T_REPROJ = 1, OK_SV_T_IMU = 2, OK_SV_T_POSE = 3, OK_SV_T_SAB = 4,
        OK_SV_T_RELPOSE = 5, OK_SV_T_HPOINT = 6, OK_SV_T_TWOPOSE = 7, OK_SV_T_TWOPOSE_CONST = 8,
-       OK_SV_T_TWOPOSE_EXT = 9, OK_SV_T_TWOPOSE_EXT_CONST = 10 };
-enum { OK_SV_KIND_NONE = 0, OK_SV_KIND_POSE = 1, OK_SV_KIND_HPOINT = 2, OK_SV_KIND_OTHER = 3 };
-enum { OK_SV_LOSS_NONE = 0, OK_SV_LOSS_CAUCHY = 1, OK_SV_LOSS_OTHER = 2 };
+       OK_SV_T_TWOPOSE_EXT = 9, OK_SV_T_TWOPOSE_EXT_CONST = 10,
+       OK_SV_T_GPS = 11, /* OKVIS2-X GpsErrorAsynchronous (ok_gps.h): residuals 3, blocks pose / speed-and-bias / T_GW */
+       OK_SV_T_ALIGN4 = 12 /* OKVIS2-X FourDoFResidual AutoDiffCostFunction<3,7> (ok_align4.h): one 7-block (PoseManifold4d) */ };
+/* OK_SV_KIND_POSE4: the 4-DoF PoseManifold4d of OKVIS2-X (T_GW): ambient 7, tangent 4 */
+enum { OK_SV_KIND_NONE = 0, OK_SV_KIND_POSE = 1, OK_SV_KIND_HPOINT = 2, OK_SV_KIND_OTHER = 3, OK_SV_KIND_POSE4 = 4 };
+/* OK_SV_LOSS_CAUCHY3: CauchyLoss(3.0) of the GPS factors (cauchyGpsLossFunctionPtr_) */
+enum { OK_SV_LOSS_NONE = 0, OK_SV_LOSS_CAUCHY = 1, OK_SV_LOSS_OTHER = 2, OK_SV_LOSS_CAUCHY3 = 3 };
 /* ceres::LinearSolverType values */
 enum { OK_SV_DENSE_NORMAL_CHOLESKY = 0, OK_SV_DENSE_QR = 1, OK_SV_SPARSE_NORMAL_CHOLESKY = 2, OK_SV_DENSE_SCHUR = 3,
        OK_SV_SPARSE_SCHUR = 4, OK_SV_ITERATIVE_SCHUR = 5, OK_SV_CGNR = 6 };
@@ -131,7 +138,7 @@ typedef struct ok_sv_param {
     int size, tangent, kind, constant;
     double* x;                       /* user state (owned by the problem) */
     int index, state_offset, delta_offset;  /* set by the reduced program */
-    double plus_jacobian[63];        /* ambient x tangent, row-major (7x6 or 4x3) */
+    double plus_jacobian[63];        /* ambient x tangent, row-major (7x6, 4x3 or 7x4) */
 } ok_sv_param;
 
 typedef struct ok_sv_resid {
@@ -147,6 +154,8 @@ typedef struct ok_sv_resid {
         ok_hpoint_err hpoint;
         ok_tp_std tp;
         ok_tp_ext tpx;
+        const struct ok_align4_term* align4;  /* Align4DoF_Ceres residual (ok_align4.h) */
+        ok_gps_async* gps;           /* the LIVE object of the graph (evaluation mutates its preintegration, as in C++) */
     } term;
     int oracle;                      /* evaluated through ok_sv_hooks.oracle (no native term) */
 } ok_sv_resid;

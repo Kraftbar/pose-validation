@@ -2,6 +2,7 @@
 /* OKVIS2 pure-C port, module 7d (part 1): DBoW2 vocabulary / database / query. See ok_dbow.h for the notices. */
 #include "ok_dbow.h"
 #include "ok_hamming.h"
+int ok_dbow_okvis2x = 0;   /* OKVIS2-X behaviour switch (getFilteredDBoWResult cut-off 0.375 instead of 0.4) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,7 +260,7 @@ void ok_dbow_filtered(const ok_dbow_db* db, const ok_dbow_result* orig, int nori
         const uint64_t id = orig[f].id;
         int is_max = 1, lo, hi;
         if (id >= (uint64_t)norig) continue;
-        if (score < 0.4) break;
+        if (score < (ok_dbow_okvis2x ? 0.375 : 0.4)) break;   /* OKVIS2-X lowered the cut-off */
         if (suppressed[f]) continue;                            /* suppressedIds.count(f): the index in score order (as upstream) */
         lo = (int)id - nonmax_radius; if (lo < 0) lo = 0;
         hi = (int)id + nonmax_radius; if (hi > norig - 1) hi = norig - 1;

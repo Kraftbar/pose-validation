@@ -185,7 +185,9 @@ def eigen_tests():
             incs += [f"-I{CERES}/include", f"-I{OKVIS_SRC}/external/ceres-solver/internal",  # header-only internals
                      f"-I{VROOT}/include", f"-I{VROOT}/include/x86_64-linux-gnu"]
             extra_link += [f"{CERES}/lib/libceres.a", f"-L{VROOT}/lib/x86_64-linux-gnu", "-lglog", "-lgflags", "-fopenmp", "-lpthread",
-                          f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu"]
+                          f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu",
+                          # ceres::internal::DenseQR / DenseCholesky reference LAPACK symbols (okvis_align4_test builds a DenseQR): OpenBLAS of the deps
+                          f"{VROOT}/lib/x86_64-linux-gnu/openblas-pthread/libopenblas.so", f"-Wl,-rpath,{VROOT}/lib/x86_64-linux-gnu/openblas-pthread"]
         if "imgcodecs" in libs:  # cv::imencode / imdecode (OpenCV 4.6 of the reference)
             extra_link += ["-lopencv_imgcodecs"]
         if "zlib" in libs:  # system zlib, to write test PNGs
@@ -208,7 +210,12 @@ def main():
     ap.add_argument("--seqs", default=None, help="comma-separated sequence names (default: all with dumps)")
     ap.add_argument("--tag", default="run1", help="comma-separated run tags")
     ap.add_argument("--max", type=int, default=-1)
+    ap.add_argument("--runs-dir", default=None, metavar="DIR",
+                    help="reference_runs root (default runs/okvis_port/reference_runs; OKVIS2-X: runs/okvis2x_port/reference_runs)")
     ap.add_argument("--eigen-tests", action="store_true")
+    ap.add_argument("--gnss-e2e", action="store_true",
+                    help="OKVIS2-X end-to-end: the C app (OKVIS_PORT_OKVIS2X=1) against the reference runs clean_gps_a (GNSS on) and clean_off "
+                         "(tools/okvis2x_check_gnss.py --stage-b: stage a, GNSS off and stage b (robust_gps_init: true) cases; needs runs/okvis2x_port/{data,data_r1,data_r2,reference_runs} and the gray packs, ~25 min)")
     ap.add_argument("--native-solve", type=int, default=0, metavar="N",
                     help="check_ok_vslam: solve every Nth graph optimise() natively on the C graph (ok_sv_solve) instead of "
                          "applying the logged solver output, and compare the result with the log (1 = every solve)")
@@ -220,6 +227,9 @@ def main():
                          "(other modules, e.g. check_ok_brisk*, have their own dump trees/runners)")
     args = ap.parse_args()
 
+    global RUNS
+    if args.runs_dir:
+        RUNS = Path(args.runs_dir).resolve()
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     harnesses = discover_harnesses(args.harness.split(","))
     if not harnesses:
@@ -304,6 +314,9 @@ def main():
         for name, ok in eigen_tests():
             print(f"  {name:<28} {'PASS' if ok else 'FAIL'}")
             any_fail |= not ok
+    if args.gnss_e2e:
+        print("\nOKVIS2-X GNSS end to end (C app vs deterministic OKVIS2-X reference):")
+        any_fail |= subprocess.run([sys.executable, str(ROOT / "tools/okvis2x_check_gnss.py"), "--stage-b"]).returncode != 0
     return 1 if any_fail else 0
 
 

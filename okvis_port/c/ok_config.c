@@ -308,6 +308,19 @@ int ok_cfg_load(const char* path, ok_cfg* c, char* err, size_t errlen) {
     c->realtime_time_limit = rdd(&r, es, "realtime_time_limit"); c->realtime_num_threads = rdi(&r, es, "realtime_num_threads");
     c->full_graph_iterations = rdi(&r, es, "full_graph_iterations"); c->full_graph_num_threads = rdi(&r, es, "full_graph_num_threads");
     c->p_dbow = rdd(&r, es, "p_dbow"); c->drift_percentage = rdd(&r, es, "drift_percentage_heuristic");
+    {   /* OKVIS2-X: gps_parameters (ViParametersReader::getGpsCalibration; a map block declares a GPS) */
+        const yn* gp = yget(root, "gps_parameters");
+        c->has_gps = 0;
+        if (gp && gp->kind == Y_MAP) {
+            const yn* ty = yget(gp, "data_type");
+            c->has_gps = 1;
+            if (!ty || ty->kind != Y_SCALAR) fail(&r, "missing string", "data_type");
+            else { strncpy(c->gps_type, ty->s, sizeof c->gps_type - 1); c->gps_cartesian = !strcmp(ty->s, "cartesian"); }
+            rdv(&r, gp, "r_SA", c->gps_r_SA, 3);
+            c->gps_yaw_error_threshold = rdd(&r, gp, "yaw_error_threshold");
+            c->gps_robust_init = rdb(&r, gp, "robust_gps_init");
+        }
+    }
 done:
     yn_free(root);
     return r.bad ? -1 : 0;

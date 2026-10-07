@@ -56,6 +56,12 @@ typedef struct ok_lm_obs { uint64_t frame_id; int cam, kp; double pose[7]; doubl
  * place when the landmark is behind a camera and gets reset along the best ray; quality (max(0, .)) and the
  * initialisation flag are returned. Observations in keypoint-id order (std::map). */
 void ok_graph_update_landmark(double hp[4], const ok_lm_obs* obs, int nobs, double* quality, int* initialised);
+/* OKVIS2-X variant (direction standard deviation quality, threshold 0.04) and its quality kernel (dirs: 3 x o) */
+void ok_graph_update_landmark_x(double hp[4], const ok_lm_obs* obs, int nobs, double* quality, int* initialised);
+double ok_graph_dir_std_quality(const double* dirs, int o);
+extern int ok_graph_x_mean_pkt;
+/* OKVIS2-X behaviour switches (default 0 = OKVIS2): ViGraph::updateLandmarks uses ok_graph_update_landmark_x */
+extern int ok_graph_okvis2x;   /* first packet row of the mean temporary (0 or 1; see ok_graph.c) */
 
 /* ---- dump readers (also used by check_ok_solve.c) ----
  * Return the number of bytes consumed, or -1 on a malformed record. */

@@ -1,4 +1,4 @@
-/* OK_PORT_SOURCES: check_ok_solve.c ok_solve.c ok_solve_linear.c ok_blas.c ok_dense.c ok_sparse.c ok_amd.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_twopose.c ok_graph.c */
+/* OK_PORT_SOURCES: check_ok_solve.c ok_solve.c ok_solve_linear.c ok_blas.c ok_dense.c ok_sparse.c ok_amd.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_twopose.c ok_graph.c ok_gps.c ok_gps_init.c ok_align4.c */
 /* Bit-exactness harness for okvis_port module 4 (the Ceres solver as driven by ViGraph::optimise).
  *
  *   check_ok_solve <seq_label> <fixtures_dir (unused, "-")> <dump_dir> [max_solves]

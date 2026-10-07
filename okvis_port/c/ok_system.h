@@ -19,6 +19,11 @@
  * is added (ThreadedSlam::processFrame finds its IMU then). Images are 8-bit grayscale, rows x cols of the camera, one per
  * camera (NULL for a camera without an image at t).
  *
+ * ---- OKVIS2-X GNSS ----
+ * With gps_parameters in the config (cartesian, robust_gps_init false) ok_sys_add_gps feeds fixes between the IMU and the frame (the
+ * reader's order); processFrame takes the fixes older than the frame into gpsMeasurementDeque_ (initialised branch), hands them to
+ * ok_vsb_add_gps_measurements after setKeyframe and drops them from the deque. See ok_vggps.h / ok_vslam.h.
+ *
  * ---- what is not ported ----
  * enforce_realtime (wall-clock budgets), parallel detection (no numerical effect), the CNN, depth / virtual cameras,
  * IMU-less operation (the constant-velocity pose guess), do_final_ba (ok_vsb_do_final_ba is not exercised), the
@@ -68,6 +73,12 @@ void ok_sys_set_publish(ok_sys* s, ok_sys_publish_fn fn, void* ctx);
 
 /* ThreadedSlam::addImuMeasurement (stamp, accelerometers, gyroscopes) */
 int ok_sys_add_imu(ok_sys* s, ok_time t, const double acc[3], const double gyr[3]);
+/* OKVIS2-X ThreadedSlam::addGpsMeasurement (cartesian): position and the three standard deviations of the fix; the DatasetReader
+ * order is IMU, then GPS (until the first fix later than the frame), then the frame. Needs gps_parameters in the config. */
+int ok_sys_add_gps(ok_sys* s, ok_time t, const double pos[3], const double err[3]);
+int ok_sys_gps_enabled(const ok_sys* s);
+/* ViSlamBackend::writeGlobalCsvTrajectory (p_GA_G = C_GW * (r_WS + C_WS * r_SA) + r_GW); returns 0 */
+int ok_sys_write_global_csv(ok_sys* s, FILE* f);
 /* ThreadedSlam::addImages + processFrame. Returns 1 processed, 0 dropped (startup: no IMU before the frame, or too few
  * keypoints before initialisation), -1 the IMU does not reach t + 0.02 s yet, -2 not ported (see above). */
 int ok_sys_add_frame(ok_sys* s, ok_time t, const unsigned char* const* images);

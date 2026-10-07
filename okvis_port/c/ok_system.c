@@ -5,6 +5,7 @@
 #include "ok_cam.h"
 #include "ok_imu.h"
 #include "ok_kin.h"
+#include "ok_vggps.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +23,10 @@ struct ok_sys {
     float* rays[OK_CFG_MAXCAM]; float* jacs[OK_CFG_MAXCAM]; int maps_ready;
     ok_imu_meas* q; size_t qhead, qn, qcap;        /* imuMeasurementsReceived_ (qhead .. qn-1 pending) */
     ok_imu_meas* dq; size_t dn, dcap;              /* imuMeasurementDeque_ */
+    ok_gps_fix* gq; size_t gqhead, gqn, gqcap;      /* gpsMeasurementsReceived_ */
+    ok_gps_fix* gdq; size_t gdn, gdcap;             /* gpsMeasurementDeque_ */
+    int gps_on;
+    double gps_r_SA[3];
     int first_frame;
     int last_init; double last_T[7], last_sb[9]; ok_time last_t;   /* lastOptimisedState_ */
     ok_sys_publish_fn publish; void* publish_ctx;
@@ -141,6 +146,16 @@ ok_sys* ok_sys_new(const ok_cfg* cfg, ok_vsb* b, const ok_fe_est* est, const ok_
     fp.realtime_max_iterations = cfg->realtime_max_iterations;
     s->be.add_imu(s->be.ctx, &cfg->imu);
     for (c = 0; c < cfg->ncam; ++c) s->be.add_camera(s->be.ctx, cfg->do_extrinsics, cfg->sigma_r, cfg->sigma_alpha);
+    if (cfg->has_gps) {                          /* ThreadedSlam::init: estimator_.addGps(*parameters_.gps) */
+        if (!cfg->gps_cartesian) {
+            if (err) snprintf(err, errlen, "gps_parameters: only data_type cartesian is ported");
+            ok_sys_free(s);
+            return NULL;
+        }
+        ok_vsb_add_gps(s->b, cfg->gps_r_SA, cfg->gps_yaw_error_threshold, cfg->gps_robust_init);
+        s->gps_on = 1;
+        memcpy(s->gps_r_SA, cfg->gps_r_SA, sizeof s->gps_r_SA);
+    }
     s->kptradius = 0.09 * cfg->detection_threshold / 36.0;
     s->fe = ok_fe_new(s->b, &fp, &s->est);
     if (vocabulary && ok_fe_set_vocabulary(s->fe, vocabulary, nvocabulary)) {
@@ -169,7 +184,7 @@ void ok_sys_free(ok_sys* s) {
     if (s->own_b) ok_vsb_free(s->b);
     ok_brisk_destroy(s->brisk);
     for (c = 0; c < OK_CFG_MAXCAM; ++c) { free(s->rays[c]); free(s->jacs[c]); }
-    free(s->q); free(s->dq);
+    free(s->q); free(s->dq); free(s->gq); free(s->gdq);
     free(s);
 }
 ok_vsb* ok_sys_backend(ok_sys* s) { return s->b; }
@@ -181,6 +196,20 @@ int ok_sys_add_imu(ok_sys* s, ok_time t, const double acc[3], const double gyr[3
     memcpy(m.acc, acc, sizeof m.acc); memcpy(m.gyr, gyr, sizeof m.gyr);
     if (s->qn == s->qcap) { s->qcap = s->qcap ? 2 * s->qcap : 1024; s->q = (ok_imu_meas*)realloc(s->q, sizeof *s->q * s->qcap); }
     s->q[s->qn++] = m;
+    return 1;
+}
+
+int ok_sys_gps_enabled(const ok_sys* s) { return s->gps_on; }
+int ok_sys_add_gps(ok_sys* s, ok_time t, const double pos[3], const double err[3]) {
+    ok_gps_fix f;
+    if (!s->gps_on) return 0;
+    memset(&f, 0, sizeof f);
+    f.t = t;
+    memcpy(f.pos, pos, sizeof f.pos);
+    f.cov[0] = err[0] * err[0]; f.cov[4] = err[1] * err[1]; f.cov[8] = err[2] * err[2];     /* setIdentity, then the diagonal */
+    f.cov[1] = f.cov[2] = f.cov[3] = f.cov[5] = f.cov[6] = f.cov[7] = 0.0;
+    if (s->gqn == s->gqcap) { s->gqcap = s->gqcap ? 2 * s->gqcap : 256; s->gq = (ok_gps_fix*)realloc(s->gq, sizeof *s->gq * s->gqcap); }
+    s->gq[s->gqn++] = f;
     return 1;
 }
 
@@ -272,6 +301,9 @@ int ok_sys_add_frame(ok_sys* s, ok_time t, const unsigned char* const* images) {
         do {
             if (!pop_imu(s)) return -1;
         } while (ok_time_lt(s->dq[s->dn - 1].t, t_hi));
+        /* drop GPS measurements that are older than the first frame (= first state) */
+        while (s->gqhead < s->gqn && ok_time_lt(s->gq[s->gqhead].t, t)) s->gqhead++;
+        if (s->gqhead == s->gqn) s->gqhead = s->gqn = 0;
         s->first_frame = 0;
     } else {
         while (ok_time_lt(s->dq[s->dn - 1].t, t_hi)) {
@@ -297,6 +329,12 @@ int ok_sys_add_frame(ok_sys* s, ok_time t, const unsigned char* const* images) {
         ip.sigma_gw_c = s->cfg.imu.sigma_gw_c; ip.sigma_aw_c = s->cfg.imu.sigma_aw_c;
         ip.g = s->cfg.imu.g; ip.g_max = s->cfg.imu.g_max; ip.a_max = s->cfg.imu.a_max;
         ok_imu_propagation(s->dq, s->dn, &ip, T7, sb, s->last_t, t, NULL, NULL);
+        /* now also get all relevant GPS measurements received thus far */
+        while (s->gqhead < s->gqn && ok_time_lt(s->gq[s->gqhead].t, t)) {
+            if (s->gdn == s->gdcap) { s->gdcap = s->gdcap ? 2 * s->gdcap : 16; s->gdq = (ok_gps_fix*)realloc(s->gdq, sizeof *s->gdq * s->gdcap); }
+            s->gdq[s->gdn++] = s->gq[s->gqhead++];
+        }
+        if (s->gqhead == s->gqn) s->gqhead = s->gqn = 0;
     }
     if (!ran_detection) {
         if (detect_all(s, t, T7, images, &f)) { feats_free(&f); return -2; }
@@ -343,6 +381,11 @@ int ok_sys_add_frame(ok_sys* s, ok_time t, const unsigned char* const* images) {
     feats_free(&f);
     if (!ok_fe_data_association(s->fe, id, &as_kf) && !ok_fe_is_initialised(s->fe)) return -2;
     s->be.set_keyframe(s->be.ctx, id, as_kf);
+    if (s->gps_on) {                                    /* Add GPS Measurements, then remove them from the deque */
+        ok_vsb_add_gps_measurements(s->b, s->gdq, (int)s->gdn, s->dq, s->dn);
+        { size_t k = 0; while (k < s->gdn && ok_time_lt(s->gdq[k].t, t)) k++;
+          if (k) { memmove(s->gdq, s->gdq + k, sizeof *s->gdq * (s->gdn - k)); s->gdn -= k; } }
+    }
     optimise_publish_marginalise(s, id, t);
     if (ok_vsb_needs_full_graph_optimisation(s->b))
         s->be.optimise_full(s->be.ctx, s->cfg.full_graph_iterations, s->cfg.full_graph_num_threads, 0);
@@ -369,7 +412,10 @@ int ok_sys_write_final_csv(ok_sys* s, FILE* f) {
     const ok_vg* g = ok_vsb_graph(s->b, 0);
     const int n = ok_vg_anystate_count(g);
     int i;
-    ok_sys_write_csv_header(f);
+    if (s->gps_on)
+        fprintf(f, "timestamp, p_WS_W_x, p_WS_W_y, p_WS_W_z, q_WS_x, q_WS_y, q_WS_z, q_WS_w, v_WS_W_x, v_WS_W_y, v_WS_W_z, "
+                   "b_g_x, b_g_y, b_g_z, b_a_x, b_a_y, b_a_z, NrGps, SID, gpsMode\n");
+    else ok_sys_write_csv_header(f);
     for (i = 0; i < n; ++i) {
         uint64_t id, kf;
         ok_time ts;
@@ -397,7 +443,51 @@ int ok_sys_write_final_csv(ok_sys* s, FILE* f) {
         }
         write_time(f, ts);
         write_values(f, T7, sb);
-        fprintf(f, ", %llu\n", (unsigned long long)kf);
+        if (s->gps_on) {       /* OKVIS2-X: NrGps, SID, gpsMode (of the keyframe state when reconstructed), keyframe id */
+            const uint64_t at = kf ? kf : id;
+            fprintf(f, ", %d, %llu, %d, %llu\n", ok_vg_gps_nfactors(g, at), (unsigned long long)id, ok_vg_gps_mode(g, at), (unsigned long long)kf);
+        } else fprintf(f, ", %llu\n", (unsigned long long)kf);
+    }
+    return 0;
+}
+
+/* ViSlamBackend::writeGlobalCsvTrajectory */
+int ok_sys_write_global_csv(ok_sys* s, FILE* f) {
+    const ok_vg* g = ok_vsb_graph(s->b, 0);
+    const int n = ok_vg_anystate_count(g);
+    double tg7[7];
+    ok_tf T_GW;
+    int i;
+    fprintf(f, "timestamp, p_GA_G_x, p_GA_G_y, p_GA_G_z\n");
+    ok_vg_gps_get_T_GW(g, tg7);
+    ok_tf_convert(&T_GW, tg7);                                   /* kinematics::Transformation T_GW = realtimeGraph_.T_GW() */
+    for (i = 0; i < n; ++i) {
+        uint64_t id, kf;
+        ok_time ts;
+        double T_Sk_S[7], v_Sk[3], T7[7], lv[3], sum[3], gv[3], p[3];
+        ok_tf T_WS;
+        ok_vg_anystate_at(g, i, &id, &kf, &ts, T_Sk_S, v_Sk);
+        if (kf) {
+            double Tk[7];
+            ok_tf a, b2, o;
+            ok_vg_pose_values(g, kf, Tk);
+            ok_tf_set_coeffs(&a, Tk, 0);
+            ok_tf_set_coeffs(&b2, T_Sk_S, 0);
+            ok_tf_mul(&a, &b2, &o, 0);
+            T7[0] = o.r[0]; T7[1] = o.r[1]; T7[2] = o.r[2]; T7[3] = o.q.x; T7[4] = o.q.y; T7[5] = o.q.z; T7[6] = o.q.w;
+        } else {
+            ok_vg_state_view sv;
+            ok_vg_pose_values(g, id, T7);
+            ok_vg_state_find(g, id, &sv);
+            ts = sv.ts;
+        }
+        ok_tf_convert(&T_WS, T7);                                /* Transformation T_WS (cached) from the cacheless product / estimate */
+        ok_m3_mulv(T_WS.C, s->gps_r_SA, lv);
+        sum[0] = T_WS.r[0] + lv[0]; sum[1] = T_WS.r[1] + lv[1]; sum[2] = T_WS.r[2] + lv[2];
+        ok_m3_mulv(T_GW.C, sum, gv);
+        p[0] = gv[0] + T_GW.r[0]; p[1] = gv[1] + T_GW.r[1]; p[2] = gv[2] + T_GW.r[2];
+        write_time(f, ts);
+        fprintf(f, ", %.18e, %.18e, %.18e\n", p[0], p[1], p[2]);
     }
     return 0;
 }

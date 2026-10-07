@@ -9,6 +9,7 @@
 #include <string.h>
 #include "ok_blas.h"
 #include "ok_dense.h"
+#include "ok_align4.h"
 #include "ok_solve_internal.h"
 
 typedef struct chunk { int start, size, nf; int* f_blocks; int* f_offsets; } chunk;  /* f_blocks ascending (std::map) */
@@ -388,6 +389,23 @@ static int sparse_solve(ok_sv_state* S, lin* L, const double* D, double* x) {
     return term_type;
 }
 
+/* ---------------------------------------------- DENSE_QR ----------------------------------------------------- */
+/* DenseQRSolver::SolveImpl (EIGEN): lhs_ (ColMajor, rows + cols x cols) = [J; diag(D)], rhs_ = [b; 0], then EigenDenseQR
+ * (HouseholderQR::solve). Single parameter block: S->values is the RowMajor DenseSparseMatrix. */
+static int dense_qr_solve(ok_sv_state* S, const double* D, double* x) {
+    const int rows = S->num_residuals, cols = S->num_effective, aug = rows + (D ? cols : 0);
+    double* lhs = (double*)xcalloc((size_t)aug * (size_t)cols, sizeof(double));
+    double* rhs = (double*)xcalloc((size_t)aug, sizeof(double));
+    int i, j;
+    for (i = 0; i < rows; ++i)
+        for (j = 0; j < cols; ++j) lhs[(size_t)j * aug + i] = S->values[(size_t)i * cols + j];
+    memcpy(rhs, S->residuals, sizeof(double) * (size_t)rows);
+    if (D) for (j = 0; j < cols; ++j) lhs[(size_t)j * aug + rows + j] = D[j];
+    ok_eigen_hqr_solve(aug, cols, lhs, rhs, x);
+    free(lhs); free(rhs);
+    return OK_SV_LS_SUCCESS;
+}
+
 /* ------------------------------------------------ dispatch ---------------------------------------------- */
 void ok_sv_linear_init(ok_sv_state* S) {
     lin* L = (lin*)xcalloc(1, sizeof(lin));
@@ -399,6 +417,7 @@ int ok_sv_linear_solve(ok_sv_state* S, const double* D, double* x) {
     lin* L = (lin*)S->lin;
     if (L->type == OK_SV_DENSE_SCHUR) return schur_solve(S, L, D, x);
     if (L->type == OK_SV_SPARSE_NORMAL_CHOLESKY) return sparse_solve(S, L, D, x);
+    if (L->type == OK_SV_DENSE_QR) return dense_qr_solve(S, D, x);
     return OK_SV_LS_FATAL_ERROR;
 }
 void ok_sv_linear_free(ok_sv_state* S) {

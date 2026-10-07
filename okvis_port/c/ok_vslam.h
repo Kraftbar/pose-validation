@@ -112,6 +112,8 @@ typedef struct ok_vsb_cam_in {
 } ok_vsb_cam_in;
 
 ok_vsb* ok_vsb_new(const ok_vsb_hooks* h);
+/* OKVIS2-X behaviour switch (default 0 = OKVIS2): keep the images of pose-graph frames */
+extern int ok_vsb_okvis2x;
 void ok_vsb_free(ok_vsb* b);
 ok_vg* ok_vsb_graph(ok_vsb* b, int which);          /* 0 realtime, 1 full */
 
@@ -172,6 +174,14 @@ int ok_vsb_is_in_imu_window(const ok_vsb* b, uint64_t id);
  * returns the OPT-record result bytes (malloc'd). ok_vsb_solve_native is the same as an ok_vsb_hooks.solve hook. */
 int ok_vg_solve_native(ok_vg* g, int max_iter, unsigned char** res, size_t* rlen);
 int ok_vsb_solve_native(void* ctx, int graph, ok_vg* g, int max_iter, unsigned char** res, size_t* rlen);
+
+/* ---- OKVIS2-X GNSS (ViSlamBackend::addGps, addGpsMeasurementsOnAllGraphs, tryGpsAlignment, attempt{Full,Pos}GpsAlignment,
+ * addGpsAlignmentFrame; the graph side is ok_vggps.h). Call ok_vsb_add_gps after the cameras / IMU, before the first addStates. ---- */
+int ok_vsb_add_gps(ok_vsb* b, const double r_SA[3], double yaw_error_threshold, int robust);
+int ok_vsb_gps_enabled(const ok_vsb* b);
+/* inputgpsMeasurementDeque (n fixes, deque order) with the IMU deque of the current frame; returns the C++ bool (measurements added) */
+int ok_vsb_add_gps_measurements(ok_vsb* b, const ok_gps_fix* m, int n, const ok_imu_meas* imu, size_t nimu);
+void ok_vsb_T_GW(const ok_vsb* b, double T7[7]);                      /* realtimeGraph_.T_GW() */
 
 /* OpenCV 4.6 cv::circle(img, center, radius, 255, FILLED) on a rows x cols CV_8UC1 buffer (exposed for the unit test) */
 void ok_vsb_circle_filled(unsigned char* img, int rows, int cols, int cx, int cy, int radius);

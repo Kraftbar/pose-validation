@@ -45,6 +45,11 @@ typedef struct ok_cfg {
     int num_keyframes, num_loop_closure_frames, num_imu_frames, do_loop_closures, do_final_ba, enforce_realtime;
     int realtime_min_iterations, realtime_max_iterations, realtime_num_threads, full_graph_iterations, full_graph_num_threads;
     double realtime_time_limit, p_dbow, drift_percentage;
+    /* gps_parameters (OKVIS2-X GpsParameters; has_gps = the block is a map) */
+    int has_gps, gps_cartesian;      /* gps_cartesian: data_type == "cartesian" (the only type ported) */
+    char gps_type[24];
+    double gps_r_SA[3], gps_yaw_error_threshold;
+    int gps_robust_init;
 } ok_cfg;
 
 /* 0 on success; on failure a message in err */

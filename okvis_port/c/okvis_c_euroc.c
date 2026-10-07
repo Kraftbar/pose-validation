@@ -8,6 +8,12 @@
  * ok_png.c, bit-exact with cv::imread IMREAD_GRAYSCALE), or gray/cam<i>.gray packs (tools/okvis_port_images.py), used if present; <vocabulary.bin> is the DBoW2 payload of tools/convert_okvis_vocabulary.py. Writes
  * <out dir>/causal.csv (the state published after every frame, TrajectoryOutput) and <out dir>/final.csv
  * (ViSlamBackend::writeFinalCsvTrajectory), byte-identical to the deterministic reference build's outputs.
+ * OKVIS_PORT_OKVIS2X=1: the OKVIS2-X behaviour changes with GNSS off (landmark quality, pose-graph images kept, DBoW cut-off
+ * 0.375; okvis2x_port/PLAN.md), to be compared with the OKVIS2-X reference in columns 1-17.
+ * GNSS (OKVIS2-X, gps_parameters in the config, data_type cartesian, robust_gps_init false): the DatasetReader order is IMU, GPS, frame; the
+ * fixes come from <sequence dir>/mav0/gps0/data.csv (timestamp, x, y, z, 3 standard deviations; std::stof) and the app also writes
+ * <out dir>/global_final.csv (ViSlamBackend::writeGlobalCsvTrajectory); final.csv then carries NrGps, SID, gpsMode, keyframe id after b_a_z.
+ * Run it with OKVIS_PORT_OKVIS2X=1 (okvis2x_port/HANDOVER_gnss_integration.md); OKVIS_PORT_GNSS_LOG=<file> writes the GNSS event log.
  *
  * Derived from OKVIS2 okvis_apps / DatasetReader.cpp (BSD-3-Clause, Copyright (c) 2015 Autonomous Systems Lab / ETH Zurich,
  * 2020 Smart Robotics Lab / Imperial College London, 2024 Smart Robotics Lab / Technical University of Munich; see
@@ -15,6 +21,9 @@
  */
 #include "ok_system.h"
 #include "ok_png.h"
+#include "ok_graph.h"
+#include "ok_vslam.h"
+#include "ok_dbow.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,11 +110,15 @@ int main(int argc, char** argv) {
     uint8_t* img[OK_CFG_MAXCAM];
     unsigned char* voc;
     long nvoc, frames = 0;
-    FILE *f, *imu, *causal;
+    FILE *f, *imu, *causal, *gpsf = NULL;
+    ok_time t_gps = ok_time_from_nsec(0);
     ok_time start;
     uint32_t i;
     int c, imu_done = 0;
     long max_frames;
+    if (getenv("OKVIS_PORT_OKVIS2X") && atoi(getenv("OKVIS_PORT_OKVIS2X"))) {   /* OKVIS2-X behaviour (GNSS on or off) */
+        ok_graph_okvis2x = 1; ok_vsb_okvis2x = 1; ok_dbow_okvis2x = 1;
+    }
     if (argc != 5 && argc != 6) { fprintf(stderr, "okvis_c_euroc <config.yaml> <sequence dir> <vocabulary.bin> <out dir> [max frames]\n"); return 2; }
     max_frames = argc == 6 ? atol(argv[5]) : -1;
     if (ok_cfg_load(argv[1], &cfg, err, sizeof err)) { fprintf(stderr, "%s: %s\n", argv[1], err); return 1; }
@@ -131,6 +144,11 @@ int main(int argc, char** argv) {
     if (!imu || !fgets(line, sizeof line, imu)) { fprintf(stderr, "cannot read %s\n", path); return 1; }
     sys = ok_sys_new(&cfg, NULL, NULL, NULL, voc, (size_t)nvoc, err, sizeof err);
     if (!sys) { fprintf(stderr, "%s\n", err); return 1; }
+    if (cfg.has_gps) {                          /* DatasetReader: <seq>/mav0/gps0/data.csv, the header line skipped */
+        snprintf(path, sizeof path, "%s/mav0/gps0/data.csv", argv[2]);
+        gpsf = fopen(path, "r");
+        if (!gpsf || !fgets(line, sizeof line, gpsf)) { fprintf(stderr, "cannot read %s\n", path); return 1; }
+    }
     snprintf(path, sizeof path, "%s/causal.csv", argv[4]);
     causal = fopen(path, "w");
     if (!causal) { fprintf(stderr, "cannot write %s\n", path); return 1; }
@@ -155,6 +173,21 @@ int main(int argc, char** argv) {
                 ok_sys_add_imu(sys, t_imu, v + 3, v);
         } while (ok_time_le(t_imu, t_lim));
         if (imu_done) break;
+        if (gpsf) {                             /* GPS: every fix up to the first one later than t (while (t_gps_ <= t)); the end of the file ends streaming */
+            int gps_done = 0;
+            while (ok_time_le(t_gps, t)) {
+                char* tok;
+                double v[6];
+                int j;
+                if (!fgets(line, sizeof line, gpsf)) { gps_done = 1; break; }
+                tok = strtok(line, ",");
+                t_gps = ok_time_from_nsec(strtoull(tok, NULL, 10));
+                for (j = 0; j < 6; ++j) { tok = strtok(NULL, ","); v[j] = (double)strtof(tok ? tok : "0", NULL); }   /* std::stof */
+                if (ok_duration_to_nsec(ok_duration_add(ok_time_sub(t_gps, start), ok_duration_from_sec(1.0))) > 0)
+                    ok_sys_add_gps(sys, t_gps, v, v + 3);
+            }
+            if (gps_done) break;
+        }
         for (c = 0; c < cfg.ncam; ++c) {
             if (!gpack_read(&gp[c], gp[0].ts[i], img[c])) { fprintf(stderr, "camera %d: no image at %llu\n", c, (unsigned long long)gp[0].ts[i]); return 1; }
             imgs[c] = img[c];
@@ -170,6 +203,14 @@ int main(int argc, char** argv) {
     if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
     ok_sys_write_final_csv(sys, f);
     fclose(f);
+    if (gpsf) {
+        snprintf(path, sizeof path, "%s/global_final.csv", argv[4]);
+        f = fopen(path, "w");
+        if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
+        ok_sys_write_global_csv(sys, f);
+        fclose(f);
+        fclose(gpsf);
+    }
     fprintf(stderr, "%ld frames processed, trajectories in %s\n", frames, argv[4]);
     ok_sys_free(sys);
     for (c = 0; c < cfg.ncam; ++c) { free(img[c]); gpack_close(&gp[c]); }

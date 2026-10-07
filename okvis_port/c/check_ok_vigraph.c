@@ -1,4 +1,4 @@
-/* OK_PORT_SOURCES: check_ok_vigraph.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c */
+/* OK_PORT_SOURCES: check_ok_vigraph.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c ok_gps.c ok_gps_init.c */
 /* Bit-exactness harness for okvis_port module 5d (ViGraph / ViGraphEstimator state and every graph mutation).
  *
  *   check_ok_vigraph <seq_label> <fixtures_dir (unused, "-")> <dump_dir> [max_mutations]

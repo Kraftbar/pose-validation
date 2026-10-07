@@ -7,6 +7,7 @@
 #include <string.h>
 #include "ok_blas.h"
 #include "ok_dense.h"
+#include "ok_align4.h"
 #include "ok_solve.h"
 #include "ok_solve_internal.h"
 
@@ -245,6 +246,8 @@ static int cost_function_evaluate(ok_sv_state* S, ok_sv_resid* rb, const double*
         case OK_SV_T_SAB: return ok_sab_err_evaluate(&rb->term.sab, params, res, jac, NULL);
         case OK_SV_T_RELPOSE: return ok_relpose_err_evaluate(&rb->term.relpose, params, res, jac, NULL);
         case OK_SV_T_HPOINT: return ok_hpoint_err_evaluate(&rb->term.hpoint, params, res, jac, NULL);
+        case OK_SV_T_GPS: return ok_gps_async_evaluate(rb->term.gps, params, res, jac, NULL);
+        case OK_SV_T_ALIGN4: ok_align4_residual(rb->term.align4, params[0], res, jac ? jac[0] : NULL); return 1;
         case OK_SV_T_TWOPOSE: case OK_SV_T_TWOPOSE_CONST: case OK_SV_T_TWOPOSE_EXT: case OK_SV_T_TWOPOSE_EXT_CONST:
             if (!rb->oracle) {
                 const int ok = (rb->type == OK_SV_T_TWOPOSE || rb->type == OK_SV_T_TWOPOSE_CONST)
@@ -306,7 +309,7 @@ int ok_sv_eval_block(ok_sv_state* S, ok_sv_resid* rb, const double* const* param
     {
         double rho[3], sqrt_rho1, residual_scaling, alpha_sq_norm;
         int i;
-        cauchy_evaluate(S->pb->opt.cauchy_a > 0.0 ? S->pb->opt.cauchy_a : 1.0, sq, rho);
+        cauchy_evaluate(rb->loss == OK_SV_LOSS_CAUCHY3 ? 3.0 : (S->pb->opt.cauchy_a > 0.0 ? S->pb->opt.cauchy_a : 1.0), sq, rho);
         *cost = 0.5 * rho[0];
         if (!jacobians && !residuals) return 1;
         /* Corrector */
@@ -349,6 +352,7 @@ static int state_to_blocks(ok_sv_state* S, const double* x) {
         S->state_ptr[i] = x + p->state_offset;
         if (p->kind == OK_SV_KIND_POSE) ok_pose_plus_jacobian(S->state_ptr[i], p->plus_jacobian);
         else if (p->kind == OK_SV_KIND_HPOINT) ok_hpoint_plus_jacobian(S->state_ptr[i], p->plus_jacobian);
+        else if (p->kind == OK_SV_KIND_POSE4) ok_pose4_plus_jacobian(S->state_ptr[i], p->plus_jacobian);
         else if (p->kind == OK_SV_KIND_OTHER) return 0;
     }
     return 1;
@@ -410,6 +414,7 @@ static int plus(ok_sv_state* S, const double* x, const double* delta, double* x_
         double* out = x_plus_delta + p->state_offset;
         if (p->kind == OK_SV_KIND_POSE) { if (!ok_pose_plus(bx, bd, out)) return 0; }
         else if (p->kind == OK_SV_KIND_HPOINT) { if (!ok_hpoint_plus(bx, bd, out)) return 0; }
+        else if (p->kind == OK_SV_KIND_POSE4) { if (!ok_pose4_plus(bx, bd, out)) return 0; }
         else if (p->kind == OK_SV_KIND_NONE) { for (j = 0; j < p->size; ++j) out[j] = bx[j] + bd[j]; }
         else return 0;
     }
@@ -419,6 +424,10 @@ static int plus(ok_sv_state* S, const double* x, const double* delta, double* x_
 /* ---- BlockSparseMatrix operations (single thread) ---- */
 void ok_sv_jac_right_multiply(const ok_sv_state* S, const double* x, double* y) {  /* y += J x */
     int i, c;
+    if (S->pb->opt.linear_solver_type == OK_SV_DENSE_QR) {   /* DenseSparseMatrix: y.noalias() += RowMajor m_ * x (single block: S->values is m_) */
+        ok_gemv_row(S->num_residuals, S->num_effective, S->values, S->num_effective, x, y, 1.0);
+        return;
+    }
     for (i = 0; i < S->nr_red; ++i) {
         const ok_sv_row* row = &S->rows[i];
         for (c = 0; c < row->ncells; ++c) {
@@ -444,6 +453,12 @@ void ok_sv_jac_left_multiply(const ok_sv_state* S, const double* x, double* y) {
 static void squared_column_norm(const ok_sv_state* S, double* x) {
     int i, c;
     memset(x, 0, sizeof(double) * (size_t)S->num_effective);
+    if (S->pb->opt.linear_solver_type == OK_SV_DENSE_QR) {   /* DenseSparseMatrix::SquaredColumnNorm: the naive row loop */
+        const double* m = S->values;
+        for (i = 0; i < S->num_residuals; ++i)
+            for (c = 0; c < S->num_effective; ++c, ++m) x[c] += (*m) * (*m);
+        return;
+    }
     for (i = 0; i < S->nr_red; ++i) {
         const ok_sv_row* row = &S->rows[i];
         for (c = 0; c < row->ncells; ++c) {
@@ -870,6 +885,8 @@ int ok_sv_solve(ok_sv_problem* pb, const ok_sv_hooks* hooks) {
         sparse_cholesky_ordering(S);
         set_offsets(S);
         S->num_eliminate_blocks = 0;
+    } else if (pb->opt.linear_solver_type == OK_SV_DENSE_QR && S->np_red == 1) {
+        S->num_eliminate_blocks = 0;   /* Align4DoF_Ceres: one parameter block, DenseSparseMatrix == the single cell column */
     } else { S->termination = OK_SV_FAILURE; goto done; }
     if (hooks && hooks->on_reduced)
         hooks->on_reduced(hooks->ctx, pb, S->fixed_cost, S->num_eliminate_blocks, S->np_red, S->porder, S->nr_red, S->rorder);

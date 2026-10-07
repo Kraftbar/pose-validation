@@ -3,6 +3,8 @@
  * mutation-log layout. Every function mirrors the C++ method of the same name; the Problem calls are pushed to an event
  * queue in the order the C++ code makes them. */
 #include "ok_vigraph.h"
+#include "ok_gps.h"
+#include "ok_gps_init.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +138,7 @@ typedef struct rlink {          /* RelativePoseLink */
 typedef struct prior_pose { int has; ok_pose_err e; } prior_pose;
 typedef struct prior_sb { int has; ok_sab_err e; } prior_sb;
 
+typedef struct gpsf { ok_gps_async e; } gpsf;     /* GpsFactor: the error term (its address is the residual block id) */
 typedef struct state {
     uint64_t id;
     ok_time ts;
@@ -146,6 +149,9 @@ typedef struct state {
     prior_pose* pose_prior;     /* allocated when present: its address is the residual block */
     prior_sb* sb_prior;
     emap tp, tpc, rel;          /* other state id -> link */
+    gpsf** gf; int ngf, capgf;  /* GpsFactors (OKVIS2-X) */
+    int gps_mode;               /* gpsMode */
+    ok_vg_blk* tgw;             /* T_GW (shared) */
 } state;
 typedef struct landmark {
     uint64_t id;
@@ -156,7 +162,7 @@ typedef struct landmark {
 } landmark;
 typedef struct anystate { uint64_t kf; ok_time ts; ok_tf T_Sk_S; double v_Sk[3]; } anystate;
 
-typedef enum { RK_OBS = 1, RK_IMU, RK_POSEPRIOR, RK_SBPRIOR, RK_TP, RK_TPC, RK_REL, RK_FIX } rkind;
+typedef enum { RK_OBS = 1, RK_IMU, RK_POSEPRIOR, RK_SBPRIOR, RK_TP, RK_TPC, RK_REL, RK_FIX, RK_GPS } rkind;
 typedef struct rdesc { int kind; void* term; int loss, nb; uint64_t blk[OK_PB_MAXB]; int type; } rdesc;
 
 #define EVCAP_INIT 256
@@ -180,6 +186,10 @@ struct ok_vg {
     /* the initial-fixation PoseError of ViSlamBackend::optimiseRealtimeGraph */
     ok_pose_err* fix_term; uint64_t fix_rb;
     ok_vg_blk** blocks; int nblocks, capblocks;   /* retain addresses until graph teardown (replay bijection) */
+    /* OKVIS2-X GNSS */
+    int gps_on; double gps_r_SA[3], gps_yaw_thr; int gps_robust;
+    ok_vg_blk* tgw;             /* the T_GW block of states_.begin() (one shared block) */
+    void* gps_policy; void (*gps_free)(void*); void (*gps_removed)(void*, uint64_t);
     int solver_type; double ftol;   /* ceres Solver::Options (linear_solver_type, function_tolerance) as ViGraph::optimise logs them */
 };
 
@@ -211,6 +221,7 @@ static void p_add_param(ok_vg* g, ok_vg_blk* b, int manifold) {   /* Problem::Ad
     ok_vg_event* e;
     ok_problem_add_parameter_block(&g->pb, H(b), b->size);
     e = ev_new(g, OK_P_ADDPARAM); e->a = H(b); e->b = (uint64_t)b->size;
+    b->kind = manifold;
     if (manifold) {
         ok_problem_set_manifold(&g->pb, H(b), (uint64_t)manifold);
         e = ev_new(g, OK_P_SETMANIFOLD); e->a = H(b); e->b = (uint64_t)manifold;
@@ -247,7 +258,7 @@ static void p_set_const(ok_vg* g, ok_vg_blk* b, int c) {
 static int p_has(const ok_vg* g, const ok_vg_blk* b) { return ok_problem_find_param(&g->pb, H(b)) >= 0; }
 
 /* resid types as ok_solve.h */
-enum { T_REPROJ = 1, T_IMU = 2, T_POSE = 3, T_SAB = 4, T_REL = 5, T_TP = 7, T_TPC = 8 };
+enum { T_REPROJ = 1, T_IMU = 2, T_POSE = 3, T_SAB = 4, T_REL = 5, T_TP = 7, T_TPC = 8, T_GPS = 11 };
 
 /* ---- construction ---- */
 ok_vg* ok_vg_new(void) {
@@ -268,6 +279,12 @@ static ok_vg_blk* blk_new(ok_vg* g, int size, uint64_t id, ok_time ts) {
     g->blocks[g->nblocks++] = b;
     b->size = size; b->id = id; b->ts = ts;
     return b;
+}
+
+static void gps_free_factors(state* s) {
+    int i;
+    for (i = 0; i < s->ngf; ++i) { ok_gps_async_free(&s->gf[i]->e); free(s->gf[i]); }
+    free(s->gf); s->gf = NULL; s->ngf = s->capgf = 0;
 }
 
 void ok_vg_free(ok_vg* g) {
@@ -297,8 +314,10 @@ void ok_vg_free(ok_vg* g) {
             if (--l->refs == 0) free(l);
         }
         emap_free(&s->obs); emap_free(&s->tp); emap_free(&s->tpc); emap_free(&s->rel);
+        gps_free_factors(s);
         free(s->pose_prior); free(s->sb_prior); free(s);
     }
+    if (g->gps_free) g->gps_free(g->gps_policy);
     for (i = 0; i < g->landmarks.n; ++i) {
         landmark* l = (landmark*)g->landmarks.a[i].p;
         emap_free(&l->obs); free(l);
@@ -370,6 +389,14 @@ uint64_t ok_vg_add_states_initialise(ok_vg* g, ok_time t, const ok_imu_meas* mea
         memcpy(s->extr[i]->x, T_SC[i], sizeof(double) * 7);
         p_add_param(g, s->extr[i], 1);
     }
+    if (g->gps_on) {      /* OKVIS2-X: the gps parameter block (T_GW = identity, PoseManifold4d), set variable */
+        static const double ident[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+        g->tgw = blk_new(g, 7, id, t);
+        memcpy(g->tgw->x, ident, sizeof ident);
+        p_add_param(g, g->tgw, 3);
+        p_set_const(g, g->tgw, 0);
+        s->tgw = g->tgw;
+    }
     /* priors: yaw and pitch free, position pinned (information 1e8), roll... as upstream */
     for (i = 0; i < 6; ++i) diag[i] = 1.0;
     diag[0] = 1.0e8; diag[1] = 1.0e8; diag[2] = 1.0e8;
@@ -423,6 +450,7 @@ uint64_t ok_vg_add_states_propagate(ok_vg* g, ok_time t, const ok_imu_meas* meas
     p_add_resid(g, L, RK_IMU, L->e, T_IMU, 0, 4, b4);
     last->next_imu = L; s->prev_imu = L;
     for (i = 0; i < g->ncam; ++i) s->extr[i] = last->extr[i];      /* re-use the same extrinsics */
+    s->tgw = last->tgw;                                             /* GPS trafo: point back to the initial parameter block */
     emap_put(&g->states, id, 0, s);
     anystate_add(g, id, t);
     return id;
@@ -764,7 +792,10 @@ void ok_vg_update_landmarks(ok_vg* g) {
             memcpy(ob[i].extr, s->extr[o->kid.cam]->x, sizeof(double) * 7);
             ob[i].err = *o->err;
         }
-        if (l->obs.n > 0) ok_graph_update_landmark(l->hp->x, ob, l->obs.n, &quality, &init);
+        if (l->obs.n > 0) {
+            if (ok_graph_okvis2x) ok_graph_update_landmark_x(l->hp->x, ob, l->obs.n, &quality, &init);
+            else ok_graph_update_landmark(l->hp->x, ob, l->obs.n, &quality, &init);
+        }
         l->hp->initialised = init;
         l->quality = quality > 0.0 ? quality : 0.0;      /* std::max(0.0, quality) */
     }
@@ -847,6 +878,8 @@ int ok_vg_eliminate_state_by_imu_merge(ok_vg* g, uint64_t id, uint64_t ref, uint
     ok_imu_error_free(L2->e); free(L2->e); free(L2);
     emap_del(&g->states, id, 0);
     emap_free(&s->obs); emap_free(&s->tp); emap_free(&s->tpc); emap_free(&s->rel);
+    gps_free_factors(s);
+    if (g->gps_removed) g->gps_removed(g->gps_policy, id);   /* gpsStates_ / gpsReInitStates_ / gpsInitMap_ .erase(stateId) */
     free(s->pose_prior); free(s->sb_prior);
     free(s);
     return 1;
@@ -1282,6 +1315,53 @@ int ok_vg_poke_sync_imu(ok_vg* g, const ok_vg* src, uint64_t id) {
     ok_vg_imu_copy(d->prev_imu->e, s->prev_imu->e);
     return 1;
 }
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * OKVIS2-X GNSS: the graph side (see ok_vggps.c for the state machine)
+ * ---------------------------------------------------------------------------------------------------------------- */
+int ok_vg_gps_enable(ok_vg* g, const double r_SA[3], double yaw_error_threshold, int robust) {
+    if (g->gps_on) return -1;                  /* "only one GPS currently supported" (the C++ test is size() > 1) */
+    memcpy(g->gps_r_SA, r_SA, sizeof g->gps_r_SA);
+    g->gps_yaw_thr = yaw_error_threshold; g->gps_robust = robust; g->gps_on = 1;
+    return 0;
+}
+int ok_vg_gps_enabled(const ok_vg* g) { return g->gps_on; }
+const double* ok_vg_gps_r_SA(const ok_vg* g) { return g->gps_r_SA; }
+double ok_vg_gps_yaw_error_threshold(const ok_vg* g) { return g->gps_yaw_thr; }
+int ok_vg_gps_robust(const ok_vg* g) { return g->gps_robust; }
+const ok_imu_params* ok_vg_imu_params(const ok_vg* g) { return &g->imu_p; }
+void ok_vg_gps_get_T_GW(const ok_vg* g, double T7[7]) { memcpy(T7, g->tgw->x, sizeof(double) * 7); }
+void ok_vg_gps_set_T_GW(ok_vg* g, const double T7[7]) { memcpy(g->tgw->x, T7, sizeof(double) * 7); }
+void ok_vg_gps_set_const(ok_vg* g, int constant) { p_set_const(g, g->tgw, constant); g->tgw->fixed = constant; }
+int ok_vg_gps_nfactors(const ok_vg* g, uint64_t sid) { state* s = st_get(g, sid); return s ? s->ngf : 0; }
+ok_gps_async* ok_vg_gps_factor(const ok_vg* g, uint64_t sid, int i) { state* s = st_get(g, sid); return (s && i >= 0 && i < s->ngf) ? &s->gf[i]->e : NULL; }
+static void gps_add_resid(ok_vg* g, state* s, gpsf* f) {
+    ok_vg_blk* b3[3];
+    b3[0] = s->pose; b3[1] = s->sb; b3[2] = s->tgw;
+    p_add_resid(g, f, RK_GPS, &f->e, T_GPS, 2, 3, b3);
+}
+void ok_vg_gps_push_factor(ok_vg* g, uint64_t sid, const ok_gps_fix* m, const ok_imu_meas* imu, size_t n, int add_residual) {
+    state* s = st_get(g, sid);
+    gpsf* f = (gpsf*)xcalloc(sizeof(gpsf));
+    double info[9];
+    ok_gps_inverse3(m->cov, info);                         /* covariances.inverse() */
+    ok_gps_async_init(&f->e, m->pos, info, g->gps_r_SA, imu, n, &g->imu_p, s->ts, m->t);
+    if (add_residual) gps_add_resid(g, s, f);
+    if (s->ngf == s->capgf) { s->capgf = s->capgf ? 2 * s->capgf : 4; s->gf = (gpsf**)realloc(s->gf, sizeof(gpsf*) * (size_t)s->capgf); }
+    s->gf[s->ngf++] = f;
+}
+void ok_vg_gps_add_residuals(ok_vg* g, uint64_t sid) {
+    state* s = st_get(g, sid);
+    int i;
+    if (!s) return;
+    for (i = 0; i < s->ngf; ++i) gps_add_resid(g, s, s->gf[i]);
+}
+void ok_vg_gps_set_mode(ok_vg* g, uint64_t sid, int mode) { state* s = st_get(g, sid); if (s) s->gps_mode = mode; }
+int ok_vg_gps_mode(const ok_vg* g, uint64_t sid) { state* s = st_get(g, sid); return s ? s->gps_mode : 0; }
+void ok_vg_gps_set_policy(ok_vg* g, void* policy, void (*free_fn)(void*), void (*removed)(void*, uint64_t)) {
+    g->gps_policy = policy; g->gps_free = free_fn; g->gps_removed = removed;
+}
+void* ok_vg_gps_policy(const ok_vg* g) { return g->gps_policy; }
 
 /* ------------------------------------------------------------------------------------------------------------------
  * observation of the state (replay harness)

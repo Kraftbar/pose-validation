@@ -1,4 +1,4 @@
-/* OK_PORT_SOURCES: check_ok_vslam.c ok_vslam.c ok_vsb_geom.c ok_vsolve.c ok_solve.c ok_solve_linear.c ok_sparse.c ok_amd.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c */
+/* OK_PORT_SOURCES: check_ok_vslam.c ok_vslam.c ok_vsb_geom.c ok_vsolve.c ok_solve.c ok_solve_linear.c ok_sparse.c ok_amd.c ok_vigraph.c ok_problem.c ok_graph.c ok_twopose.c ok_err.c ok_param.c ok_cam.c ok_kin.c ok_imu.c ok_time.c ok_eigen.c ok_dense.c ok_blas.c ok_gps.c ok_gps_init.c ok_align4.c ok_vggps.c */
 /* Bit-exactness harness for okvis_port module 6 (ViSlamBackend: strategy, IMU-frame / keyframe / loop-closure frame sets,
  * pose-graph conversion, loop-closure alignment, synchronisation).
  *

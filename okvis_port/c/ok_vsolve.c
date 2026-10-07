@@ -39,6 +39,7 @@ static int nres_of(int type) {
         case OK_SV_T_POSE: case OK_SV_T_RELPOSE: case OK_SV_T_TWOPOSE: case OK_SV_T_TWOPOSE_CONST: return 6;
         case OK_SV_T_SAB: return 9;
         case OK_SV_T_HPOINT: return 3;
+        case OK_SV_T_GPS: return 3;
         default: return 0;
     }
 }
@@ -70,6 +71,7 @@ int ok_vg_solve_native(ok_vg* g, int max_iter, unsigned char** res, size_t* rlen
         p->ptr = cp[i]; p->size = b->size;
         p->kind = b->size == 7 ? OK_SV_KIND_POSE : (b->size == 4 ? OK_SV_KIND_HPOINT : OK_SV_KIND_NONE);
         p->tangent = b->size == 7 ? 6 : (b->size == 4 ? 3 : b->size);
+        if (b->kind == 3) { p->kind = OK_SV_KIND_POSE4; p->tangent = 4; }     /* OKVIS2-X T_GW: PoseManifold4d */
         p->constant = ok_vg_is_constant(g, cp[i]) > 0;
         p->x = b->x;                                    /* the solver updates the graph's block in place */
         p->index = -1;
@@ -80,7 +82,7 @@ int ok_vg_solve_native(ok_vg* g, int max_iter, unsigned char** res, size_t* rlen
         ok_vg_resid d;
         ok_sv_resid* rb = &sp.r[i];
         if (!ok_vg_find_resid(g, cr[i], &d)) { ok = 0; break; }
-        rb->ptr = cr[i]; rb->type = d.type; rb->loss = d.loss ? OK_SV_LOSS_CAUCHY : OK_SV_LOSS_NONE; rb->nb = d.nb; rb->nres = nres_of(d.type);
+        rb->ptr = cr[i]; rb->type = d.type; rb->loss = d.loss == 2 ? OK_SV_LOSS_CAUCHY3 : (d.loss ? OK_SV_LOSS_CAUCHY : OK_SV_LOSS_NONE); rb->nb = d.nb; rb->nres = nres_of(d.type);
         for (k = 0; k < d.nb; ++k) { rb->blk[k] = pmap_find(pm, sp.np, d.blk[k]); if (rb->blk[k] < 0) ok = 0; }
         switch (d.type) {
             case OK_SV_T_REPROJ: rb->term.reproj = *(const ok_reproj_err*)d.term; break;
@@ -90,6 +92,7 @@ int ok_vg_solve_native(ok_vg* g, int max_iter, unsigned char** res, size_t* rlen
             case OK_SV_T_RELPOSE: rb->term.relpose = *(const ok_relpose_err*)d.term; break;
             case OK_SV_T_TWOPOSE: rb->term.tp = ((const ok_twopose*)d.term)->term; break;
             case OK_SV_T_TWOPOSE_CONST: rb->term.tp = *(const ok_tp_std*)d.term; rb->term.tp.is_computed = 1; break;
+            case OK_SV_T_GPS: rb->term.gps = (ok_gps_async*)(void*)d.term; break;
             default: ok = 0; break;
         }
     }

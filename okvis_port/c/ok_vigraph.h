@@ -72,6 +72,7 @@
 #include <stdint.h>
 #include "ok_cam.h"
 #include "ok_err.h"
+#include "ok_gps.h"
 #include "ok_graph.h"
 #include "ok_imu.h"
 #include "ok_kin.h"
@@ -98,6 +99,7 @@ typedef struct ok_vg_event {
 typedef struct ok_vg_blk {    /* a parameter block: PoseParameterBlock (7), SpeedAndBiasParameterBlock (9), HomogeneousPointParameterBlock (4) */
     double x[9];
     int size, fixed, initialised;
+    int kind;                 /* the manifold set on it: 0 none, 1 PoseManifold, 2 HomogeneousPointManifold, 3 PoseManifold4d (T_GW) */
     uint64_t id;
     ok_time ts;
 } ok_vg_blk;
@@ -276,5 +278,32 @@ size_t ok_vg_relpose_payload(const ok_relpose_err* e, unsigned char** out);
 size_t ok_vg_tp_payload(const ok_tp_std* e, unsigned char** out);
 uint64_t ok_vg_fnv(const void* p, size_t n);
 void ok_vg_imu_copy(ok_imu_error* dst, const ok_imu_error* src);
+
+/* ---- OKVIS2-X GNSS: the graph side (the T_GW block, the per-state GpsFactors); the state machine is ok_vggps.c ---- */
+typedef struct ok_gps_fix { ok_time t; double pos[3]; double cov[9]; } ok_gps_fix;   /* GpsMeasurement (cartesian): position, covariance (3x3 col-major) */
+/* addGps: enables the GNSS terms of this graph (call before the first addStates; addStatesInitialise then creates the T_GW block even
+ * though no fix was seen yet, as upstream) */
+int ok_vg_gps_enable(ok_vg* g, const double r_SA[3], double yaw_error_threshold, int robust);
+int ok_vg_gps_enabled(const ok_vg* g);
+const double* ok_vg_gps_r_SA(const ok_vg* g);
+double ok_vg_gps_yaw_error_threshold(const ok_vg* g);
+int ok_vg_gps_robust(const ok_vg* g);
+const ok_imu_params* ok_vg_imu_params(const ok_vg* g);
+/* T_GW = states_.begin()->second.T_GW (the one shared block): coefficients [r, q xyzw] */
+void ok_vg_gps_get_T_GW(const ok_vg* g, double T7[7]);
+void ok_vg_gps_set_T_GW(ok_vg* g, const double T7[7]);                 /* setGpsExtrinsics: T_GW->setEstimate */
+void ok_vg_gps_set_const(ok_vg* g, int constant);                     /* freeze / unfreezeGpsExtrinsics (the Problem call only) */
+/* GpsFactors of a state (std::vector, push order) */
+int ok_vg_gps_nfactors(const ok_vg* g, uint64_t sid);
+ok_gps_async* ok_vg_gps_factor(const ok_vg* g, uint64_t sid, int i);
+/* GpsFactors.push_back(new GpsErrorAsynchronous(...)) of ViGraph::addGpsMeasurement; the residual (Cauchy(3), blocks pose / speed-and-bias /
+ * T_GW) is added now when add_residual, else later by ok_vg_gps_add_residuals */
+void ok_vg_gps_push_factor(ok_vg* g, uint64_t sid, const ok_gps_fix* f, const ok_imu_meas* imu, size_t n, int add_residual);
+void ok_vg_gps_add_residuals(ok_vg* g, uint64_t sid);                 /* AddResidualBlock for every factor of the state (addGpsInitFactors body) */
+void ok_vg_gps_set_mode(ok_vg* g, uint64_t sid, int mode);
+int ok_vg_gps_mode(const ok_vg* g, uint64_t sid);
+/* the policy object (ok_vggps.c) hangs off the graph; `removed` is called when a state was eliminated */
+void ok_vg_gps_set_policy(ok_vg* g, void* policy, void (*free_fn)(void*), void (*removed)(void*, uint64_t));
+void* ok_vg_gps_policy(const ok_vg* g);
 
 #endif

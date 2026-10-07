@@ -76,4 +76,7 @@ void ok_dbow_query(const ok_dbow_db* db, const ok_dbow_bow* q, ok_dbow_result** 
  * (ascending entry id of the retained entries) */
 void ok_dbow_filtered(const ok_dbow_db* db, const ok_dbow_result* orig, int norig, uint64_t** state_ids, double** scores, int* nout);
 
+/* OKVIS2-X behaviour switch (default 0 = OKVIS2): getFilteredDBoWResult score cut-off 0.375 instead of 0.4 */
+extern int ok_dbow_okvis2x;
+
 #endif
