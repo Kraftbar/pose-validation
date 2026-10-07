@@ -1,0 +1,12 @@
+--- a/src/utils/keypoints.cpp
++++ b/src/utils/keypoints.cpp
+@@ -386,7 +386,8 @@
+           new opengv::sac_problems::relative_pose::
+               CentralRelativePoseSacProblem(
+                   adapter, opengv::sac_problems::relative_pose::
+-                               CentralRelativePoseSacProblem::STEWENIUS));
++                               CentralRelativePoseSacProblem::STEWENIUS,
++                               false /* basalt_port: fixed RNG seed (default seeds from time(0)+clock()) */));
+   // run ransac
+   ransac.sac_model_ = relposeproblem_ptr;
+   ransac.threshold_ = ransac_thresh;

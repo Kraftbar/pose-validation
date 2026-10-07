@@ -1,0 +1,47 @@
+# Headless, single-threaded, deterministic reference build of Basalt (basalt_port/reference).
+# Replaces upstream CMakeLists.txt (which needs vcpkg + Pangolin + RealSense + rosbag and builds with -O3 -march=native).
+# Everything needed is passed in by tools/build_basalt_reference.py.
+cmake_minimum_required(VERSION 3.20)
+project(basalt_reference CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# reference flags: no -march=native, no -O3, no contraction, no fast-math
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -ffp-contract=off -fno-fast-math")
+set(CMAKE_CXX_FLAGS "-Wall -Wno-unused-parameter -Wno-deprecated-declarations -DEIGEN_DONT_PARALLELIZE -DFMT_HEADER_ONLY")
+
+set(EIGEN_INC "" CACHE PATH "Eigen include dir")
+set(DEPS_INC "" CACHE PATH "fmt/nlohmann/CLI11 include dir")
+set(TBB_INC "" CACHE PATH "oneTBB include dir")
+set(TBB_LIB "" CACHE FILEPATH "libtbb.so")
+set(OCV_ROOT "" CACHE PATH "OpenCV install prefix")
+set(OCV_INC "${OCV_ROOT}/include/opencv4")
+set(OCV_LIBS ${OCV_ROOT}/lib/libopencv_calib3d.so ${OCV_ROOT}/lib/libopencv_features2d.so ${OCV_ROOT}/lib/libopencv_imgcodecs.so
+             ${OCV_ROOT}/lib/libopencv_imgproc.so ${OCV_ROOT}/lib/libopencv_flann.so ${OCV_ROOT}/lib/libopencv_core.so)
+set(D ${CMAKE_CURRENT_SOURCE_DIR}/_deps)
+
+# opengv (pristine sources + patches; static; the vcpkg port sets C++17 and -include cassert too)
+file(GLOB_RECURSE OPENGV_SRC ${D}/opengv/src/*.cpp)
+add_library(opengv STATIC ${OPENGV_SRC})
+target_include_directories(opengv PUBLIC ${D}/opengv/include SYSTEM ${EIGEN_INC} ${EIGEN_INC}/unsupported)
+target_compile_options(opengv PRIVATE -include cassert -w)
+
+set(INC ${CMAKE_CURRENT_SOURCE_DIR}/include ${D}/basalt-headers/include ${D}/Sophus ${D}/cereal/include ${D}/magic_enum/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ros/include)
+set(BASALT_SRC
+  src/io/dataset_io.cpp
+  src/linearization/landmark_block.cpp src/linearization/linearization_abs_qr.cpp src/linearization/linearization_abs_sc.cpp
+  src/linearization/linearization_base.cpp src/linearization/linearization_rel_sc.cpp
+  src/optical_flow/optical_flow.cpp
+  src/utils/keypoints.cpp src/utils/system_utils.cpp src/utils/time_utils.cpp src/utils/vio_config.cpp
+  src/vi_estimator/ba_base.cpp src/vi_estimator/landmark_database.cpp src/vi_estimator/marg_helper.cpp src/vi_estimator/sc_ba_base.cpp
+  src/vi_estimator/sqrt_ba_base.cpp src/vi_estimator/sqrt_keypoint_vio.cpp src/vi_estimator/sqrt_keypoint_vo.cpp src/vi_estimator/vio_estimator.cpp)
+add_library(basalt STATIC ${BASALT_SRC})
+target_include_directories(basalt PUBLIC ${INC} SYSTEM ${EIGEN_INC} ${EIGEN_INC}/unsupported ${DEPS_INC} ${TBB_INC} ${OCV_INC})
+target_compile_definitions(basalt PUBLIC BASALT_INSTANTIATIONS_DOUBLE BASALT_INSTANTIATIONS_FLOAT)
+target_link_libraries(basalt PUBLIC opengv ${TBB_LIB} ${OCV_LIBS} pthread)
+
+add_executable(basalt_ref_driver ${CMAKE_CURRENT_SOURCE_DIR}/driver/basalt_ref_driver.cpp)
+target_link_libraries(basalt_ref_driver basalt)

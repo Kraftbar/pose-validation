@@ -1,0 +1,391 @@
+diff -ruN a/include/basalt/utils/bs_port_dump6.h b/include/basalt/utils/bs_port_dump6.h
+--- a/include/basalt/utils/bs_port_dump6.h	1970-01-01 01:00:00.000000000 +0100
++++ b/include/basalt/utils/bs_port_dump6.h	2026-10-07 02:48:33.306701016 +0200
+@@ -0,0 +1,247 @@
++// basalt_port module M6 instrumentation (reference build only, never distributed). Observation only. Extends bs_port_dump.h (patch 0003).
++//
++// Enabled by BASALT_PORT_DUMP_DIR together with BASALT_PORT_M6=1; writes <dir>/m6.bin (same framing as the other streams:
++// u32 tag, u64 payload bytes, payload; little endian). Needs BASALT_PORT_DUMP_FULL=1 for the PROBLEM records. Records:
++//   HDR (100)  u32 version 1, u32 sizeof(Scalar) = 4
++//   LM_ADD (20)        u64 id, f32 direction[2], f32 inv_dist, i64 host_frame, u64 host_cam                      LandmarkDatabase::addLandmark
++//   LM_OBS (21)        i64 frame, u64 cam (target), u64 kpt_id, f32 pos[2]                                      addObservation
++//   LM_RMFRAME (22)    i64 frame                                                                                removeFrame
++//   LM_RMKF (23)       u32 nk, i64[nk], u32 np, i64[np], u32 ns, i64[ns]                                        removeKeyframes(kfs, poses, states)
++//   LM_RMLM (24)       u64 id                                                                                   removeLandmark
++//   LM_RMOBS (25)      u64 id, u32 n, n x { i64 frame, u64 cam }                                                removeObservations
++//   ORDER (26)         u32 kind(0 = LinearizationBase::create ABS_QR), u32 n_lm, u32 n_hosts, u64 lm_order_hash, u64 host_order_hash
++//                      (FNV-1a 64 of the ids / (frame, cam) in unordered_map iteration order, as OPT_BEGIN of patch 0003)
++//   UNCONN (27)        u32 n_emplace, i32 ids[n] (emplace order into unordered_set<int> unconnected_obs0), u32 n_set, i32 order[n_set] (iteration order)
++//   BIAS_LIN (28)      i64 start_t, f32 bias_gyro_lin[3], f32 bias_accel_lin[3]                                 IntegratedImuMeasurement constructor arguments
++//   PROBLEM (30)       see emitProblem(): the complete input of one LinearizationBase::create (kind 0 = optimize(), 1 = marginalize())
++#pragma once
++
++#include <basalt/utils/bs_port_dump.h>
++#include <basalt/utils/imu_types.h>
++#include <basalt/vi_estimator/landmark_database.h>
++
++namespace basalt {
++namespace port6 {
++
++enum Tag6 : uint32_t {
++  T6_LM_ADD = 20, T6_LM_OBS = 21, T6_LM_RMFRAME = 22, T6_LM_RMKF = 23, T6_LM_RMLM = 24, T6_LM_RMOBS = 25, T6_ORDER = 26,
++  T6_UNCONN = 27, T6_BIAS_LIN = 28, T6_PROBLEM = 30
++};
++
++struct W {
++  FILE* f = nullptr;
++  W() {
++    const char* e = std::getenv("BASALT_PORT_M6");
++    if (!(e && std::atoi(e) != 0 && port::D().on)) return;
++    f = std::fopen((port::D().dir + "/m6.bin").c_str(), "wb");
++    if (!f) return;
++    static char buf[1 << 20];
++    std::setvbuf(f, buf, _IOFBF, sizeof buf);
++    port::Buf h;
++    h.u32(1);
++    h.u32((uint32_t)sizeof(float));
++    write(port::T_HDR, h.b);
++  }
++  ~W() { if (f) std::fclose(f); }
++  void write(uint32_t tag, const std::vector<uint8_t>& pay) {
++    if (!f) return;
++    uint64_t n = pay.size();
++    std::fwrite(&tag, 4, 1, f);
++    std::fwrite(&n, 8, 1, f);
++    if (n) std::fwrite(pay.data(), 1, n, f);
++  }
++};
++inline W& w() { static W x; return x; }
++inline bool on() { return w().f != nullptr; }
++
++template <class Scalar>
++inline constexpr bool is_float() { return std::is_same<Scalar, float>::value; }
++
++template <class Scalar>
++inline void lmAdd(uint64_t id, const Keypoint<Scalar>& p) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  b.u64(id);
++  b.arr(p.direction.data(), 2);
++  b.f32((float)p.inv_dist);
++  b.i64(p.host_kf_id.frame_id);
++  b.u64(p.host_kf_id.cam_id);
++  w().write(T6_LM_ADD, b.b);
++}
++template <class Scalar>
++inline void lmObs(const TimeCamId& t, const KeypointObservation<Scalar>& o) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  b.i64(t.frame_id);
++  b.u64(t.cam_id);
++  b.u64((uint64_t)o.kpt_id);
++  b.arr(o.pos.data(), 2);
++  w().write(T6_LM_OBS, b.b);
++}
++template <class Scalar>
++inline void lmRemoveFrame(int64_t frame) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  b.i64(frame);
++  w().write(T6_LM_RMFRAME, b.b);
++}
++template <class Scalar, class Set>
++inline void lmRemoveKeyframes(const Set& kfs, const Set& poses, const Set& states) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  for (const Set* s : {&kfs, &poses, &states}) {
++    b.u32((uint32_t)s->size());
++    for (auto v : *s) b.i64((int64_t)v);
++  }
++  w().write(T6_LM_RMKF, b.b);
++}
++template <class Scalar>
++inline void lmRemoveLandmark(uint64_t id) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  b.u64(id);
++  w().write(T6_LM_RMLM, b.b);
++}
++template <class Scalar, class Set>
++inline void lmRemoveObservations(uint64_t id, const Set& obs) {
++  if (!is_float<Scalar>() || !on()) return;
++  port::Buf b;
++  b.u64(id);
++  b.u32((uint32_t)obs.size());
++  for (const auto& t : obs) { b.i64(t.frame_id); b.u64(t.cam_id); }
++  w().write(T6_LM_RMOBS, b.b);
++}
++
++template <class Lmdb>
++inline void order(uint32_t kind, const Lmdb& lmdb) {
++  if (!on()) return;
++  uint64_t hl = port::fnv(nullptr, 0), hh = port::fnv(nullptr, 0);
++  uint32_t nl = 0, nh = 0;
++  for (const auto& kv : lmdb.getLandmarks()) { uint64_t id = kv.first; hl = port::fnvT(id, hl); ++nl; }
++  for (const auto& kv : lmdb.getObservations()) {
++    int64_t f = kv.first.frame_id;
++    uint64_t c = kv.first.cam_id;
++    hh = port::fnvT(f, hh);
++    hh = port::fnvT(c, hh);
++    ++nh;
++  }
++  port::Buf b;
++  b.u32(kind); b.u32(nl); b.u32(nh); b.u64(hl); b.u64(hh);
++  w().write(T6_ORDER, b.b);
++}
++
++template <class Set>
++inline void unconn(const std::vector<int>& emplace_seq, const Set& set) {
++  if (!on()) return;
++  port::Buf b;
++  b.u32((uint32_t)emplace_seq.size());
++  for (int v : emplace_seq) b.i32(v);
++  b.u32((uint32_t)set.size());
++  for (int v : set) b.i32(v);
++  w().write(T6_UNCONN, b.b);
++}
++
++template <class Vec3>
++inline void biasLin(int64_t start_t, const Vec3& bg, const Vec3& ba) {
++  if (!on()) return;
++  port::Buf b;
++  b.i64(start_t);
++  b.arr(bg.data(), 3);
++  b.arr(ba.data(), 3);
++  w().write(T6_BIAS_LIN, b.b);
++}
++
++// PROBLEM record (tag 30): the estimator state a LinearizationBase::create (ABS_QR) call sees.
++//   u32 kind, i64 t_ns (last_state_t_ns),
++//   u32 np, np x { i64 t, u32 linearized, f32 lin[7] (q xyzw, t), f32 cur[7] (getPose()), f32 delta[6] }                       frame_poses
++//   u32 ns, ns x { i64 t, u32 linearized, f32 lin[16] (q4 p3 v3 bg3 ba3), f32 cur[16] (getState()), f32 delta[15] }          frame_states
++//   u32 na, na x { i64 t, u32 start, u32 size }, u32 total                                                                     aom
++//   u32 nimu, nimu x { i64 key, i64 start_t, i64 dt_ns, f32 dq[4], dp[3], dv[3], cov[81], d_state_d_ba[27], d_state_d_bg[27] } ild.imu_meas
++//   f32 g[3], f32 gyro_bias_sqrt_weight[3], f32 accel_bias_sqrt_weight[3]
++//   u32 has_marg; if 1: u32 is_sqrt, u32 n, n x { i64 t, u32 start, u32 size }, u32 total, u32 rows, u32 cols, f32 H[rows*cols], f32 b[rows]
++//   u32 n_used (0xFFFFFFFF = nullptr), i64[n_used]; u32 n_lost (0xFFFFFFFF = nullptr), u64[n_lost]                             used_frames, lost_landmarks
++//   u32 nl, nl x { u64 id, f32 dir[2], f32 inv_dist, i64 host_frame, u64 host_cam, u32 nobs, nobs x { i64 frame, u64 cam, f32 pos[2] } }   kpts order
++template <class Scalar, class Poses, class States, class Aom, class Marg, class Ild, class Lmdb, class Vec3, class SetU, class SetL>
++inline void emitProblem(uint32_t kind, int64_t t_ns, const Poses& poses, const States& states, const Aom& aom, const Marg* marg, const Ild& ild,
++                        const Lmdb& lmdb, const Vec3& g, const Vec3& gw, const Vec3& aw, const SetU* used, const SetL* lost) {
++  if (!is_float<Scalar>() || !on() || !port::D().full) return;
++  port::Buf b;
++  b.u32(kind);
++  b.i64(t_ns);
++  b.u32((uint32_t)poses.size());
++  for (const auto& kv : poses) {
++    b.i64(kv.first);
++    b.u32(kv.second.isLinearized() ? 1u : 0u);
++    port::putSE3(b, kv.second.getPoseLin());
++    port::putSE3(b, kv.second.getPose());
++    b.arr(kv.second.getDelta().data(), 6);
++  }
++  b.u32((uint32_t)states.size());
++  for (const auto& kv : states) {
++    b.i64(kv.first);
++    b.u32(kv.second.isLinearized() ? 1u : 0u);
++    port::putState(b, kv.second.getStateLin());
++    port::putState(b, kv.second.getState());
++    b.arr(kv.second.getDelta().data(), 15);
++  }
++  b.u32((uint32_t)aom.abs_order_map.size());
++  for (const auto& kv : aom.abs_order_map) {
++    b.i64(kv.first);
++    b.u32((uint32_t)kv.second.first);
++    b.u32((uint32_t)kv.second.second);
++  }
++  b.u32((uint32_t)aom.total_size);
++  b.u32((uint32_t)ild.imu_meas.size());
++  for (const auto& kv : ild.imu_meas) {
++    const auto& m = *kv.second;
++    b.i64(kv.first);
++    b.i64(m.get_start_t_ns());
++    b.i64(m.get_dt_ns());
++    const auto& ds = m.getDeltaState();
++    b.arr(ds.T_w_i.unit_quaternion().coeffs().data(), 4);
++    b.arr(ds.T_w_i.translation().data(), 3);
++    b.arr(ds.vel_w_i.data(), 3);
++    b.arr(m.get_cov().data(), 81);
++    b.arr(m.get_d_state_d_ba().data(), 27);
++    b.arr(m.get_d_state_d_bg().data(), 27);
++  }
++  b.arr(g.data(), 3);
++  b.arr(gw.data(), 3);
++  b.arr(aw.data(), 3);
++  b.u32(marg ? 1u : 0u);
++  if (marg) {
++    b.u32(marg->is_sqrt ? 1u : 0u);
++    b.u32((uint32_t)marg->order.abs_order_map.size());
++    for (const auto& kv : marg->order.abs_order_map) {
++      b.i64(kv.first);
++      b.u32((uint32_t)kv.second.first);
++      b.u32((uint32_t)kv.second.second);
++    }
++    b.u32((uint32_t)marg->order.total_size);
++    b.u32((uint32_t)marg->H.rows());
++    b.u32((uint32_t)marg->H.cols());
++    b.arr(marg->H.data(), (size_t)marg->H.size());
++    b.arr(marg->b.data(), (size_t)marg->b.size());
++  }
++  if (used) { b.u32((uint32_t)used->size()); for (auto v : *used) b.i64((int64_t)v); } else b.u32(0xFFFFFFFFu);
++  if (lost) { b.u32((uint32_t)lost->size()); for (auto v : *lost) b.u64((uint64_t)v); } else b.u32(0xFFFFFFFFu);
++  b.u32((uint32_t)lmdb.numLandmarks());
++  for (const auto& kv : lmdb.getLandmarks()) {
++    const auto& k = kv.second;
++    b.u64((uint64_t)kv.first);
++    b.arr(k.direction.data(), 2);
++    b.f32((float)k.inv_dist);
++    b.i64(k.host_kf_id.frame_id);
++    b.u64(k.host_kf_id.cam_id);
++    b.u32((uint32_t)k.obs.size());
++    for (const auto& o : k.obs) {
++      b.i64(o.first.frame_id);
++      b.u64(o.first.cam_id);
++      b.arr(o.second.data(), 2);
++    }
++  }
++  w().write(T6_PROBLEM, b.b);
++}
++
++}  // namespace port6
++}  // namespace basalt
+diff -ruN a/src/linearization/linearization_base.cpp b/src/linearization/linearization_base.cpp
+--- a/src/linearization/linearization_base.cpp	2026-10-07 02:47:37.598364501 +0200
++++ b/src/linearization/linearization_base.cpp	2026-10-07 02:48:33.327700766 +0200
+@@ -41,6 +41,7 @@
+ #include <magic_enum/magic_enum.hpp>
+ 
+ #include <basalt/utils/bs_port_dump.h>
++#include <basalt/utils/bs_port_dump6.h>
+ 
+ namespace basalt {
+ 
+@@ -73,6 +74,7 @@
+   switch (options.linearization_type) {
+     case LinearizationType::ABS_QR:
+       port::count(port::C_LIN_CREATE_ABS_QR);
++      if (std::is_same_v<Scalar, float>) port6::order(0, estimator->lmdb);
+       return std::make_unique<LinearizationAbsQR<Scalar, POSE_SIZE>>(
+           estimator, aom, options, marg_lin_data, imu_lin_data, used_frames,
+           lost_landmarks, last_state_to_marg);
+diff -ruN a/src/vi_estimator/landmark_database.cpp b/src/vi_estimator/landmark_database.cpp
+--- a/src/vi_estimator/landmark_database.cpp	2026-10-07 02:47:37.596364525 +0200
++++ b/src/vi_estimator/landmark_database.cpp	2026-10-07 02:55:00.184052680 +0200
+@@ -36,12 +36,14 @@
+ #include <algorithm>
+ 
+ #include <basalt/vi_estimator/landmark_database.h>
++#include <basalt/utils/bs_port_dump6.h>
+ 
+ namespace basalt {
+ 
+ template <class Scalar_>
+ void LandmarkDatabase<Scalar_>::addLandmark(KeypointId lm_id,
+                                             const Keypoint<Scalar>& pos) {
++  port6::lmAdd<Scalar>(lm_id, pos);
+   auto& kpt = kpts[lm_id];
+   kpt.direction = pos.direction;
+   kpt.inv_dist = pos.inv_dist;
+@@ -50,6 +52,7 @@
+ 
+ template <class Scalar_>
+ void LandmarkDatabase<Scalar_>::removeFrame(const FrameId& frame) {
++  port6::lmRemoveFrame<Scalar>(frame);
+   for (auto it = kpts.begin(); it != kpts.end();) {
+     for (auto it2 = it->second.obs.begin(); it2 != it->second.obs.end();) {
+       if (it2->first.frame_id == frame)
+@@ -71,6 +74,7 @@
+     const std::set<FrameId>& kfs_to_marg,
+     const std::set<FrameId>& poses_to_marg,
+     const std::set<FrameId>& states_to_marg_all) {
++  port6::lmRemoveKeyframes<Scalar>(kfs_to_marg, poses_to_marg, states_to_marg_all);
+   for (auto it = kpts.begin(); it != kpts.end();) {
+     if (kfs_to_marg.count(it->second.host_kf_id.frame_id) > 0) {
+       it = removeLandmarkHelper(it);
+@@ -116,6 +120,7 @@
+ template <class Scalar_>
+ void LandmarkDatabase<Scalar_>::addObservation(
+     const TimeCamId& tcid_target, const KeypointObservation<Scalar>& o) {
++  port6::lmObs<Scalar>(tcid_target, o);
+   auto it = kpts.find(o.kpt_id);
+   BASALT_ASSERT(it != kpts.end());
+ 
+@@ -210,6 +215,7 @@
+ 
+ template <class Scalar_>
+ void LandmarkDatabase<Scalar_>::removeLandmark(KeypointId lm_id) {
++  port6::lmRemoveLandmark<Scalar>(lm_id);
+   auto it = kpts.find(lm_id);
+   if (it != kpts.end()) removeLandmarkHelper(it);
+ }
+@@ -217,6 +223,7 @@
+ template <class Scalar_>
+ void LandmarkDatabase<Scalar_>::removeObservations(
+     KeypointId lm_id, const std::set<TimeCamId>& obs) {
++  port6::lmRemoveObservations<Scalar>(lm_id, obs);
+   auto it = kpts.find(lm_id);
+   BASALT_ASSERT(it != kpts.end());
+ 
+diff -ruN a/src/vi_estimator/sqrt_keypoint_vio.cpp b/src/vi_estimator/sqrt_keypoint_vio.cpp
+--- a/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 02:47:37.596364525 +0200
++++ b/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 02:48:43.456580139 +0200
+@@ -55,6 +55,7 @@
+ #include <chrono>
+ 
+ #include <basalt/utils/bs_port_dump.h>
++#include <basalt/utils/bs_port_dump6.h>
+ 
+ namespace basalt {
+ 
+@@ -320,6 +321,7 @@
+         meas.reset(new IntegratedImuMeasurement<Scalar>(
+             prev_frame->t_ns, last_state.getState().bias_gyro,
+             last_state.getState().bias_accel));
++        port6::biasLin(prev_frame->t_ns, last_state.getState().bias_gyro, last_state.getState().bias_accel);
+ 
+         BASALT_ASSERT_MSG(prev_frame->t_ns < curr_frame->t_ns,
+                           "duplicate frame timestamps?! zero time delta leads "
+@@ -454,6 +456,7 @@
+   int connected0 = 0;
+   std::map<int64_t, int> num_points_connected;
+   std::unordered_set<int> unconnected_obs0;
++  std::vector<int> port6_unconn_seq;
+   for (size_t i = 0; i < opt_flow_meas->observations.size(); i++) {
+     TimeCamId tcid_target(opt_flow_meas->t_ns, i);
+ 
+@@ -479,6 +482,7 @@
+       } else {
+         if (i == 0) {
+           unconnected_obs0.emplace(kpt_id);
++          if (port6::on()) port6_unconn_seq.push_back(kpt_id);
+         }
+       }
+     }
+@@ -505,6 +509,7 @@
+     TimeCamId tcidl(opt_flow_meas->t_ns, 0);
+ 
+     int num_points_added = 0;
++    port6::unconn(port6_unconn_seq, unconnected_obs0);
+     for (int lm_id : unconnected_obs0) {
+       // Find all observations
+       std::map<TimeCamId, KeypointObservation<Scalar>> kp_obs;
+@@ -866,6 +871,9 @@
+         ild.imu_meas[kv.first] = &kv.second;
+       }
+ 
++      if (port_m)
++        port6::emitProblem<Scalar>(1, last_state_t_ns, frame_poses, frame_states, aom, &marg_data, ild, lmdb, g, gyro_bias_sqrt_weight,
++                                   accel_bias_sqrt_weight, &kfs_to_marg, &lost_landmaks);
+       auto lqr = LinearizationBase<Scalar, POSE_SIZE>::create(
+           this, aom, lqr_options, &marg_data, &ild, &kfs_to_marg,
+           &lost_landmaks, last_state_to_marg);
+@@ -1347,6 +1355,9 @@
+       }
+       port::D().write(port::S_ITER, port::T_OPT_BEGIN, pb.b);
+     }
++    if (port_s)
++      port6::emitProblem<Scalar>(0, last_state_t_ns, frame_poses, frame_states, aom, &marg_data, ild, lmdb, g, gyro_bias_sqrt_weight,
++                                 accel_bias_sqrt_weight, (const std::set<int64_t>*)nullptr, (const std::unordered_set<KeypointId>*)nullptr);
+ 
+     bool terminated = false;
+     bool converged = false;

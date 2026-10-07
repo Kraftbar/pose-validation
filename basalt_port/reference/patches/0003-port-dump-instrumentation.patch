@@ -1,0 +1,937 @@
+diff -ruN a/include/basalt/optical_flow/frame_to_frame_optical_flow.h b/include/basalt/optical_flow/frame_to_frame_optical_flow.h
+--- a/include/basalt/optical_flow/frame_to_frame_optical_flow.h	2026-10-07 00:48:11.094062409 +0200
++++ b/include/basalt/optical_flow/frame_to_frame_optical_flow.h	2026-10-07 00:48:47.947648334 +0200
+@@ -37,6 +37,8 @@
+ 
+ #include <thread>
+ 
++#include <basalt/utils/bs_port_dump.h>
++
+ #include <sophus/se2.hpp>
+ 
+ #include <tbb/blocked_range.h>
+@@ -172,12 +174,48 @@
+     }
+ 
+     if (output_queue && frame_counter % config.optical_flow_skip_frames == 0) {
++      portDumpFlow();
+       output_queue->push(transforms);
+     }
+ 
+     frame_counter++;
+   }
+ 
++  // basalt_port: FLOW record (tag 1) = the OpticalFlowResult handed to the estimator.
++  //   i64 t_ns, u64 frame_counter, u32 ncam, per cam { u32 w, u32 h, u64 fnv1a(uint16 pixels row by row) },
++  //   per cam { u32 n, n x { u64 id, f32 m00 m01 m02 m10 m11 m12 (AffineCompact2f matrix(), row-major) } } (ids ascending)
++  void portDumpFlow() {
++    port::count(port::C_FLOW_FRAMES);
++    if (!port::D().want(port::S_FLOW)) return;
++    port::Buf b;
++    b.i64(t_ns);
++    b.u64(frame_counter);
++    b.u32((uint32_t)transforms->observations.size());
++    for (size_t i = 0; i < transforms->observations.size(); i++) {
++      uint64_t h = port::fnv(nullptr, 0);
++      uint32_t w = 0, hh = 0;
++      if (transforms->input_images && i < transforms->input_images->img_data.size() &&
++          transforms->input_images->img_data[i].img) {
++        const auto& im = *transforms->input_images->img_data[i].img;
++        w = (uint32_t)im.w;
++        hh = (uint32_t)im.h;
++        for (size_t y = 0; y < im.h; y++) h = port::fnv(im.RowPtr(y), sizeof(uint16_t) * im.w, h);
++      }
++      b.u32(w);
++      b.u32(hh);
++      b.u64(h);
++    }
++    for (const auto& obs : transforms->observations) {
++      b.u32((uint32_t)obs.size());
++      for (const auto& kv : obs) {
++        b.u64((uint64_t)kv.first);
++        const Eigen::Matrix<float, 2, 3, Eigen::RowMajor> m = kv.second.matrix().template cast<float>();
++        b.arr(m.data(), 6);
++      }
++    }
++    port::D().write(port::S_FLOW, port::T_FLOW, b.b);
++  }
++
+   void trackPoints(const basalt::ManagedImagePyr<uint16_t>& pyr_1,
+                    const basalt::ManagedImagePyr<uint16_t>& pyr_2,
+                    const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
+diff -ruN a/include/basalt/utils/bs_port_dump.h b/include/basalt/utils/bs_port_dump.h
+--- a/include/basalt/utils/bs_port_dump.h	1970-01-01 01:00:00.000000000 +0100
++++ b/include/basalt/utils/bs_port_dump.h	2026-10-07 00:50:42.186356646 +0200
+@@ -0,0 +1,239 @@
++// basalt_port instrumentation (reference build only, never distributed). Observation only: reads estimator state, never writes it.
++//
++// Environment (everything off unless BASALT_PORT_DUMP_DIR is set):
++//   BASALT_PORT_DUMP_DIR=<dir>     writes <dir>/{flow,imu,iter,marg,summary}.bin
++//   BASALT_PORT_DUMP_EVERY="flow=1,imu=1,iter=1,marg=1"   sample every N-th frame (flow/imu) / optimize() call / marginalisation
++//   BASALT_PORT_DUMP_FULL=1        iter and marg records additionally carry the dense H,b,inc / Q2Jp,Q2r,prior,H_new,b_new arrays
++//
++// Framed records: u32 tag, u64 payload bytes, payload (little endian, no padding). Layouts: basalt_port/c/check_bs_dump.c and
++// basalt_port/PLAN.md. S = Scalar of the estimator (float in the reference), matrices are Eigen column major.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <type_traits>
++
++namespace basalt {
++namespace port {
++
++enum Stream { S_FLOW = 0, S_IMU = 1, S_ITER = 2, S_MARG = 3, S_SUMMARY = 4, S_COUNT = 5 };
++
++// record tags
++enum Tag : uint32_t {
++  T_FLOW = 1,
++  T_IMU_PREINT = 2,
++  T_ITER_STEP = 3,
++  T_MARG = 4,
++  T_IMU_PREDICT = 5,
++  T_OPT_END = 6,
++  T_OPT_BEGIN = 7,
++  T_SUMMARY = 9,
++  T_HDR = 100
++};
++
++// counters of executed paths (always counted, only reported when the dump is on)
++enum Counter {
++  C_FRAMES_MEASURED, C_OPTIMIZE_CALLS, C_OPTIMIZE_RUN, C_LM_STEPS, C_LM_ACCEPTED, C_LM_REJECTED, C_LM_INVALID, C_LDLT_SOLVES,
++  C_LDLT_RETRY, C_MARGINALIZE_CALLS, C_MARG_DONE, C_MARG_SQRT_TO_SQRT, C_MARG_SQ_TO_SQRT, C_MARG_SQ_TO_SQ, C_MARG_KF_DROPS,
++  C_LIN_CREATE_ABS_QR, C_LIN_CREATE_ABS_SC, C_LIN_CREATE_REL_SC, C_LINEARIZE_PROBLEM, C_PERFORM_QR, C_GET_DENSE_Q2JP,
++  C_GET_DENSE_H_B, C_EST_CTOR_FLOAT, C_EST_CTOR_DOUBLE, C_IMU_INTEGRATE, C_IMU_FRAME_PAIRS, C_FLOW_FRAMES,
++  C_LOG_MARG_NULLSPACE, C_NEW_KF, C_LANDMARKS_ADDED, C_COUNTERS
++};
++static const char* const kCounterNames[C_COUNTERS] = {
++    "frames_measured", "optimize_calls", "optimize_run", "lm_steps", "lm_accepted", "lm_rejected", "lm_invalid", "ldlt_solves",
++    "ldlt_retry", "marginalize_calls", "marg_done", "marg_helper_sqrt_to_sqrt", "marg_helper_sq_to_sqrt", "marg_helper_sq_to_sq",
++    "marg_kf_drops", "lin_create_abs_qr", "lin_create_abs_sc", "lin_create_rel_sc", "linearize_problem", "perform_qr",
++    "get_dense_q2jp_q2r", "get_dense_h_b", "est_ctor_float", "est_ctor_double", "imu_integrate", "imu_frame_pairs", "flow_frames",
++    "log_marg_nullspace", "new_kf", "landmarks_added"};
++
++struct Dump {
++  bool on = false;
++  bool full = false;
++  int every[S_COUNT] = {1, 1, 1, 1, 1};
++  uint64_t seen[S_COUNT] = {0, 0, 0, 0, 0};
++  FILE* f[S_COUNT] = {nullptr, nullptr, nullptr, nullptr, nullptr};
++  std::atomic<uint64_t> cnt[C_COUNTERS];
++  std::string dir;
++
++  Dump() {
++    for (auto& c : cnt) c = 0;
++    const char* d = std::getenv("BASALT_PORT_DUMP_DIR");
++    if (!d || !*d) return;
++    dir = d;
++    on = true;
++    if (const char* fl = std::getenv("BASALT_PORT_DUMP_FULL")) full = std::atoi(fl) != 0;
++    if (const char* e = std::getenv("BASALT_PORT_DUMP_EVERY")) {
++      std::string s(e);
++      size_t p = 0;
++      while (p < s.size()) {
++        size_t q = s.find(',', p);
++        if (q == std::string::npos) q = s.size();
++        std::string kv = s.substr(p, q - p);
++        size_t eq = kv.find('=');
++        if (eq != std::string::npos) {
++          std::string k = kv.substr(0, eq);
++          int v = std::atoi(kv.c_str() + eq + 1);
++          if (v < 1) v = 1;
++          if (k == "flow") every[S_FLOW] = v;
++          else if (k == "imu") every[S_IMU] = v;
++          else if (k == "iter") every[S_ITER] = v;
++          else if (k == "marg") every[S_MARG] = v;
++        }
++        p = q + 1;
++      }
++    }
++  }
++  ~Dump() {
++    if (on) {
++      std::vector<uint8_t> b;
++      for (int i = 0; i < C_COUNTERS; i++) {
++        uint32_t n = (uint32_t)std::strlen(kCounterNames[i]);
++        raw(b, &n, 4);
++        raw(b, kCounterNames[i], n);
++        uint64_t v = cnt[i];
++        raw(b, &v, 8);
++      }
++      std::vector<uint8_t> pay;
++      uint32_t nc = C_COUNTERS;
++      raw(pay, &nc, 4);
++      pay.insert(pay.end(), b.begin(), b.end());
++      write(S_SUMMARY, T_SUMMARY, pay);
++    }
++    for (auto* x : f)
++      if (x) std::fclose(x);
++  }
++
++  static void raw(std::vector<uint8_t>& b, const void* p, size_t n) {
++    const uint8_t* c = (const uint8_t*)p;
++    b.insert(b.end(), c, c + n);
++  }
++
++  // true for the first and then every every[s]-th call, per stream
++  bool want(Stream s) {
++    if (!on) return false;
++    bool r = (seen[s] % (uint64_t)every[s]) == 0;
++    seen[s]++;
++    return r;
++  }
++
++  bool wantIdx(Stream s, uint64_t idx) const { return on && (idx % (uint64_t)every[s]) == 0; }
++
++  void write(Stream s, uint32_t tag, const std::vector<uint8_t>& pay) {
++    if (!f[s]) {
++      static const char* names[S_COUNT] = {"flow", "imu", "iter", "marg", "summary"};
++      f[s] = std::fopen((dir + "/" + names[s] + ".bin").c_str(), "wb");
++      if (!f[s]) return;
++      // HDR: u32 version, u32 sizeof(Scalar of estimator)=4 (float reference), u32 every[4], u32 full
++      std::vector<uint8_t> h;
++      uint32_t v[7] = {1, (uint32_t)sizeof(float), (uint32_t)every[0], (uint32_t)every[1], (uint32_t)every[2], (uint32_t)every[3],
++                       (uint32_t)full};
++      raw(h, v, sizeof v);
++      uint32_t t = T_HDR;
++      uint64_t n = h.size();
++      std::fwrite(&t, 4, 1, f[s]);
++      std::fwrite(&n, 8, 1, f[s]);
++      std::fwrite(h.data(), 1, n, f[s]);
++    }
++    uint64_t n = pay.size();
++    std::fwrite(&tag, 4, 1, f[s]);
++    std::fwrite(&n, 8, 1, f[s]);
++    if (n) std::fwrite(pay.data(), 1, n, f[s]);
++    std::fflush(f[s]);
++  }
++};
++
++inline Dump& D() {
++  static Dump d;
++  return d;
++}
++inline void count(Counter c) { D().cnt[c].fetch_add(1, std::memory_order_relaxed); }
++inline void countN(Counter c, uint64_t n) { D().cnt[c].fetch_add(n, std::memory_order_relaxed); }
++
++struct Buf {
++  std::vector<uint8_t> b;
++  void u32(uint32_t v) { Dump::raw(b, &v, 4); }
++  void i32(int32_t v) { Dump::raw(b, &v, 4); }
++  void u64(uint64_t v) { Dump::raw(b, &v, 8); }
++  void i64(int64_t v) { Dump::raw(b, &v, 8); }
++  void f32(float v) { Dump::raw(b, &v, 4); }
++  template <class T>
++  void arr(const T* p, size_t n) { Dump::raw(b, p, n * sizeof(T)); }
++};
++
++// FNV-1a 64 over raw bytes, chainable
++inline uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
++  const uint8_t* c = (const uint8_t*)p;
++  for (size_t i = 0; i < n; i++) {
++    h ^= c[i];
++    h *= 1099511628211ull;
++  }
++  return h;
++}
++template <class T>
++inline uint64_t fnvT(const T& v, uint64_t h) { return fnv(&v, sizeof(T), h); }
++
++template <class Mat>  // dense Eigen matrix/vector, contiguous column major
++inline uint64_t hashMat(const Mat& m) {
++  uint64_t h = fnv(nullptr, 0);
++  int64_t r = m.rows(), c = m.cols();
++  h = fnvT(r, h);
++  h = fnvT(c, h);
++  return fnv(m.data(), sizeof(typename Mat::Scalar) * m.size(), h);
++}
++
++template <class SE3>
++inline void putSE3(Buf& b, const SE3& T) {  // quaternion coeffs (x,y,z,w), translation
++  b.arr(T.unit_quaternion().coeffs().data(), 4);
++  b.arr(T.translation().data(), 3);
++}
++template <class SE3>
++inline uint64_t hashSE3(const SE3& T, uint64_t h) {
++  h = fnv(T.unit_quaternion().coeffs().data(), sizeof(typename SE3::Scalar) * 4, h);
++  return fnv(T.translation().data(), sizeof(typename SE3::Scalar) * 3, h);
++}
++
++// digest of all frame poses and frame states (current + linearisation point + delta + lin flag)
++template <class Poses, class States>
++inline uint64_t stateDigest(const Poses& poses, const States& states) {
++  uint64_t h = fnv(nullptr, 0);
++  for (const auto& kv : poses) {
++    int64_t k = kv.first;
++    h = fnvT(k, h);
++    uint8_t lin = kv.second.isLinearized();
++    h = fnvT(lin, h);
++    h = hashSE3(kv.second.getPose(), h);
++    h = hashSE3(kv.second.getPoseLin(), h);
++    h = fnv(kv.second.getDelta().data(), sizeof(typename std::decay_t<decltype(kv.second.getDelta())>::Scalar) * 6, h);
++  }
++  for (const auto& kv : states) {
++    int64_t k = kv.first;
++    h = fnvT(k, h);
++    uint8_t lin = kv.second.isLinearized();
++    h = fnvT(lin, h);
++    for (const auto* s : {&kv.second.getState(), &kv.second.getStateLin()}) {
++      h = hashSE3(s->T_w_i, h);
++      h = fnv(s->vel_w_i.data(), sizeof(s->vel_w_i(0)) * 3, h);
++      h = fnv(s->bias_gyro.data(), sizeof(s->bias_gyro(0)) * 3, h);
++      h = fnv(s->bias_accel.data(), sizeof(s->bias_accel(0)) * 3, h);
++    }
++    h = fnv(kv.second.getDelta().data(), sizeof(typename std::decay_t<decltype(kv.second.getDelta())>::Scalar) * 15, h);
++  }
++  return h;
++}
++
++template <class State>  // PoseVelBiasState: quat(4) p(3) v(3) bg(3) ba(3)
++inline void putState(Buf& b, const State& s) {
++  putSE3(b, s.T_w_i);
++  b.arr(s.vel_w_i.data(), 3);
++  b.arr(s.bias_gyro.data(), 3);
++  b.arr(s.bias_accel.data(), 3);
++}
++
++}  // namespace port
++}  // namespace basalt
+diff -ruN a/src/linearization/linearization_base.cpp b/src/linearization/linearization_base.cpp
+--- a/src/linearization/linearization_base.cpp	2026-10-07 00:48:11.097062376 +0200
++++ b/src/linearization/linearization_base.cpp	2026-10-07 00:48:56.570551245 +0200
+@@ -40,6 +40,8 @@
+ 
+ #include <magic_enum/magic_enum.hpp>
+ 
++#include <basalt/utils/bs_port_dump.h>
++
+ namespace basalt {
+ 
+ bool isLinearizationSqrt(const LinearizationType& type) {
+@@ -70,16 +72,19 @@
+ 
+   switch (options.linearization_type) {
+     case LinearizationType::ABS_QR:
++      port::count(port::C_LIN_CREATE_ABS_QR);
+       return std::make_unique<LinearizationAbsQR<Scalar, POSE_SIZE>>(
+           estimator, aom, options, marg_lin_data, imu_lin_data, used_frames,
+           lost_landmarks, last_state_to_marg);
+ 
+     case LinearizationType::ABS_SC:
++      port::count(port::C_LIN_CREATE_ABS_SC);
+       return std::make_unique<LinearizationAbsSC<Scalar, POSE_SIZE>>(
+           estimator, aom, options, marg_lin_data, imu_lin_data, used_frames,
+           lost_landmarks, last_state_to_marg);
+ 
+     case LinearizationType::REL_SC:
++      port::count(port::C_LIN_CREATE_REL_SC);
+       return std::make_unique<LinearizationRelSC<Scalar, POSE_SIZE>>(
+           estimator, aom, options, marg_lin_data, imu_lin_data, used_frames,
+           lost_landmarks, last_state_to_marg);
+diff -ruN a/src/vi_estimator/marg_helper.cpp b/src/vi_estimator/marg_helper.cpp
+--- a/src/vi_estimator/marg_helper.cpp	2026-10-07 00:48:11.096062387 +0200
++++ b/src/vi_estimator/marg_helper.cpp	2026-10-07 00:48:56.570551245 +0200
+@@ -35,6 +35,7 @@
+ 
+ #include <basalt/utils/assert.h>
+ #include <basalt/vi_estimator/marg_helper.h>
++#include <basalt/utils/bs_port_dump.h>
+ 
+ namespace basalt {
+ 
+@@ -42,6 +43,7 @@
+ void MargHelper<Scalar_>::marginalizeHelperSqToSq(
+     MatX& abs_H, VecX& abs_b, const std::set<int>& idx_to_keep,
+     const std::set<int>& idx_to_marg, MatX& marg_H, VecX& marg_b) {
++  port::count(port::C_MARG_SQ_TO_SQ);
+   int keep_size = idx_to_keep.size();
+   int marg_size = idx_to_marg.size();
+ 
+@@ -125,6 +127,7 @@
+ void MargHelper<Scalar_>::marginalizeHelperSqToSqrt(
+     MatX& abs_H, VecX& abs_b, const std::set<int>& idx_to_keep,
+     const std::set<int>& idx_to_marg, MatX& marg_sqrt_H, VecX& marg_sqrt_b) {
++  port::count(port::C_MARG_SQ_TO_SQRT);
+   // TODO: We might lose the strong initial pose prior if there are no obs
+   // during marginalization (e.g. during first marginalization). Unclear when
+   // this can happen. Keeping keyframes w/o any points in the optimization
+@@ -258,6 +261,7 @@
+ void MargHelper<Scalar_>::marginalizeHelperSqrtToSqrt(
+     MatX& Q2Jp, VecX& Q2r, const std::set<int>& idx_to_keep,
+     const std::set<int>& idx_to_marg, MatX& marg_sqrt_H, VecX& marg_sqrt_b) {
++  port::count(port::C_MARG_SQRT_TO_SQRT);
+   Eigen::Index keep_size = idx_to_keep.size();
+   Eigen::Index marg_size = idx_to_marg.size();
+ 
+diff -ruN a/src/vi_estimator/sqrt_keypoint_vio.cpp b/src/vi_estimator/sqrt_keypoint_vio.cpp
+--- a/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 00:48:11.095062398 +0200
++++ b/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 01:13:39.969408711 +0200
+@@ -54,8 +54,98 @@
+ 
+ #include <chrono>
+ 
++#include <basalt/utils/bs_port_dump.h>
++
+ namespace basalt {
+ 
++// ---- basalt_port instrumentation helpers (observation only) ----
++namespace {
++// IMU_PREINT record (tag 2) in imu.bin:
++//   i64 start_t_ns, i64 end_t_ns, S bg_lin[3], S ba_lin[3], S accel_cov[3], S gyro_cov[3],
++//   u32 ns, ns x { i64 t_ns, S accel[3], S gyro[3] } (calibrated, as handed to integrate(); the tail sample carries the frame time),
++//   i64 dt_ns, S dq[4](x,y,z,w), S dp[3], S dv[3], S cov[81], S d_state_d_ba[27], S d_state_d_bg[27] (col major)
++template <class Scalar>
++void port_emit_preint(const IntegratedImuMeasurement<Scalar>& meas, int64_t start_t, int64_t end_t,
++                      const Eigen::Matrix<Scalar, 3, 1>& bg, const Eigen::Matrix<Scalar, 3, 1>& ba,
++                      const Eigen::Matrix<Scalar, 3, 1>& acov, const Eigen::Matrix<Scalar, 3, 1>& gcov,
++                      const std::vector<ImuData<Scalar>>& samples) {
++  port::Buf b;
++  b.i64(start_t);
++  b.i64(end_t);
++  b.arr(bg.data(), 3);
++  b.arr(ba.data(), 3);
++  b.arr(acov.data(), 3);
++  b.arr(gcov.data(), 3);
++  b.u32((uint32_t)samples.size());
++  for (const auto& d : samples) {
++    b.i64(d.t_ns);
++    b.arr(d.accel.data(), 3);
++    b.arr(d.gyro.data(), 3);
++  }
++  const auto& ds = meas.getDeltaState();
++  b.i64(meas.get_dt_ns());
++  b.arr(ds.T_w_i.unit_quaternion().coeffs().data(), 4);
++  b.arr(ds.T_w_i.translation().data(), 3);
++  b.arr(ds.vel_w_i.data(), 3);
++  b.arr(meas.get_cov().data(), 81);
++  b.arr(meas.get_d_state_d_ba().data(), 27);
++  b.arr(meas.get_d_state_d_bg().data(), 27);
++  // NOTE: sqrt_cov_inv is deliberately NOT dumped. Calling get_sqrt_cov_inv() from this translation unit would instantiate
++  // IntegratedImuMeasurement<float>::compute_sqrt_cov_inv here, where the unqualified sqrt(float) of preintegration.h resolves to
++  // ::sqrt(double); the linker would then pick this copy over the (float sqrtss) copy of the linearization units and change the
++  // trajectory (ODR hazard, see basalt_port/PLAN.md).
++  port::D().write(port::S_IMU, port::T_IMU_PREINT, b.b);
++}
++
++// landmark ids in lmdb iteration order (the order that fixes the landmark block / QR row / float accumulation order)
++template <class Lmdb>
++uint64_t port_lm_order_hash(const Lmdb& lmdb, std::vector<uint64_t>* ids = nullptr) {
++  uint64_t h = port::fnv(nullptr, 0);
++  for (const auto& kv : lmdb.getLandmarks()) {
++    uint64_t id = kv.first;
++    h = port::fnvT(id, h);
++    if (ids) ids->push_back(id);
++  }
++  return h;
++}
++// host frames in lmdb.getObservations() iteration order (the order computeError sums in)
++template <class Lmdb>
++uint64_t port_host_order_hash(const Lmdb& lmdb, std::vector<std::pair<int64_t, uint64_t>>* hosts = nullptr) {
++  uint64_t h = port::fnv(nullptr, 0);
++  for (const auto& kv : lmdb.getObservations()) {
++    int64_t f = kv.first.frame_id;
++    uint64_t c = kv.first.cam_id;
++    h = port::fnvT(f, h);
++    h = port::fnvT(c, h);
++    if (hosts) hosts->emplace_back(f, c);
++  }
++  return h;
++}
++// landmark values hashed in ascending id order (independent of container order)
++template <class Lmdb>
++uint64_t port_lm_value_hash(const Lmdb& lmdb) {
++  std::vector<uint64_t> ids;
++  for (const auto& kv : lmdb.getLandmarks()) ids.push_back(kv.first);
++  std::sort(ids.begin(), ids.end());
++  uint64_t h = port::fnv(nullptr, 0);
++  for (uint64_t id : ids) {
++    const auto& k = lmdb.getLandmark(id);
++    int64_t hf = k.host_kf_id.frame_id;
++    uint64_t hc = k.host_kf_id.cam_id;
++    h = port::fnvT(id, h);
++    h = port::fnvT(hf, h);
++    h = port::fnvT(hc, h);
++    h = port::fnv(k.direction.data(), sizeof(k.direction(0)) * 2, h);
++    h = port::fnvT(k.inv_dist, h);
++  }
++  return h;
++}
++template <class Mat>
++void port_put_mat(port::Buf& b, const Mat& m) {
++  b.arr(m.data(), (size_t)m.size());
++}
++}  // namespace
++
+ template <class Scalar_>
+ SqrtKeypointVioEstimator<Scalar_>::SqrtKeypointVioEstimator(
+     const Eigen::Vector3d& g_, const basalt::Calibration<double>& calib_,
+@@ -72,6 +162,7 @@
+   obs_std_dev = Scalar(config.vio_obs_std_dev);
+   huber_thresh = Scalar(config.vio_obs_huber_thresh);
+   calib = calib_.cast<Scalar>();
++  port::count(std::is_same_v<Scalar, float> ? port::C_EST_CTOR_FLOAT : port::C_EST_CTOR_DOUBLE);
+ 
+   // Setup marginalization
+   marg_data.is_sqrt = config.vio_sqrt_marg;
+@@ -167,6 +258,8 @@
+     data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
+     data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+ 
++    std::vector<ImuData<Scalar>> port_samples;
++    uint64_t port_pair_idx = 0;
+     while (true) {
+       vision_data_queue.pop(curr_frame);
+ 
+@@ -232,6 +325,7 @@
+                           "duplicate frame timestamps?! zero time delta leads "
+                           "to invalid IMU integration.");
+ 
++        port_samples.clear();
+         while (data->t_ns <= prev_frame->t_ns) {
+           data = popFromImuDataQueue();
+           if (!data) break;
+@@ -240,6 +334,8 @@
+         }
+ 
+         while (data->t_ns <= curr_frame->t_ns) {
++          if (port::D().on) port_samples.push_back(*data);
++          port::count(port::C_IMU_INTEGRATE);
+           meas->integrate(*data, accel_cov, gyro_cov);
+           data = popFromImuDataQueue();
+           if (!data) break;
+@@ -251,9 +347,17 @@
+           if (!data.get()) break;
+           int64_t tmp = data->t_ns;
+           data->t_ns = curr_frame->t_ns;
++          if (port::D().on) port_samples.push_back(*data);
++          port::count(port::C_IMU_INTEGRATE);
+           meas->integrate(*data, accel_cov, gyro_cov);
+           data->t_ns = tmp;
+         }
++        port::count(port::C_IMU_FRAME_PAIRS);
++        if (port::D().wantIdx(port::S_IMU, port_pair_idx++)) {
++          const auto& ls = frame_states.at(last_state_t_ns).getState();
++          port_emit_preint<Scalar>(*meas, prev_frame->t_ns, curr_frame->t_ns, ls.bias_gyro, ls.bias_accel, accel_cov,
++                                   gyro_cov, port_samples);
++        }
+       }
+ 
+       measure(curr_frame, meas);
+@@ -307,6 +411,7 @@
+     const OpticalFlowResult::Ptr& opt_flow_meas,
+     const typename IntegratedImuMeasurement<Scalar>::Ptr& meas) {
+   stats_sums_.add("frame_id", opt_flow_meas->t_ns).format("none");
++  port::count(port::C_FRAMES_MEASURED);
+   Timer t_total;
+ 
+   if (meas.get()) {
+@@ -321,6 +426,18 @@
+ 
+     meas->predictState(frame_states.at(last_state_t_ns).getState(), g,
+                        next_state);
++    {  // IMU_PREDICT record (tag 5): i64 t0, i64 t1, S g[3], S state0[16], S state1[16] (quat xyzw, p, v, bg, ba)
++      static uint64_t port_predict_idx = 0;
++      if (port::D().wantIdx(port::S_IMU, port_predict_idx++)) {
++        port::Buf pb;
++        pb.i64(last_state_t_ns);
++        pb.i64(opt_flow_meas->t_ns);
++        pb.arr(g.data(), 3);
++        port::putState(pb, frame_states.at(last_state_t_ns).getState());
++        port::putState(pb, next_state);
++        port::D().write(port::S_IMU, port::T_IMU_PREDICT, pb.b);
++      }
++    }
+ 
+     last_state_t_ns = opt_flow_meas->t_ns;
+     next_state.t_ns = opt_flow_meas->t_ns;
+@@ -382,6 +499,7 @@
+     // baseline) and make keyframe for camera 0
+     take_kf = false;
+     frames_after_kf = 0;
++    port::count(port::C_NEW_KF);
+     kf_ids.emplace(last_state_t_ns);
+ 
+     TimeCamId tcidl(opt_flow_meas->t_ns, 0);
+@@ -451,6 +569,7 @@
+           lmdb.addLandmark(lm_id, kpt_pos);
+ 
+           num_points_added++;
++          port::count(port::C_LANDMARKS_ADDED);
+           valid_kp = true;
+         }
+       }
+@@ -525,6 +644,7 @@
+ 
+ template <class Scalar_>
+ void SqrtKeypointVioEstimator<Scalar_>::logMargNullspace() {
++  port::count(port::C_LOG_MARG_NULLSPACE);
+   nullspace_marg_data.order = marg_data.order;
+   if (config.vio_debug) {
+     std::cout << "======== Marg nullspace ==========" << std::endl;
+@@ -553,11 +673,14 @@
+     const std::map<int64_t, int>& num_points_connected,
+     const std::unordered_set<KeypointId>& lost_landmaks) {
+   if (!opt_started) return;
++  port::count(port::C_MARGINALIZE_CALLS);
+ 
+   Timer t_total;
+ 
+   if (frame_poses.size() > max_kfs || frame_states.size() >= max_states) {
+     // Marginalize
++    port::count(port::C_MARG_DONE);
++    const bool port_m = port::D().want(port::S_MARG);
+ 
+     const int states_to_remove = frame_states.size() - max_states + 1;
+ 
+@@ -695,10 +818,27 @@
+       std::cout << "kfs_to_marg.size() " << kfs_to_marg.size() << std::endl;
+     }
+ 
++    port::countN(port::C_MARG_KF_DROPS, kfs_to_marg.size());
+     Timer t_actual_marg;
+ 
+     size_t asize = aom.total_size;
+ 
++    // basalt_port: prior going in
++    uint32_t port_prior_rows = marg_data.H.rows(), port_prior_cols = marg_data.H.cols();
++    uint64_t port_prior_Hh = 0, port_prior_bh = 0;
++    std::vector<Scalar> port_prior_H, port_prior_b;
++    if (port_m) {
++      port_prior_Hh = port::hashMat(marg_data.H);
++      port_prior_bh = port::hashMat(marg_data.b);
++      if (port::D().full) {
++        port_prior_H.assign(marg_data.H.data(), marg_data.H.data() + marg_data.H.size());
++        port_prior_b.assign(marg_data.b.data(), marg_data.b.data() + marg_data.b.size());
++      }
++    }
++    uint32_t port_q_rows = 0, port_q_cols = 0;
++    uint64_t port_q_Jh = 0, port_q_rh = 0;
++    std::vector<Scalar> port_q_J, port_q_r;
++
+     bool is_lin_sqrt = isLinearizationSqrt(config.vio_linearization_type);
+ 
+     MatX Q2Jp_or_H;
+@@ -730,15 +870,30 @@
+           this, aom, lqr_options, &marg_data, &ild, &kfs_to_marg,
+           &lost_landmaks, last_state_to_marg);
+ 
++      port::count(port::C_LINEARIZE_PROBLEM);
+       lqr->linearizeProblem();
++      port::count(port::C_PERFORM_QR);
+       lqr->performQR();
+ 
+       if (is_lin_sqrt && marg_data.is_sqrt) {
++        port::count(port::C_GET_DENSE_Q2JP);
+         lqr->get_dense_Q2Jp_Q2r(Q2Jp_or_H, Q2r_or_b);
+       } else {
++        port::count(port::C_GET_DENSE_H_B);
+         lqr->get_dense_H_b(Q2Jp_or_H, Q2r_or_b);
+       }
+ 
++      if (port_m) {
++        port_q_rows = Q2Jp_or_H.rows();
++        port_q_cols = Q2Jp_or_H.cols();
++        port_q_Jh = port::hashMat(Q2Jp_or_H);
++        port_q_rh = port::hashMat(Q2r_or_b);
++        if (port::D().full) {
++          port_q_J.assign(Q2Jp_or_H.data(), Q2Jp_or_H.data() + Q2Jp_or_H.size());
++          port_q_r.assign(Q2r_or_b.data(), Q2r_or_b.data() + Q2r_or_b.size());
++        }
++      }
++
+       stats_sums_.add("marg_linearize", t_linearize.elapsed()).format("ms");
+     }
+ 
+@@ -983,6 +1138,70 @@
+     computeDelta(marg_data.order, delta);
+     marg_data.b -= marg_data.H * delta;
+ 
++    if (port_m) {
++      // MARG record (tag 4) in marg.bin:
++      //   i64 t_ns(last_state_t_ns), i64 last_state_to_marg, u32 path(0 SqrtToSqrt,1 SqToSqrt,2 SqToSq), u32 is_lin_sqrt, u32 is_sqrt,
++      //   u32 aom_total, u32 aom_items, u32 n_poses_to_marg, n_states_marg_all, n_states_marg_vel_bias, n_kfs_to_marg, n_kf_all,
++      //   u32 n_aom, n_aom x { i64 frame, u32 start, u32 size }, u32 n_keep, i32 keep[n], u32 n_marg, i32 marg[n],
++      //   u32 n_kfs_marg, i64[n], u32 n_kf_all, i64[n],
++      //   prior in: u32 rows, u32 cols, u64 hash(H), u64 hash(b);  Q2Jp/H: u32 rows, u32 cols, u64 hash, u64 hash(Q2r/b);
++      //   out: u32 rows, u32 cols, u64 hash(H_new), u32 nb, u64 hash(b_new), u64 hash(final marg_data.b after - H*delta), u32 order_total;
++      //   u32 full, if full: S prior_H[], S prior_b[], S Q2Jp[], S Q2r[], S H_new[], S b_new[], S final_b[]  (col major, sizes above)
++      port::Buf pb;
++      pb.i64(last_state_t_ns);
++      pb.i64(last_state_to_marg);
++      pb.u32((is_lin_sqrt && marg_data.is_sqrt) ? 0u : (marg_data.is_sqrt ? 1u : 2u));
++      pb.u32(is_lin_sqrt ? 1u : 0u);
++      pb.u32(marg_data.is_sqrt ? 1u : 0u);
++      pb.u32((uint32_t)aom.total_size);
++      pb.u32((uint32_t)aom.items);
++      pb.u32((uint32_t)poses_to_marg.size());
++      pb.u32((uint32_t)states_to_marg_all.size());
++      pb.u32((uint32_t)states_to_marg_vel_bias.size());
++      pb.u32((uint32_t)kfs_to_marg.size());
++      pb.u32((uint32_t)kf_ids_all.size());
++      pb.u32((uint32_t)aom.abs_order_map.size());
++      for (const auto& kv : aom.abs_order_map) {
++        pb.i64(kv.first);
++        pb.u32((uint32_t)kv.second.first);
++        pb.u32((uint32_t)kv.second.second);
++      }
++      pb.u32((uint32_t)idx_to_keep.size());
++      for (int v : idx_to_keep) pb.i32(v);
++      pb.u32((uint32_t)idx_to_marg.size());
++      for (int v : idx_to_marg) pb.i32(v);
++      pb.u32((uint32_t)kfs_to_marg.size());
++      for (int64_t v : kfs_to_marg) pb.i64(v);
++      pb.u32((uint32_t)kf_ids_all.size());
++      for (int64_t v : kf_ids_all) pb.i64(v);
++      pb.u32(port_prior_rows);
++      pb.u32(port_prior_cols);
++      pb.u64(port_prior_Hh);
++      pb.u64(port_prior_bh);
++      pb.u32(port_q_rows);
++      pb.u32(port_q_cols);
++      pb.u64(port_q_Jh);
++      pb.u64(port_q_rh);
++      pb.u32((uint32_t)marg_H_new.rows());
++      pb.u32((uint32_t)marg_H_new.cols());
++      pb.u64(port::hashMat(marg_H_new));
++      pb.u32((uint32_t)marg_b_new.size());
++      pb.u64(port::hashMat(marg_b_new));
++      pb.u64(port::hashMat(marg_data.b));
++      pb.u32((uint32_t)marg_data.order.total_size);
++      pb.u32(port::D().full ? 1u : 0u);
++      if (port::D().full) {
++        pb.arr(port_prior_H.data(), port_prior_H.size());
++        pb.arr(port_prior_b.data(), port_prior_b.size());
++        pb.arr(port_q_J.data(), port_q_J.size());
++        pb.arr(port_q_r.data(), port_q_r.size());
++        port_put_mat(pb, marg_H_new);
++        port_put_mat(pb, marg_b_new);
++        port_put_mat(pb, marg_data.b);
++      }
++      port::D().write(port::S_MARG, port::T_MARG, pb.b);
++    }
++
+     if (config.vio_debug || config.vio_extended_logging) {
+       VecX delta;
+       computeDelta(marg_data.order, delta);
+@@ -1014,8 +1233,11 @@
+     std::cout << "=================================" << std::endl;
+   }
+ 
++  port::count(port::C_OPTIMIZE_CALLS);
+   if (opt_started || frame_states.size() > 4) {
+     opt_started = true;
++    port::count(port::C_OPTIMIZE_RUN);
++    const bool port_s = port::D().want(port::S_ITER);
+ 
+     // harcoded configs
+     // bool scale_Jp = config.vio_scale_jacobian && is_qr_solver();
+@@ -1088,6 +1310,44 @@
+       lqr->log_problem_stats(stats);
+     }
+ 
++    if (port_s) {
++      // OPT_BEGIN record (tag 7) in iter.bin:
++      //   i64 t_ns, u32 n_poses, n_states, n_lms, n_obs, n_hosts, aom_total, n_imu_meas, S lambda_init,
++      //   u64 state_hash, lm_order_hash, host_order_hash, lm_value_hash, u32 prior_rows, prior_cols, u64 prior_H_hash, prior_b_hash,
++      //   u32 full, if full: u32 nl, u64 ids[nl] (lmdb iteration order), u32 nh, nh x { i64 frame, u64 cam } (observations order)
++      port::Buf pb;
++      std::vector<uint64_t> ids;
++      std::vector<std::pair<int64_t, uint64_t>> hosts;
++      pb.i64(last_state_t_ns);
++      pb.u32((uint32_t)frame_poses.size());
++      pb.u32((uint32_t)frame_states.size());
++      pb.u32((uint32_t)lmdb.numLandmarks());
++      pb.u32((uint32_t)lmdb.numObservations());
++      pb.u32((uint32_t)lmdb.getObservations().size());
++      pb.u32((uint32_t)aom.total_size);
++      pb.u32((uint32_t)imu_meas.size());
++      pb.f32((float)lambda);
++      pb.u64(port::stateDigest(frame_poses, frame_states));
++      pb.u64(port_lm_order_hash(lmdb, &ids));
++      pb.u64(port_host_order_hash(lmdb, &hosts));
++      pb.u64(port_lm_value_hash(lmdb));
++      pb.u32((uint32_t)marg_data.H.rows());
++      pb.u32((uint32_t)marg_data.H.cols());
++      pb.u64(port::hashMat(marg_data.H));
++      pb.u64(port::hashMat(marg_data.b));
++      pb.u32(port::D().full ? 1u : 0u);
++      if (port::D().full) {
++        pb.u32((uint32_t)ids.size());
++        pb.arr(ids.data(), ids.size());
++        pb.u32((uint32_t)hosts.size());
++        for (const auto& h : hosts) {
++          pb.i64(h.first);
++          pb.u64(h.second);
++        }
++      }
++      port::D().write(port::S_ITER, port::T_OPT_BEGIN, pb.b);
++    }
++
+     bool terminated = false;
+     bool converged = false;
+     std::string message;
+@@ -1109,6 +1369,7 @@
+ 
+         // linearize residuals
+         bool numerically_valid;
++        port::count(port::C_LINEARIZE_PROBLEM);
+         error_total = lqr->linearizeProblem(&numerically_valid);
+         BASALT_ASSERT_STREAM(
+             numerically_valid,
+@@ -1128,6 +1389,7 @@
+         //        }
+ 
+         // marginalize points in place
++        port::count(port::C_PERFORM_QR);
+         lqr->performQR();
+         stats.add("performQR", t.reset()).format("ms");
+       }
+@@ -1157,6 +1419,11 @@
+       // inner loop for backtracking in LM (still count as main iteration
+       // though)
+       for (int j = 0; it <= config.vio_max_iterations && !terminated; j++) {
++        const Scalar port_lambda0 = lambda;
++        const int port_it0 = it;
++        uint64_t port_Hh = 0, port_bh = 0;
++        uint32_t port_n = 0;
++        std::vector<Scalar> port_H, port_b;
+         if (j > 0) {
+           timer_iteration.reset();
+           if (config.vio_debug) {
+@@ -1200,10 +1467,21 @@
+           MatX H;
+           VecX b;
+ 
++          port::count(port::C_GET_DENSE_H_B);
+           lqr->get_dense_H_b(H, b);
+ 
+           stats.add("get_dense_H_b", t.reset()).format("ms");
+ 
++          if (port_s) {
++            port_n = H.rows();
++            port_Hh = port::hashMat(H);
++            port_bh = port::hashMat(b);
++            if (port::D().full) {
++              port_H.assign(H.data(), H.data() + H.size());
++              port_b.assign(b.data(), b.data() + b.size());
++            }
++          }
++
+           int iter = 0;
+           bool inc_valid = false;
+           constexpr int max_num_iter = 3;
+@@ -1214,10 +1492,12 @@
+             H_copy.diagonal() += Hdiag_lambda;
+ 
+             Eigen::LDLT<Eigen::Ref<MatX>> ldlt(H_copy);
++            port::count(port::C_LDLT_SOLVES);
+             inc = ldlt.solve(b);
+             stats.add("solve", t.reset()).format("ms");
+ 
+             if (!inc.array().isFinite().all()) {
++              port::count(port::C_LDLT_RETRY);
+               lambda = lambda_vee * lambda;
+               lambda_vee *= vee_factor;
+             } else {
+@@ -1232,6 +1512,8 @@
+           }
+         }
+ 
++        const uint64_t port_state_pre = port_s ? port::stateDigest(frame_poses, frame_states) : 0;
++
+         // backup state (then apply increment and check cost decrease)
+         backup();
+ 
+@@ -1333,6 +1615,49 @@
+           }
+         }
+ 
++        port::count(port::C_LM_STEPS);
++        port::count(step_is_successful ? port::C_LM_ACCEPTED : port::C_LM_REJECTED);
++        if (!step_is_valid) port::count(port::C_LM_INVALID);
++        const uint64_t port_state_post = port_s ? port::stateDigest(frame_poses, frame_states) : 0;
++        const uint64_t port_lm_post = port_s ? port_lm_value_hash(lmdb) : 0;
++        // ITER_STEP record (tag 3) in iter.bin (one per inner LM evaluation, accepted or not; state hashes are taken after the
++        // increment is applied and before a rejected step is undone):
++        //   i64 t_ns, u32 it, u32 j, u32 flags(bit0 accepted, bit1 step_valid),
++        //   S lambda_before, S lambda_after, S error_total, S after_vi_err(vision+imu+bias), S after_marg_err, S l_diff, S f_diff,
++        //   S relative_decrease, S step_norminf, u32 Hdim, u64 hash(H), hash(b), hash(inc), state_pre, state_post, lm_value_post,
++        //   u32 full, if full: S H[n*n], S b[n], S inc[n] (inc = the applied, negated increment)
++        auto port_emit_step = [&](bool accepted) {
++          if (!port_s) return;
++          port::Buf pb;
++          pb.i64(last_state_t_ns);
++          pb.u32((uint32_t)port_it0);
++          pb.u32((uint32_t)j);
++          pb.u32((accepted ? 1u : 0u) | (step_is_valid ? 2u : 0u));
++          pb.arr(&port_lambda0, 1);
++          pb.arr(&lambda, 1);
++          pb.arr(&error_total, 1);
++          pb.arr(&after_update_vision_and_inertial_error, 1);
++          pb.arr(&after_update_marg_prior_error, 1);
++          pb.arr(&l_diff, 1);
++          pb.arr(&f_diff, 1);
++          pb.arr(&relative_decrease, 1);
++          pb.arr(&step_norminf, 1);
++          pb.u32(port_n);
++          pb.u64(port_Hh);
++          pb.u64(port_bh);
++          pb.u64(port::hashMat(inc));
++          pb.u64(port_state_pre);
++          pb.u64(port_state_post);
++          pb.u64(port_lm_post);
++          pb.u32(port::D().full ? 1u : 0u);
++          if (port::D().full) {
++            pb.arr(port_H.data(), port_H.size());
++            pb.arr(port_b.data(), port_b.size());
++            port_put_mat(pb, inc);
++          }
++          port::D().write(port::S_ITER, port::T_ITER_STEP, pb.b);
++        };
++
+         if (step_is_successful) {
+           BASALT_ASSERT(step_is_valid);
+ 
+@@ -1363,6 +1688,8 @@
+             terminated = true;
+           }
+ 
++          port_emit_step(true);
++
+           // stop inner lm loop
+           break;
+         } else {
+@@ -1385,6 +1712,7 @@
+           //        lambda = std::max(min_lambda, lambda);
+           //        lambda = std::min(max_lambda, lambda);
+ 
++          port_emit_step(false);
+           restore();
+           it++;
+           it_rejected++;
+@@ -1398,6 +1726,19 @@
+       }
+     }
+ 
++    if (port_s) {
++      // OPT_END record (tag 6): i64 t_ns, u32 it, u32 it_rejected, u32 converged, u32 terminated, S lambda, u64 state_hash
++      port::Buf pb;
++      pb.i64(last_state_t_ns);
++      pb.u32((uint32_t)it);
++      pb.u32((uint32_t)it_rejected);
++      pb.u32(converged ? 1u : 0u);
++      pb.u32(terminated ? 1u : 0u);
++      pb.arr(&lambda, 1);
++      pb.u64(port::stateDigest(frame_poses, frame_states));
++      port::D().write(port::S_ITER, port::T_OPT_END, pb.b);
++    }
++
+     stats.add("optimize", timer_total.elapsed()).format("ms");
+     stats.add("num_it", it).format("count");
+     stats.add("num_it_rejected", it_rejected).format("count");

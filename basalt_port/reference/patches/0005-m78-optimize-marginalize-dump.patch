@@ -1,0 +1,180 @@
+diff -ruN a/include/basalt/utils/bs_port_dump78.h b/include/basalt/utils/bs_port_dump78.h
+--- a/include/basalt/utils/bs_port_dump78.h	1970-01-01 01:00:00.000000000 +0100
++++ b/include/basalt/utils/bs_port_dump78.h	2026-10-07 03:51:39.105878445 +0200
+@@ -0,0 +1,75 @@
++// basalt_port modules M7 / M8 instrumentation (reference build only, never distributed). Observation only. Extends bs_port_dump.h (patch 0003)
++// and bs_port_dump6.h (patch 0004).
++//
++// Enabled by BASALT_PORT_DUMP_DIR together with BASALT_PORT_M78=1; writes <dir>/m78.bin (same framing as the other streams:
++// u32 tag, u64 payload bytes, payload; little endian). Records follow the sampling of iter.bin (OPT_*) and marg.bin (MARG_*), so a
++// record exists exactly when the matching OPT_BEGIN / MARG record exists. Records:
++//   HDR (100)       u32 version 1, u32 sizeof(Scalar) = 4
++//   OPT_PRE (40)    i64 t_ns, f32 lambda_vee (member at entry), f32 min_lambda, f32 max_lambda, f64 lm_lambda_initial, i32 max_iterations,
++//                   u32 opt_started (before this call)                                      emitted after `lambda = lm_lambda_initial`
++//   OPT_POST (41)   i64 t_ns, f32 lambda_vee, f32 lambda, u64 lm_value_hash                 emitted after OPT_END
++//   MARG_IN (42)    i64 t_ns (last_state_t_ns), u32 max_states, u32 max_kfs, f64 kf_marg_feature_ratio, u32 n, i64 kf_ids[n],
++//                   u32 n, n x { i64, i32 } num_points_connected, u32 n, n x { i64, i32 } num_points_kf, u32 n, i64 imu_meas keys[n],
++//                   u32 n, i64 prev_opt_flow_res keys[n], u32 n, i64 frame_poses keys[n], u32 n, i64 frame_states keys[n]      (before any change)
++//   MARG_OUT (43)   i64 t_ns, u32 n, i64 kf_ids[n], u32 n, n x { i64, u32 linearized } frame_poses, u32 n, n x { i64, u32 linearized } frame_states,
++//                   u32 n, i64 imu_meas keys[n], u32 n, i64 prev_opt_flow_res keys[n],
++//                   u32 n, n x { i64 t, u32 start, u32 size } marg_data.order, u32 order_total, u32 H rows, u32 H cols, u64 hash(H), u64 hash(b),
++//                   u64 state_digest (poses + states), u64 lm_order_hash, host_order_hash, lm_value_hash, u32 n_landmarks, u32 n_observations
++#pragma once
++
++#include <basalt/utils/bs_port_dump.h>
++
++namespace basalt {
++namespace port78 {
++
++enum Tag78 : uint32_t { T7_OPT_PRE = 40, T7_OPT_POST = 41, T8_MARG_IN = 42, T8_MARG_OUT = 43 };
++
++struct W {
++  FILE* f = nullptr;
++  W() {
++    const char* e = std::getenv("BASALT_PORT_M78");
++    if (!(e && std::atoi(e) != 0 && port::D().on)) return;
++    f = std::fopen((port::D().dir + "/m78.bin").c_str(), "wb");
++    if (!f) return;
++    static char buf[1 << 20];
++    std::setvbuf(f, buf, _IOFBF, sizeof buf);
++    port::Buf h;
++    h.u32(1);
++    h.u32((uint32_t)sizeof(float));
++    write(port::T_HDR, h.b);
++  }
++  ~W() { if (f) std::fclose(f); }
++  void write(uint32_t tag, const std::vector<uint8_t>& pay) {
++    if (!f) return;
++    uint64_t n = pay.size();
++    std::fwrite(&tag, 4, 1, f);
++    std::fwrite(&n, 8, 1, f);
++    if (n) std::fwrite(pay.data(), 1, n, f);
++  }
++};
++inline W& w() { static W x; return x; }
++inline bool on() { return w().f != nullptr; }
++
++template <class Set>
++inline void putKeys(port::Buf& b, const Set& s) {
++  b.u32((uint32_t)s.size());
++  for (const auto& v : s) b.i64((int64_t)v);
++}
++template <class Map>
++inline void putMapKeys(port::Buf& b, const Map& m) {
++  b.u32((uint32_t)m.size());
++  for (const auto& kv : m) b.i64((int64_t)kv.first);
++}
++template <class Map>
++inline void putIntMap(port::Buf& b, const Map& m) {
++  b.u32((uint32_t)m.size());
++  for (const auto& kv : m) { b.i64((int64_t)kv.first); b.i32((int32_t)kv.second); }
++}
++template <class Map>
++inline void putLinMap(port::Buf& b, const Map& m) {
++  b.u32((uint32_t)m.size());
++  for (const auto& kv : m) { b.i64((int64_t)kv.first); b.u32(kv.second.isLinearized() ? 1u : 0u); }
++}
++
++}  // namespace port78
++}  // namespace basalt
+diff -ruN a/src/vi_estimator/sqrt_keypoint_vio.cpp b/src/vi_estimator/sqrt_keypoint_vio.cpp
+--- a/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 03:51:39.102878481 +0200
++++ b/src/vi_estimator/sqrt_keypoint_vio.cpp	2026-10-07 03:51:39.114878336 +0200
+@@ -56,6 +56,7 @@
+ 
+ #include <basalt/utils/bs_port_dump.h>
+ #include <basalt/utils/bs_port_dump6.h>
++#include <basalt/utils/bs_port_dump78.h>
+ 
+ namespace basalt {
+ 
+@@ -686,6 +687,21 @@
+     // Marginalize
+     port::count(port::C_MARG_DONE);
+     const bool port_m = port::D().want(port::S_MARG);
++    if (port_m && port78::on()) {
++      port::Buf pb;
++      pb.i64(last_state_t_ns);
++      pb.u32((uint32_t)max_states);
++      pb.u32((uint32_t)max_kfs);
++      { double ratio = config.vio_kf_marg_feature_ratio; pb.arr(&ratio, 1); }
++      port78::putKeys(pb, kf_ids);
++      port78::putIntMap(pb, num_points_connected);
++      port78::putIntMap(pb, num_points_kf);
++      port78::putMapKeys(pb, imu_meas);
++      port78::putMapKeys(pb, prev_opt_flow_res);
++      port78::putMapKeys(pb, frame_poses);
++      port78::putMapKeys(pb, frame_states);
++      port78::w().write(port78::T8_MARG_IN, pb.b);
++    }
+ 
+     const int states_to_remove = frame_states.size() - max_states + 1;
+ 
+@@ -1146,6 +1162,34 @@
+     computeDelta(marg_data.order, delta);
+     marg_data.b -= marg_data.H * delta;
+ 
++    if (port_m && port78::on()) {
++      port::Buf pb;
++      pb.i64(last_state_t_ns);
++      port78::putKeys(pb, kf_ids);
++      port78::putLinMap(pb, frame_poses);
++      port78::putLinMap(pb, frame_states);
++      port78::putMapKeys(pb, imu_meas);
++      port78::putMapKeys(pb, prev_opt_flow_res);
++      pb.u32((uint32_t)marg_data.order.abs_order_map.size());
++      for (const auto& kv : marg_data.order.abs_order_map) {
++        pb.i64(kv.first);
++        pb.u32((uint32_t)kv.second.first);
++        pb.u32((uint32_t)kv.second.second);
++      }
++      pb.u32((uint32_t)marg_data.order.total_size);
++      pb.u32((uint32_t)marg_data.H.rows());
++      pb.u32((uint32_t)marg_data.H.cols());
++      pb.u64(port::hashMat(marg_data.H));
++      pb.u64(port::hashMat(marg_data.b));
++      pb.u64(port::stateDigest(frame_poses, frame_states));
++      pb.u64(port_lm_order_hash(lmdb));
++      pb.u64(port_host_order_hash(lmdb));
++      pb.u64(port_lm_value_hash(lmdb));
++      pb.u32((uint32_t)lmdb.numLandmarks());
++      pb.u32((uint32_t)lmdb.numObservations());
++      port78::w().write(port78::T8_MARG_OUT, pb.b);
++    }
++
+     if (port_m) {
+       // MARG record (tag 4) in marg.bin:
+       //   i64 t_ns(last_state_t_ns), i64 last_state_to_marg, u32 path(0 SqrtToSqrt,1 SqToSqrt,2 SqToSq), u32 is_lin_sqrt, u32 is_sqrt,
+@@ -1290,6 +1334,17 @@
+     // - no landmark damping
+     // - outlier removal after 4 iterations?
+     lambda = Scalar(config.vio_lm_lambda_initial);
++    if (port_s && port78::on()) {
++      port::Buf pb;
++      pb.i64(last_state_t_ns);
++      pb.arr(&lambda_vee, 1);
++      pb.arr(&min_lambda, 1);
++      pb.arr(&max_lambda, 1);
++      { double li = config.vio_lm_lambda_initial; pb.arr(&li, 1); }
++      pb.i32((int32_t)config.vio_max_iterations);
++      pb.u32(1u);
++      port78::w().write(port78::T7_OPT_PRE, pb.b);
++    }
+ 
+     // record stats
+     stats.add("num_cams", this->frame_poses.size()).format("count");
+@@ -1748,6 +1803,14 @@
+       pb.arr(&lambda, 1);
+       pb.u64(port::stateDigest(frame_poses, frame_states));
+       port::D().write(port::S_ITER, port::T_OPT_END, pb.b);
++      if (port78::on()) {
++        port::Buf pb2;
++        pb2.i64(last_state_t_ns);
++        pb2.arr(&lambda_vee, 1);
++        pb2.arr(&lambda, 1);
++        pb2.u64(port_lm_value_hash(lmdb));
++        port78::w().write(port78::T7_OPT_POST, pb2.b);
++      }
+     }
+ 
+     stats.add("optimize", timer_total.elapsed()).format("ms");
