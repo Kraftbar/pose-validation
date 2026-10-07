@@ -1,4 +1,4 @@
-# Status (2026-10-05)
+# Status (2026-10-07)
 
 Entry point for new sessions. Short on purpose; details live in the linked files.
 
@@ -18,7 +18,9 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 |---|---|---|---|
 | `stella_port/` | stella_vslam mono, bit-exact | complete | `stella_port/HANDOVER.md` (top) |
 | `okvis_port/` | OKVIS2 (drone winner), bit-exact | complete for EuRoC: M1–M8 done; `okvis_c_euroc` runs MH_01 mono + stereo from images + IMU csv, trajectories byte-identical to the reference | `okvis_port/HANDOVER.md`, `PLAN.md` |
-| `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | M1–M7 done; window solve, image functions and map layer native | `rdvio_port/HANDOVER.md`, `PLAN.md` |
+| `rdvio_port/` | RD-VIO/XRSLAM (phone winner), bit-exact | complete for EuRoC: M1–M11 + M7b done; `rdvio_c_euroc` runs pure C99 from PNGs + IMU csv, trajectories byte-identical to the reference on all 11 sequences | `rdvio_port/HANDOVER.md` (top), `PLAN.md` |
+| `okvis2x_port/` | OKVIS2-X GNSS extension on top of okvis_port, bit-exact | GNSS stage (a) (`robust_gps_init: false`) done: with `OKVIS_PORT_OKVIS2X=1` + `gps_parameters`, `okvis_c_euroc` reproduces the X reference on MH_01 mono with generated GNSS (causal, final, global trajectory; 3 GNSS scenarios). GNSS-off X mono + stereo too. Stage (b), robust init (RANSAC + Ceres LM/DENSE_QR/autodiff alignment), is done as well: byte-identical on 3 robust scenarios incl. dropout + re-init (`tools/okvis2x_check_gnss.py --stage-b`). Open: geodetic input, stereo + GNSS | `okvis2x_port/PLAN.md`, `HANDOVER_*.md`, `reference/README.md` |
+| `basalt_port/` | Basalt (TUM, BSD-3) stereo VIO, float, bit-exact | complete for EuRoC: M0–M9 done; `basalt_c_euroc` reproduces the reference trajectory byte for byte on all 11 EuRoC sequences. It is about 7x slower than the reference (71 % of the time in the M6 GEBP model) | `basalt_port/PLAN.md`, `HANDOVER.md` |
 | `stella_vio/` | our modified copy of stella_port | re-init, IMU, R-frames, merge, PoseLib-style solvers, gait scale servo (all opt-in beyond defaults) | `stella_vio/README.md`, `RESULTS.md` |
 | `gnss_fusion/` | our C GNSS fusion | smoother, gait speed prior, georef, auto switch, gait regularity gate | `gnss_fusion/README.md` |
 | `phone_pipeline/` | stella_vio → gait → fusion, live | beats GNSS alone outdoors (live 4.31 / 11.33 / 11.82 vs 5.73 / 14.66 / 12.00 m); indoor 0.6–0.8 m with servo | `phone_pipeline/README.md` |
