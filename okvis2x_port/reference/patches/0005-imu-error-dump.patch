@@ -1,0 +1,387 @@
+0003: okvis_port instrumentation of ImuError (only active when OKVIS_PORT_DUMP_DIR is set; no numerical
+ effect). Adds okvis/ceres/OkvisPortDump.hpp; ImuError::{propagation,append} become thin wrappers around
+ the unmodified propagationImpl/appendImpl bodies, redoPreintegration dumps its full post-state, and
+ Evaluate dumps sampled compact (pre-state, parameters, residuals, Jacobians) records, initPose dumps its result. Record layouts are
+ documented in okvis_port/c/ok_imu.h and parsed by okvis_port/c/check_ok_imu.c.
+diff --git a/okvis_ceres/include/okvis/ceres/ImuError.hpp b/okvis_ceres/include/okvis/ceres/ImuError.hpp
+index f82f65c..87a7e84 100644
+--- a/okvis_ceres/include/okvis/ceres/ImuError.hpp
++++ b/okvis_ceres/include/okvis/ceres/ImuError.hpp
+@@ -32,6 +32,8 @@
+ #include <okvis/Parameters.hpp>
+ #include <okvis/ceres/ErrorInterface.hpp>
+ 
++namespace okvis_port { struct Buf; }  // okvis_port reference instrumentation
++
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+ /// \brief ceres Namespace for ceres-related functionality implemented in okvis.
+@@ -174,6 +176,24 @@ class ImuError :
+                          covariance_t* covariance = nullptr,
+                          jacobian_t* jacobian = nullptr);
+ 
++  /// \brief okvis_port: un-instrumented implementations (the public entry points dump when enabled).
++  static int propagationImpl(const okvis::ImuMeasurementDeque & imuMeasurements,
++                             const okvis::ImuParameters & imuParams,
++                             okvis::kinematics::Transformation& T_WS,
++                             okvis::SpeedAndBias & speedAndBiases,
++                             const okvis::Time& t_start, const okvis::Time& t_end,
++                             covariance_t* covariance = nullptr,
++                             jacobian_t* jacobian = nullptr);
++  /// \brief okvis_port: un-instrumented append.
++  int appendImpl(const okvis::kinematics::Transformation& T_WS,
++                 const okvis::SpeedAndBias & speedAndBiases,
++                 const okvis::ImuMeasurementDeque & imuMeasurements,
++                 const okvis::Time& t_1);
++  /// \brief okvis_port: serialise all preintegration internals.
++  void portSnapshot(okvis_port::Buf& b) const;
++  /// \brief okvis_port: snapshot, optionally without the measurement deque / with uninitialised information zeroed.
++  void portSnapshotImpl(okvis_port::Buf& b, bool withMeas, bool zeroUninit) const;
++
+   /// \brief Initialise pose from IMU measurements (assuming non-accelerating).
+   /// @param[in] imuMeasurements IMU measurements.
+   /// @param[out] T_WS The pose output.
+diff --git a/okvis_ceres/include/okvis/ceres/OkvisPortDump.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortDump.hpp
+new file mode 100644
+index 0000000..50af458
+--- /dev/null
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortDump.hpp
+@@ -0,0 +1,99 @@
++/*
++ * okvis_port reference instrumentation (NOT upstream code): binary dumps of ImuError inputs/outputs
++ * for the pure-C port's bit-exactness checks. Active only when OKVIS_PORT_DUMP_DIR is set.
++ * OKVIS_PORT_DUMP_EVERY="prop=1,preint=1,append=1,eval=200,append=5" selects every-N sampling per record kind
++ * (0 = off). Files: imu_prop.bin imu_preint.bin imu_append.bin imu_eval.bin in the dump dir.
++ * Everything is native-endian raw doubles / u32 / u64; layouts documented in okvis_port/c/ok_imu.h.
++ */
++#ifndef OKVIS_PORT_DUMP_HPP_
++#define OKVIS_PORT_DUMP_HPP_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include <Eigen/Core>
++#include <okvis/Measurements.hpp>
++#include <okvis/Parameters.hpp>
++#include <okvis/Time.hpp>
++
++namespace okvis_port {
++
++enum Kind { PROP = 0, PREINT = 1, APPEND = 2, EVAL = 3, INITPOSE = 4, NUM_KINDS = 5 };
++
++struct Buf {
++  std::vector<char> b;
++  void raw(const void* p, size_t n) { const char* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
++  void u32(uint32_t v) { raw(&v, 4); }
++  void u64(uint64_t v) { raw(&v, 8); }
++  void f64(double v) { raw(&v, 8); }
++  void f64n(const double* p, size_t n) { raw(p, 8 * n); }
++  void time(const okvis::Time& t) { u32(t.sec); u32(t.nsec); }
++  void meas(const okvis::ImuMeasurementDeque& d) {
++    u64(d.size());
++    for (const auto& m : d) {
++      time(m.timeStamp);
++      f64n(m.measurement.gyroscopes.data(), 3);
++      f64n(m.measurement.accelerometers.data(), 3);
++    }
++  }
++  void params(const okvis::ImuParameters& p) {
++    f64(p.sigma_g_c); f64(p.sigma_a_c); f64(p.sigma_gw_c); f64(p.sigma_aw_c);
++    f64(p.g); f64(p.g_max); f64(p.a_max);
++  }
++};
++
++class Dump {
++ public:
++  static Dump& get() { static Dump d; return d; }
++  bool on(Kind k) {  // true if this call should be recorded (counts every call)
++    if (!dir_.size()) return false;
++    std::lock_guard<std::mutex> l(m_);
++    const uint64_t c = calls_[k]++;
++    return every_[k] > 0 && (c % every_[k]) == 0;
++  }
++  void write(Kind k, const Buf& b) {
++    std::lock_guard<std::mutex> l(m_);
++    if (!f_[k]) {
++      static const char* names[] = {"imu_prop.bin", "imu_preint.bin", "imu_append.bin", "imu_eval.bin", "imu_initpose.bin"};
++      f_[k] = std::fopen((dir_ + "/" + names[k]).c_str(), "wb");
++    }
++    std::fwrite(b.b.data(), 1, b.b.size(), f_[k]);
++    written_[k]++;
++  }
++  ~Dump() {
++    for (int k = 0; k < NUM_KINDS; ++k) {
++      if (f_[k]) std::fclose(f_[k]);
++      if (dir_.size()) std::fprintf(stderr, "okvis_port dump kind %d: calls=%llu written=%llu\n", k,
++                                    (unsigned long long)calls_[k], (unsigned long long)written_[k]);
++    }
++  }
++ private:
++  Dump() {
++    const char* d = std::getenv("OKVIS_PORT_DUMP_DIR");
++    if (d) dir_ = d;
++    for (int k = 0; k < NUM_KINDS; ++k) { every_[k] = 1; calls_[k] = 0; written_[k] = 0; f_[k] = nullptr; }
++    every_[EVAL] = 200; every_[APPEND] = 5;
++    const char* e = std::getenv("OKVIS_PORT_DUMP_EVERY");
++    if (e) {
++      std::string s(e);
++      const char* names[] = {"prop", "preint", "append", "eval", "initpose"};
++      for (int k = 0; k < NUM_KINDS; ++k) {
++        size_t p = s.find(std::string(names[k]) + "=");
++        if (p != std::string::npos) every_[k] = std::atoi(s.c_str() + p + std::strlen(names[k]) + 1);
++      }
++    }
++  }
++  std::string dir_;
++  std::mutex m_;
++  uint64_t every_[NUM_KINDS], calls_[NUM_KINDS], written_[NUM_KINDS];
++  FILE* f_[NUM_KINDS];
++};
++
++}  // namespace okvis_port
++
++#endif  // OKVIS_PORT_DUMP_HPP_
+diff --git a/okvis_ceres/src/ImuError.cpp b/okvis_ceres/src/ImuError.cpp
+index 42ca3dd..6d42aa4 100644
+--- a/okvis_ceres/src/ImuError.cpp
++++ b/okvis_ceres/src/ImuError.cpp
+@@ -27,6 +27,7 @@
+ #include <okvis/ceres/ode/ode.hpp>
+ #include <okvis/kinematics/Transformation.hpp>
+ #include <okvis/PseudoInverse.hpp>
++#include <okvis/ceres/OkvisPortDump.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -60,7 +61,7 @@ ImuError::ImuError(const okvis::ImuMeasurementDeque & imuMeasurements,
+   }
+ }
+ 
+-int ImuError::append(const okvis::kinematics::Transformation& /*T_WS*/,
++int ImuError::appendImpl(const okvis::kinematics::Transformation& /*T_WS*/,
+                      const okvis::SpeedAndBias & speedAndBiases,
+                      const okvis::ImuMeasurementDeque & imuMeasurements, const okvis::Time& t_1)
+ {
+@@ -462,9 +463,120 @@ int ImuError::redoPreintegration(const okvis::kinematics::Transformation& /*T_WS
+   PseudoInverse::symmSqrtU(P_delta_, squareRootInformation_);
+   information_ = squareRootInformation_.transpose()*squareRootInformation_;
+ 
++  {  // okvis_port instrumentation
++    auto& D = okvis_port::Dump::get();
++    if (D.on(okvis_port::PREINT)) {
++      okvis_port::Buf buf;
++      buf.f64n(speedAndBiases.data(), 9);
++      buf.u64(uint64_t(i));
++      portSnapshotImpl(buf, true, false);
++      D.write(okvis_port::PREINT, buf);
++    }
++  }
+   return i;
+ }
+ 
++
++// ---- okvis_port instrumentation wrappers ----
++void ImuError::portSnapshot(okvis_port::Buf& b) const {
++  portSnapshotImpl(b, true, true);
++}
++
++// withMeas: include the measurement deque (otherwise only its size)
++void ImuError::portSnapshotImpl(okvis_port::Buf& b, bool withMeas, bool zeroUninit) const {
++  if (withMeas) {
++    b.meas(imuMeasurements_);
++  } else {
++    b.u64(imuMeasurements_.size());
++  }
++  b.params(imuParameters_);
++  b.time(t0_);
++  b.time(t1_);
++  b.f64n(Delta_q_.coeffs().data(), 4);
++  b.f64n(C_integral_.data(), 9);
++  b.f64n(C_doubleintegral_.data(), 9);
++  b.f64n(acc_integral_.data(), 3);
++  b.f64n(acc_doubleintegral_.data(), 3);
++  b.f64n(cross_.data(), 9);
++  b.f64n(dalpha_db_g_.data(), 9);
++  b.f64n(dv_db_g_.data(), 9);
++  b.f64n(dp_db_g_.data(), 9);
++  b.f64n(P_delta_.data(), 225);
++  b.f64n(speedAndBiases_ref_.data(), 9);
++  b.u32(redo_ ? 1u : 0u);
++  b.u32(uint32_t(redoCounter_));
++  // information_/squareRootInformation_ are uninitialised until the first redoPreintegration: dump zeros then
++  // (zeroUninit; not for the post-redo snapshot, where redoCounter_ is only incremented after the call returns)
++  const double zeros[225] = {0};
++  b.f64n((zeroUninit && redoCounter_ == 0) ? zeros : information_.data(), 225);
++  b.f64n((zeroUninit && redoCounter_ == 0) ? zeros : squareRootInformation_.data(), 225);
++  b.u32(uint32_t(dPdsigma_.size()));
++  for (const auto& m : dPdsigma_) b.f64n(m.data(), 225);
++}
++
++int ImuError::append(const okvis::kinematics::Transformation& T_WS,
++                     const okvis::SpeedAndBias & speedAndBiases,
++                     const okvis::ImuMeasurementDeque & imuMeasurements,
++                     const okvis::Time& t_1) {
++  auto& D = okvis_port::Dump::get();
++  if (!D.on(okvis_port::APPEND)) {
++    return appendImpl(T_WS, speedAndBiases, imuMeasurements, t_1);
++  }
++  okvis_port::Buf buf;
++  portSnapshot(buf);  // pre state
++  buf.f64n(speedAndBiases.data(), 9);
++  buf.meas(imuMeasurements);
++  buf.time(t_1);
++  const int ret = appendImpl(T_WS, speedAndBiases, imuMeasurements, t_1);
++  buf.u64(uint64_t(int64_t(ret)));
++  portSnapshotImpl(buf, false, false);  // post state (measurement deque: size only)
++  D.write(okvis_port::APPEND, buf);
++  return ret;
++}
++
++int ImuError::propagation(const okvis::ImuMeasurementDeque & imuMeasurements,
++                          const okvis::ImuParameters & imuParams,
++                          okvis::kinematics::Transformation& T_WS,
++                          okvis::SpeedAndBias & speedAndBiases,
++                          const okvis::Time & t_start,
++                          const okvis::Time & t_end, covariance_t* covariance,
++                          jacobian_t* jacobian) {
++  auto& D = okvis_port::Dump::get();
++  if (!D.on(okvis_port::PROP)) {
++    return propagationImpl(imuMeasurements, imuParams, T_WS, speedAndBiases, t_start, t_end,
++                           covariance, jacobian);
++  }
++  const okvis::kinematics::Transformation T0 = T_WS;
++  const okvis::SpeedAndBias sb0 = speedAndBiases;
++  const int ret = propagationImpl(imuMeasurements, imuParams, T_WS, speedAndBiases, t_start, t_end,
++                                  covariance, jacobian);
++  // second call on copies with covariance + jacobian requested (outputs of the first are unaffected)
++  okvis::kinematics::Transformation T1 = T0;
++  okvis::SpeedAndBias sb1 = sb0;
++  covariance_t cov = covariance_t::Zero();
++  jacobian_t jac = jacobian_t::Zero();
++  const int ret1 = propagationImpl(imuMeasurements, imuParams, T1, sb1, t_start, t_end, &cov, &jac);
++  okvis_port::Buf buf;
++  buf.meas(imuMeasurements);
++  buf.params(imuParams);
++  buf.f64n(T0.coeffs().data(), 7);
++  buf.f64n(sb0.data(), 9);
++  buf.time(t_start);
++  buf.time(t_end);
++  buf.u32(covariance ? 1u : 0u);
++  buf.u32(jacobian ? 1u : 0u);
++  buf.u64(uint64_t(int64_t(ret)));
++  buf.f64n(static_cast<const okvis::kinematics::Transformation&>(T_WS).coeffs().data(), 7);
++  buf.f64n(speedAndBiases.data(), 9);
++  buf.u64(uint64_t(int64_t(ret1)));
++  buf.f64n(static_cast<const okvis::kinematics::Transformation&>(T1).coeffs().data(), 7);
++  buf.f64n(sb1.data(), 9);
++  buf.f64n(cov.data(), 225);
++  buf.f64n(jac.data(), 225);
++  D.write(okvis_port::PROP, buf);
++  return ret;
++}
++
+ void ImuError::syncFrom(const ImuError &other)
+ {
+   imuParameters_ = other.imuParameters_; // The IMU parameters.
+@@ -534,13 +646,13 @@ std::shared_ptr<ImuErrorBase> ImuError::clone() const
+ }
+ 
+ // Propagates pose, speeds and biases with given IMU measurements.
+-int ImuError::propagation(const okvis::ImuMeasurementDeque & imuMeasurements,
+-                          const okvis::ImuParameters & imuParams,
+-                          okvis::kinematics::Transformation& T_WS,
+-                          okvis::SpeedAndBias & speedAndBiases,
+-                          const okvis::Time & t_start,
+-                          const okvis::Time & t_end, covariance_t* covariance,
+-                          jacobian_t* jacobian) {
++int ImuError::propagationImpl(const okvis::ImuMeasurementDeque & imuMeasurements,
++                              const okvis::ImuParameters & imuParams,
++                              okvis::kinematics::Transformation& T_WS,
++                              okvis::SpeedAndBias & speedAndBiases,
++                              const okvis::Time & t_start,
++                              const okvis::Time & t_end, covariance_t* covariance,
++                              jacobian_t* jacobian) {
+ 
+   // now the propagation
+   okvis::Time time = t_start;
+@@ -783,13 +895,74 @@ bool ImuError::initPose(const ImuMeasurementDeque &imuMeasurements,
+   poseIncrement.tail<3>() *= angle;
+   T_WS.oplus(-poseIncrement);
+ 
++  {  // okvis_port instrumentation
++    auto& D = okvis_port::Dump::get();
++    if (D.on(okvis_port::INITPOSE)) {
++      okvis_port::Buf buf;
++      buf.meas(imuMeasurements);
++      buf.f64n(static_cast<const okvis::kinematics::Transformation&>(T_WS).coeffs().data(), 7);
++      D.write(okvis_port::INITPOSE, buf);
++    }
++  }
+   return true;
+ }
+ 
+ // This evaluates the error term and additionally computes the Jacobians.
+ bool ImuError::Evaluate(double const* const * parameters, double* residuals,
+                         double** jacobians) const {
+-  return EvaluateWithMinimalJacobians(parameters, residuals, jacobians, nullptr);
++  auto& D = okvis_port::Dump::get();
++  if (!D.on(okvis_port::EVAL)) {
++    return EvaluateWithMinimalJacobians(parameters, residuals, jacobians, nullptr);
++  }
++  okvis_port::Buf buf;
++  // compact pre-state: everything Evaluate reads, except the measurement deque (size only)
++  const int redoCounterPre = redoCounter_;
++  const bool redoPre = redo_;
++  const size_t nMeasPre = imuMeasurements_.size();
++  okvis_port::Buf pre;
++  portSnapshotImpl(pre, true, true);  // full pre-state, only kept if this call re-integrates
++  const std::vector<char> preFull = pre.b;
++  buf.u32(redoPre ? 1u : 0u);
++  buf.u32(uint32_t(redoCounterPre));
++  buf.u64(nMeasPre);
++  buf.time(t0_);
++  buf.time(t1_);
++  buf.f64(imuParameters_.g);
++  buf.f64n(speedAndBiases_ref_.data(), 9);
++  buf.f64n(Delta_q_.coeffs().data(), 4);
++  buf.f64n(C_integral_.data(), 9);
++  buf.f64n(C_doubleintegral_.data(), 9);
++  buf.f64n(acc_integral_.data(), 3);
++  buf.f64n(acc_doubleintegral_.data(), 3);
++  buf.f64n(dalpha_db_g_.data(), 9);
++  buf.f64n(dv_db_g_.data(), 9);
++  buf.f64n(dp_db_g_.data(), 9);
++  {
++    const double zeros[225] = {0};
++    buf.f64n(redoCounterPre == 0 ? zeros : squareRootInformation_.data(), 225);  // uninitialised before 1st redo
++  }
++  buf.f64n(parameters[0], 7);
++  buf.f64n(parameters[1], 9);
++  buf.f64n(parameters[2], 7);
++  buf.f64n(parameters[3], 9);
++  const bool ok = EvaluateWithMinimalJacobians(parameters, residuals, jacobians, nullptr);
++  buf.u32(ok ? 1u : 0u);
++  buf.f64n(residuals, 15);
++  const int sizes[4] = {7, 9, 7, 9};
++  for (int k = 0; k < 4; ++k) {
++    const bool has = (jacobians != nullptr && jacobians[k] != nullptr);
++    buf.u32(has ? 1u : 0u);
++    if (has) buf.f64n(jacobians[k], size_t(15 * sizes[k]));
++  }
++  const bool redone = (redoCounter_ != redoCounterPre);
++  buf.u32(redone ? 1u : 0u);
++  if (redone) {
++    // measurements + parameters + the state this call re-integrated from are in the pre-state snapshot
++    buf.u64(uint64_t(preFull.size()));
++    buf.raw(preFull.data(), preFull.size());
++  }
++  D.write(okvis_port::EVAL, buf);
++  return ok;
+ }
+ 
+ // This evaluates the error term and additionally computes

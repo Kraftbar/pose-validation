@@ -1,0 +1,734 @@
+0009: module M5 instrumentation (ViGraph / ViGraphEstimator numerics and the Ceres Problem bookkeeping), active only
+ with OKVIS_PORT_GRAPH_DUMP_DIR. (a) okvis side (new header okvis_ceres/include/okvis/ceres/OkvisPortGraphDump.hpp,
+ file graph.bin, framed records): TwoPoseStandardGraphError::compute() inputs (every observation with its reprojection
+ error, loss, parameter-block snapshots and ids) and outputs (H00_, b0_, J_, DeltaX_, linearisation point, landmarks in
+ S0), convertToReprojectionErrors() (landmarks mapped back to world), sampled TwoPose{Standard,Extrinsics}GraphError
+ {,Const}::EvaluateWithMinimalJacobians records (OKVIS_PORT_GRAPH_TPEVAL_EVERY), sampled ViGraph::updateLandmarks()
+ per-landmark inputs/outputs (OKVIS_PORT_GRAPH_LM_EVERY calls, OKVIS_PORT_GRAPH_LM_SUB landmarks); portDump payloads of
+ the four TwoPose* cost functions in the PROBLEM record of the solver dump (patch 0008, types 7-10: isComputed,
+ DeltaX, J column-major, linearisation points), so check_ok_solve evaluates them natively and verifies the result
+ against the ORACLE records. (b) Ceres side (ProblemImpl, solver.cc; file problem.bin): every AddParameterBlock /
+ SetManifold / AddResidualBlock / RemoveResidualBlock (also the implicit ones of RemoveParameterBlock, in the order of
+ its pointer-keyed set) / RemoveParameterBlock / SetParameterBlockConstant / Variable, Problem construction and
+ destruction, and the program order (hash, every OKVIS_PORT_GRAPH_PROBLEM_FULL_EVERY-th in full) at every Solve().
+ Observational only: no computed value changes (trajectories byte-identical). Layouts: okvis_port/c/ok_graph.h,
+ ok_problem.h, ok_twopose.h.
+diff --git a/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h b/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h
+index 91d2679..2e969e7 100644
+--- a/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h
++++ b/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h
+@@ -11,7 +11,9 @@
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -71,6 +73,40 @@ struct State {
+ };
+ extern State g;
+ 
++/* okvis_port (patch 0009, module M5): log of every ceres::Problem mutation that defines the program order of the
++ * parameter / residual blocks (ProblemImpl: AddParameterBlock order, swap-with-last removal incl. the order in
++ * which RemoveParameterBlock drops the dependent residual blocks of its pointer-keyed set, SetManifold,
++ * constant/variable flags) plus the program order at every Solve(). File <OKVIS_PORT_GRAPH_DUMP_DIR>/problem.bin,
++ * framed records (u32 tag, u64 len, payload); layouts in okvis_port/c/ok_problem.h. Observational only. */
++enum ProblemRecord : uint32_t {
++  P_NEW = 1, P_DELETE = 2, P_ADDPARAM = 3, P_SETMANIFOLD = 4, P_ADDRESID = 5, P_RMRESID = 6, P_RMPARAM = 7,
++  P_SETCONST = 8, P_SETVAR = 9, P_SOLVE = 10
++};
++struct ProblemLog {
++  FILE* f = nullptr;
++  bool init = false;
++  long full_every = 50;
++  uint64_t solves = 0;
++  void open() {
++    if (init) return;
++    init = true;
++    const char* d = std::getenv("OKVIS_PORT_GRAPH_DUMP_DIR");
++    if (!d) return;
++    std::string path = std::string(d) + "/problem.bin";
++    f = std::fopen(path.c_str(), "wb");
++    if (const char* e = std::getenv("OKVIS_PORT_GRAPH_PROBLEM_FULL_EVERY")) full_every = std::atol(e);
++  }
++  bool on() { open(); return f != nullptr; }
++  void write(uint32_t rec, const Buf& b) {
++    if (!f) return;
++    const uint64_t n = b.b.size();
++    std::fwrite(&rec, 4, 1, f);
++    std::fwrite(&n, 8, 1, f);
++    if (n) std::fwrite(b.b.data(), 1, n, f);
++  }
++};
++extern ProblemLog plog;
++
+ }  // namespace okvis_port_solve
+ 
+ #endif  // CERES_OKVIS_PORT_SOLVE_HOOKS_H_
+diff --git a/external/ceres-solver/internal/ceres/problem_impl.cc b/external/ceres-solver/internal/ceres/problem_impl.cc
+index 40458bf..afc52e5 100644
+--- a/external/ceres-solver/internal/ceres/problem_impl.cc
++++ b/external/ceres-solver/internal/ceres/problem_impl.cc
+@@ -30,6 +30,7 @@
+ //         mierle@gmail.com (Keir Mierle)
+ 
+ #include "ceres/problem_impl.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0009)
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -170,6 +171,11 @@ ParameterBlock* ProblemImpl::InternalAddParameterBlock(double* values,
+   }
+   parameter_block_map_[values] = new_parameter_block;
+   program_->parameter_blocks_.push_back(new_parameter_block);
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(values))); b.u32(uint32_t(size));
++    okvis_port_solve::plog.write(okvis_port_solve::P_ADDPARAM, b);
++  }
+   return new_parameter_block;
+ }
+ 
+@@ -190,6 +196,11 @@ void ProblemImpl::InternalRemoveResidualBlock(ResidualBlock* residual_block) {
+     auto it = residual_block_set_.find(residual_block);
+     residual_block_set_.erase(it);
+   }
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(residual_block)));
++    okvis_port_solve::plog.write(okvis_port_solve::P_RMRESID, b);
++  }
+   DeleteBlockInVector(program_->mutable_residual_blocks(), residual_block);
+ }
+ 
+@@ -228,15 +239,30 @@ void ProblemImpl::DeleteBlock(ParameterBlock* parameter_block) {
+ ProblemImpl::ProblemImpl()
+     : options_(Problem::Options()), program_(new internal::Program) {
+   InitializeContext(options_.context, &context_impl_, &context_impl_owned_);
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(options_.enable_fast_removal ? 1u : 0u);
++    okvis_port_solve::plog.write(okvis_port_solve::P_NEW, b);
++  }
+ }
+ 
+ ProblemImpl::ProblemImpl(const Problem::Options& options)
+     : options_(options), program_(new internal::Program) {
+   program_->evaluation_callback_ = options.evaluation_callback;
+   InitializeContext(options_.context, &context_impl_, &context_impl_owned_);
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(options_.enable_fast_removal ? 1u : 0u);
++    okvis_port_solve::plog.write(okvis_port_solve::P_NEW, b);
++  }
+ }
+ 
+ ProblemImpl::~ProblemImpl() {
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this)));
++    okvis_port_solve::plog.write(okvis_port_solve::P_DELETE, b);
++  }
+   STLDeleteContainerPointers(program_->residual_blocks_.begin(),
+                              program_->residual_blocks_.end());
+ 
+@@ -335,6 +361,14 @@ ResidualBlockId ProblemImpl::AddResidualBlock(
+   }
+ 
+   program_->residual_blocks_.push_back(new_residual_block);
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(new_residual_block)));
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(cost_function))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(loss_function)));
++    b.u32(uint32_t(num_parameter_blocks));
++    for (int i = 0; i < num_parameter_blocks; ++i) b.u64(uint64_t(reinterpret_cast<uintptr_t>(parameter_blocks[i])));
++    okvis_port_solve::plog.write(okvis_port_solve::P_ADDRESID, b);
++  }
+ 
+   if (options_.enable_fast_removal) {
+     residual_block_set_.insert(new_residual_block);
+@@ -359,13 +393,19 @@ void ProblemImpl::AddParameterBlock(double* values, int size) {
+   InternalAddParameterBlock(values, size);
+ }
+ 
+-void ProblemImpl::InternalSetManifold(double* /*values*/,
++void ProblemImpl::InternalSetManifold(double* values,
+                                       ParameterBlock* parameter_block,
+                                       Manifold* manifold) {
+   if (manifold != nullptr && options_.manifold_ownership == TAKE_OWNERSHIP) {
+     manifolds_to_delete_.push_back(manifold);
+   }
+   parameter_block->SetManifold(manifold);
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(values)));
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(manifold)));
++    okvis_port_solve::plog.write(okvis_port_solve::P_SETMANIFOLD, b);
++  }
+ }
+ 
+ void ProblemImpl::AddParameterBlock(double* values,
+@@ -441,12 +481,14 @@ void ProblemImpl::RemoveParameterBlock(const double* values) {
+                << "it can be removed.";
+   }
+ 
++  uint32_t okvis_port_ndeps = 0;  // okvis_port (patch 0009)
+   if (options_.enable_fast_removal) {
+     // Copy the dependent residuals from the parameter block because the set of
+     // dependents will change after each call to RemoveResidualBlock().
+     std::vector<ResidualBlock*> residual_blocks_to_remove(
+         parameter_block->mutable_residual_blocks()->begin(),
+         parameter_block->mutable_residual_blocks()->end());
++    okvis_port_ndeps = uint32_t(residual_blocks_to_remove.size());
+     for (auto* residual_block : residual_blocks_to_remove) {
+       InternalRemoveResidualBlock(residual_block);
+     }
+@@ -461,12 +503,18 @@ void ProblemImpl::RemoveParameterBlock(const double* values) {
+       for (int j = 0; j < num_parameter_blocks; ++j) {
+         if (residual_block->parameter_blocks()[j] == parameter_block) {
+           InternalRemoveResidualBlock(residual_block);
++          ++okvis_port_ndeps;
+           // The parameter blocks are guaranteed unique.
+           break;
+         }
+       }
+     }
+   }
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009): after the dependent residual blocks were logged
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(values))); b.u32(okvis_port_ndeps);
++    okvis_port_solve::plog.write(okvis_port_solve::P_RMPARAM, b);
++  }
+   DeleteBlockInVector(program_->mutable_parameter_blocks(), parameter_block);
+ }
+ 
+@@ -480,6 +528,11 @@ void ProblemImpl::SetParameterBlockConstant(const double* values) {
+   }
+ 
+   parameter_block->SetConstant();
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(values)));
++    okvis_port_solve::plog.write(okvis_port_solve::P_SETCONST, b);
++  }
+ }
+ 
+ bool ProblemImpl::IsParameterBlockConstant(const double* values) const {
+@@ -501,6 +554,11 @@ void ProblemImpl::SetParameterBlockVariable(double* values) {
+   }
+ 
+   parameter_block->SetVarying();
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009)
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u64(uint64_t(reinterpret_cast<uintptr_t>(values)));
++    okvis_port_solve::plog.write(okvis_port_solve::P_SETVAR, b);
++  }
+ }
+ 
+ void ProblemImpl::SetManifold(double* values, Manifold* manifold) {
+diff --git a/external/ceres-solver/internal/ceres/solver.cc b/external/ceres-solver/internal/ceres/solver.cc
+index f3d7486..8f81abb 100644
+--- a/external/ceres-solver/internal/ceres/solver.cc
++++ b/external/ceres-solver/internal/ceres/solver.cc
+@@ -33,7 +33,7 @@
+ #include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
+ #include "ceres/parameter_block.h"
+ #include "ceres/residual_block.h"
+-namespace okvis_port_solve { State g; }
++namespace okvis_port_solve { State g; ProblemLog plog; }
+ 
+ #include <algorithm>
+ #include <map>
+@@ -764,6 +764,22 @@ void Solver::Solve(const Solver::Options& options,
+   // values provided by the user.
+   program->SetParameterBlockStatePtrsToUserStatePtrs();
+ 
++  if (okvis_port_solve::plog.on()) {  // okvis_port (patch 0009): program order at every Solve() for the Problem log
++    okvis_port_solve::Buf b;
++    const auto& pbs = program->parameter_blocks();
++    const auto& rbs = program->residual_blocks();
++    std::vector<uint64_t> pp, rr;
++    for (const auto* pb : pbs) pp.push_back(uint64_t(reinterpret_cast<uintptr_t>(pb->user_state())));
++    for (const auto* rb : rbs) rr.push_back(uint64_t(reinterpret_cast<uintptr_t>(rb)));
++    const uint64_t sid = okvis_port_solve::plog.solves++;
++    const bool full = okvis_port_solve::plog.full_every > 0 && (sid % uint64_t(okvis_port_solve::plog.full_every)) == 0;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(problem_impl))); b.u64(sid);
++    b.u32(uint32_t(pp.size())); b.u32(uint32_t(rr.size()));
++    b.u64(okvis_port_solve::fnv(pp.data(), 8 * pp.size())); b.u64(okvis_port_solve::fnv(rr.data(), 8 * rr.size()));
++    b.u32(full ? 1u : 0u);
++    if (full) { b.raw(pp.data(), 8 * pp.size()); b.raw(rr.data(), 8 * rr.size()); }
++    okvis_port_solve::plog.write(okvis_port_solve::P_SOLVE, b);
++  }
+   if (okvis_port_solve::g.on(1)) {  // okvis_port: the Problem's program order (ParameterMap is pointer-sorted)
+     okvis_port_solve::Buf b;
+     b.u32(uint32_t(program->NumParameterBlocks()));
+diff --git a/okvis_ceres/include/okvis/ceres/OkvisPortGraphDump.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortGraphDump.hpp
+new file mode 100644
+index 0000000..4ab780d
+--- /dev/null
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortGraphDump.hpp
+@@ -0,0 +1,77 @@
++/*
++ * okvis_port reference instrumentation (NOT upstream code, patch 0009): binary dumps for module M5 (ViGraph /
++ * ViGraphEstimator numerics): TwoPoseGraphError compute() / convertToReprojectionErrors() / Evaluate() and
++ * ViGraph::updateLandmarks(). Active only when OKVIS_PORT_GRAPH_DUMP_DIR is set; one framed-record file graph.bin
++ * (u32 tag, u64 payload length, payload; native endian). Sampling: OKVIS_PORT_GRAPH_TPEVAL_EVERY (every Nth
++ * TwoPose*::EvaluateWithMinimalJacobians call, default 50), OKVIS_PORT_GRAPH_LM_EVERY (every Nth updateLandmarks()
++ * call, default 2), OKVIS_PORT_GRAPH_LM_SUB (every Kth landmark of a recorded call, default 8); compute() and
++ * convertToReprojectionErrors() are always recorded. Record layouts: okvis_port/c/ok_graph.h. The Ceres Problem
++ * bookkeeping log (problem.bin) lives in external/ceres-solver/include/ceres/okvis_port_solve_hooks.h.
++ * Observational only: no computed value changes, no uninitialised memory is read.
++ */
++#ifndef OKVIS_PORT_GRAPH_DUMP_HPP_
++#define OKVIS_PORT_GRAPH_DUMP_HPP_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include <okvis/kinematics/OkvisPortKinDump.hpp>
++
++namespace okvis_portg {
++
++enum Record : uint32_t { G_TP_COMPUTE = 1, G_TP_CONVERT = 2, G_TP_EVAL = 3, G_LM_UPDATE = 4 };
++
++using Buf = okvis_portk::Buf;
++
++class Dump {
++ public:
++  static Dump& get() { static Dump d; return d; }
++  bool enabled() const { return enabled_; }
++  bool onEval() { if (!enabled_) return false; std::lock_guard<std::mutex> l(m_); const uint64_t c = evalCalls_++; return evalEvery_ > 0 && (c % evalEvery_) == 0; }
++  bool onLm() { if (!enabled_) return false; std::lock_guard<std::mutex> l(m_); const uint64_t c = lmCalls_++; return lmEvery_ > 0 && (c % lmEvery_) == 0; }
++  uint64_t lmSub() const { return lmSub_; }
++  void write(uint32_t rec, const Buf& b) {
++    if (!enabled_) return;
++    std::lock_guard<std::mutex> l(m_);
++    if (!f_) f_ = std::fopen((dir_ + "/graph.bin").c_str(), "wb");
++    const uint64_t n = b.b.size();
++    std::fwrite(&rec, 4, 1, f_);
++    std::fwrite(&n, 8, 1, f_);
++    if (n) std::fwrite(b.b.data(), 1, n, f_);
++    written_[rec]++;
++  }
++  ~Dump() {
++    if (!enabled_) return;
++    if (f_) std::fclose(f_);
++    std::fprintf(stderr, "okvis_port graph dump: tp_compute=%llu tp_convert=%llu tp_eval=%llu (calls %llu) lm_update=%llu (calls %llu)\n",
++                 (unsigned long long)written_[G_TP_COMPUTE], (unsigned long long)written_[G_TP_CONVERT],
++                 (unsigned long long)written_[G_TP_EVAL], (unsigned long long)evalCalls_,
++                 (unsigned long long)written_[G_LM_UPDATE], (unsigned long long)lmCalls_);
++  }
++
++ private:
++  Dump() {
++    const char* d = std::getenv("OKVIS_PORT_GRAPH_DUMP_DIR");
++    enabled_ = d != nullptr;
++    if (d) dir_ = d;
++    for (int k = 0; k < 8; ++k) written_[k] = 0;
++    if (const char* e = std::getenv("OKVIS_PORT_GRAPH_TPEVAL_EVERY")) evalEvery_ = std::strtoull(e, nullptr, 10);
++    if (const char* e = std::getenv("OKVIS_PORT_GRAPH_LM_EVERY")) lmEvery_ = std::strtoull(e, nullptr, 10);
++    if (const char* e = std::getenv("OKVIS_PORT_GRAPH_LM_SUB")) lmSub_ = std::strtoull(e, nullptr, 10);
++  }
++  bool enabled_ = false;
++  std::string dir_;
++  std::mutex m_;
++  FILE* f_ = nullptr;
++  uint64_t evalEvery_ = 50, lmEvery_ = 2, lmSub_ = 8, evalCalls_ = 0, lmCalls_ = 0;
++  uint64_t written_[8];
++};
++
++}  // namespace okvis_portg
++
++#endif  // OKVIS_PORT_GRAPH_DUMP_HPP_
+diff --git a/okvis_ceres/include/okvis/ceres/TwoPoseExtrinsicsGraphError.hpp b/okvis_ceres/include/okvis/ceres/TwoPoseExtrinsicsGraphError.hpp
+index 3c384e0..f676bed 100644
+--- a/okvis_ceres/include/okvis/ceres/TwoPoseExtrinsicsGraphError.hpp
++++ b/okvis_ceres/include/okvis/ceres/TwoPoseExtrinsicsGraphError.hpp
+@@ -127,6 +127,22 @@ class TwoPoseExtrinsicsGraphError : public ::ceres::CostFunction
+     return "TwoPoseExtrinsicsGraphError";
+   }
+ 
++  /// okvis_port (patch 0009): solver-dump payload: u32 isComputed, u32 n, DeltaX_[n], J_ (n x n column-major), lin. point
++  /// T_S0S1 (r, q xyzw), u32 nextr, nextr x {u32 present, r[3], q[4]} (linearisationPoints_T_SC_).
++  void portDump(okvis_portk::Buf& b) const {
++    const uint32_t n = uint32_t(DeltaX_.size());
++    b.u32(isComputed_ ? 1u : 0u); b.u32(n);
++    b.f64n(DeltaX_.data(), n);
++    b.mat(J_);
++    b.f64n(linearisationPoint_T_S0S1_.r().data(), 3);
++    b.f64n(linearisationPoint_T_S0S1_.q().coeffs().data(), 4);
++    b.u32(uint32_t(linearisationPoints_T_SC_.size()));
++    for (const auto& T : linearisationPoints_T_SC_) {
++      b.u32(T ? 1u : 0u);
++      if (T) { b.f64n(T->r().data(), 3); b.f64n(T->q().coeffs().data(), 4); } else { double z[7] = {0, 0, 0, 0, 0, 0, 0}; b.f64n(z, 7); }
++    }
++  }
++
+   /// @brief The covisibilities between the two poses.
+   /// @return The number of co-observed landmarks.
+   //int covisibility(std::map<uint64_t, std::map<uint64_t, size_t>> & coObservationCounts) const;
+@@ -216,6 +232,21 @@ class TwoPoseExtrinsicsGraphErrorConst : public ::ceres::CostFunction,
+     return "TwoPoseExtrinsicsGraphErrorConst";
+   }
+ 
++  /// okvis_port (patch 0009): solver-dump payload, same layout as TwoPoseExtrinsicsGraphError::portDump (isComputed = 1).
++  void portDump(okvis_portk::Buf& b) const {
++    const uint32_t n = uint32_t(DeltaX_.size());
++    b.u32(1u); b.u32(n);
++    b.f64n(DeltaX_.data(), n);
++    b.mat(J_);
++    b.f64n(linearisationPoint_T_S0S1_.r().data(), 3);
++    b.f64n(linearisationPoint_T_S0S1_.q().coeffs().data(), 4);
++    b.u32(uint32_t(linearisationPoints_T_SC_.size()));
++    for (const auto& T : linearisationPoints_T_SC_) {
++      b.u32(T ? 1u : 0u);
++      if (T) { b.f64n(T->r().data(), 3); b.f64n(T->q().coeffs().data(), 4); } else { double z[7] = {0, 0, 0, 0, 0, 0, 0}; b.f64n(z, 7); }
++    }
++  }
++
+ protected:
+ 
+   /// @name The internal storage of the linearised system.
+diff --git a/okvis_ceres/include/okvis/ceres/TwoPoseGraphError.hpp b/okvis_ceres/include/okvis/ceres/TwoPoseGraphError.hpp
+index 13d4b74..13db7b0 100644
+--- a/okvis_ceres/include/okvis/ceres/TwoPoseGraphError.hpp
++++ b/okvis_ceres/include/okvis/ceres/TwoPoseGraphError.hpp
+@@ -31,6 +31,7 @@
+ #include <okvis/ceres/ErrorInterface.hpp>
+ #include <okvis/ceres/ReprojectionErrorBase.hpp>
+ #include <okvis/FrameTypedefs.hpp>
++#include <okvis/ceres/OkvisPortGraphDump.hpp>  // okvis_port instrumentation (patch 0009)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -266,6 +267,15 @@ class TwoPoseStandardGraphError : public ::ceres::SizedCostFunction<
+     return "TwoPoseStandardGraphError";
+   }
+ 
++  /// okvis_port (patch 0009): solver-dump payload: u32 isComputed, DeltaX_[6], J_ (6x6 column-major), lin. point T_S0S1 (r, q xyzw).
++  void portDump(okvis_portk::Buf& b) const {
++    b.u32(isComputed_ ? 1u : 0u);
++    b.f64n(DeltaX_.data(), 6);
++    b.mat(J_);
++    b.f64n(linearisationPoint_T_S0S1_.r().data(), 3);
++    b.f64n(linearisationPoint_T_S0S1_.q().coeffs().data(), 4);
++  }
++
+   /// @brief The strength of this link (regarding position uncertainty only) -- use for
+   /// visualisations.
+   /// @return The strength as inverse position standard deviation [1/m].
+@@ -361,6 +371,15 @@ class TwoPoseStandardGraphErrorConst : public ::ceres::SizedCostFunction<
+     return "TwoPoseStandardGraphErrorConst";
+   }
+ 
++  /// okvis_port (patch 0009): solver-dump payload, same layout as TwoPoseStandardGraphError::portDump (isComputed = 1).
++  void portDump(okvis_portk::Buf& b) const {
++    b.u32(1u);
++    b.f64n(DeltaX_.data(), 6);
++    b.mat(J_);
++    b.f64n(linearisationPoint_T_S0S1_.r().data(), 3);
++    b.f64n(linearisationPoint_T_S0S1_.q().coeffs().data(), 4);
++  }
++
+ protected:
+   /// @name The internal storage of the linearised system.
+   /// @{
+diff --git a/okvis_ceres/src/TwoPoseExtrinsicsGraphError.cpp b/okvis_ceres/src/TwoPoseExtrinsicsGraphError.cpp
+index 3057103..2bac2e3 100644
+--- a/okvis_ceres/src/TwoPoseExtrinsicsGraphError.cpp
++++ b/okvis_ceres/src/TwoPoseExtrinsicsGraphError.cpp
+@@ -606,6 +606,24 @@ bool TwoPoseExtrinsicsGraphError::EvaluateWithMinimalJacobians(double const* con
+     }
+   }
+ 
++  if (okvis_portg::Dump::get().onEval()) {  // okvis_port (patch 0009): sampled Evaluate record
++    okvis_portg::Buf b;
++    const int nb = int(parameter_block_sizes().size());
++    const int nres = num_residuals();
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(9u);
++    { okvis_portk::Buf p; portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size()); }
++    b.u32(uint32_t(nb));
++    for (int k = 0; k < nb; ++k) b.f64n(parameters[k], 7);
++    b.u32(jacobians ? 1u : 0u);
++    for (int k = 0; k < nb; ++k) b.u32(jacobians && jacobians[k] ? 1u : 0u);
++    b.u32(jacobiansMinimal ? 1u : 0u);
++    for (int k = 0; k < nb; ++k) b.u32(jacobiansMinimal && jacobiansMinimal[k] ? 1u : 0u);
++    b.u32(1u); b.u32(uint32_t(nres));
++    b.f64n(residuals, size_t(nres));
++    for (int k = 0; k < nb; ++k) if (jacobians && jacobians[k]) b.f64n(jacobians[k], size_t(nres) * 7);
++    for (int k = 0; k < nb; ++k) if (jacobians && jacobians[k] && jacobiansMinimal && jacobiansMinimal[k]) b.f64n(jacobiansMinimal[k], size_t(nres) * 6);
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_EVAL, b);
++  }
+   return true;
+ }
+ 
+@@ -875,6 +893,24 @@ bool TwoPoseExtrinsicsGraphErrorConst::EvaluateWithMinimalJacobians(double const
+     }
+   }
+ 
++  if (okvis_portg::Dump::get().onEval()) {  // okvis_port (patch 0009): sampled Evaluate record
++    okvis_portg::Buf b;
++    const int nb = int(parameter_block_sizes().size());
++    const int nres = num_residuals();
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(10u);
++    { okvis_portk::Buf p; portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size()); }
++    b.u32(uint32_t(nb));
++    for (int k = 0; k < nb; ++k) b.f64n(parameters[k], 7);
++    b.u32(jacobians ? 1u : 0u);
++    for (int k = 0; k < nb; ++k) b.u32(jacobians && jacobians[k] ? 1u : 0u);
++    b.u32(jacobiansMinimal ? 1u : 0u);
++    for (int k = 0; k < nb; ++k) b.u32(jacobiansMinimal && jacobiansMinimal[k] ? 1u : 0u);
++    b.u32(1u); b.u32(uint32_t(nres));
++    b.f64n(residuals, size_t(nres));
++    for (int k = 0; k < nb; ++k) if (jacobians && jacobians[k]) b.f64n(jacobians[k], size_t(nres) * 7);
++    for (int k = 0; k < nb; ++k) if (jacobians && jacobians[k] && jacobiansMinimal && jacobiansMinimal[k]) b.f64n(jacobiansMinimal[k], size_t(nres) * 6);
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_EVAL, b);
++  }
+   return true;
+ }
+ 
+diff --git a/okvis_ceres/src/TwoPoseGraphError.cpp b/okvis_ceres/src/TwoPoseGraphError.cpp
+index 93c4f2f..3b7c7de 100644
+--- a/okvis_ceres/src/TwoPoseGraphError.cpp
++++ b/okvis_ceres/src/TwoPoseGraphError.cpp
+@@ -21,9 +21,17 @@
+ #include <okvis/ceres/ReprojectionError.hpp>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/timing/Timer.hpp>
++#include <ceres/loss_function.h>
+ 
+ //#define USE_NEW_LINEARIZATION_POINT
+ 
++namespace {
++static inline void portTf7(okvis_portk::Buf& b, const okvis::kinematics::Transformation& T) {
++  b.f64n(T.r().data(), 3);
++  b.f64n(T.q().coeffs().data(), 4);
++}
++}  // namespace
++
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+ /// \brief ceres Namespace for ceres-related functionality implemented in okvis.
+@@ -169,6 +177,47 @@ bool TwoPoseStandardGraphError::compute() {
+   OKVIS_ASSERT_TRUE(Exception, poseParameterBlockInfos_[1].parameterBlock,
+       "other pose not observed")
+ 
++  // okvis_port (patch 0009): compute() inputs (the output part is appended at the end)
++  const bool portOn = okvis_portg::Dump::get().enabled();
++  okvis_portg::Buf portB;
++  if (portOn) {
++    okvis_portg::Buf& b = portB;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(7u);
++    b.u64(referencePoseId_.value()); b.u64(otherPoseId_.value()); b.u32(uint32_t(numCams_)); b.u32(stayConst_ ? 1u : 0u);
++    b.u32(isComputed_ ? 1u : 0u);
++    for (int k = 0; k < 2; ++k) {
++      const ParameterBlockInfo<7>& info = poseParameterBlockInfos_[k];
++      b.u32(info.parameterBlock ? 1u : 0u);
++      b.u64(info.parameterBlock ? info.parameterBlock->id() : 0ULL);
++      b.f64n(info.parameters.data(), 7);
++      if (info.parameterBlock) b.f64n(info.parameterBlock->parameters(), 7); else { double z[7] = {0, 0, 0, 0, 0, 0, 0}; b.f64n(z, 7); }
++    }
++    b.u32(uint32_t(extrinsicsParameterBlockInfos_.size()));
++    for (const auto& info : extrinsicsParameterBlockInfos_) {
++      b.u32(info.parameterBlock ? 1u : 0u);
++      b.u64(info.parameterBlock ? info.parameterBlock->id() : 0ULL);
++      b.u32(uint32_t(info.parameterBlock ? info.idx : 0));
++      if (info.parameterBlock) b.f64n(info.parameters.data(), 7); else { double z[7] = {0, 0, 0, 0, 0, 0, 0}; b.f64n(z, 7); }
++    }
++    b.u32(uint32_t(landmarkParameterBlockId2idx_.size()));
++    for (const auto& kv : landmarkParameterBlockId2idx_) {
++      const ParameterBlockInfo<4>& info = landmarkParameterBlockInfos_.at(kv.second);
++      b.u64(kv.first); b.u32(uint32_t(kv.second)); b.u32(uint32_t(info.idx)); b.f64n(info.parameters.data(), 4);
++    }
++    b.u32(uint32_t(observations_.size()));
++    for (const auto& group : observations_) {
++      b.u64(group.first); b.u32(uint32_t(group.second.size()));
++      for (const Observation& obs : group.second) {
++        b.u64(obs.keypointIdentifier.frameId); b.u32(uint32_t(obs.keypointIdentifier.cameraIndex)); b.u32(uint32_t(obs.keypointIdentifier.keypointIndex));
++        b.u32(obs.lossFunction == nullptr ? 0u : (dynamic_cast<const ::ceres::CauchyLoss*>(obs.lossFunction) ? 1u : 2u));
++        b.u32(obs.isMarginalised ? 1u : 0u); b.u32(obs.isDuplication ? 1u : 0u);
++        b.u64(obs.pose->id()); b.u64(obs.hPoint->id()); b.u32(obs.hPoint->initialized() ? 1u : 0u); b.f64n(obs.hPoint->parameters(), 4);
++        b.u64(obs.extrinsics->id());
++        okvis_portk::Buf p; obs.reprojectionError->portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size());
++      }
++    }
++  }
++
+   // the reference pose
+   const okvis::kinematics::Transformation T_WS0 = std::static_pointer_cast<PoseParameterBlock>(
+         poseParameterBlockInfos_[0].parameterBlock)->estimate();
+@@ -393,6 +442,19 @@ bool TwoPoseStandardGraphError::compute() {
+   // remember we have computed
+   isComputed_ = true;
+ 
++  if (portOn) {  // okvis_port (patch 0009): compute() outputs
++    okvis_portg::Buf& b = portB;
++    b.u32(1u);
++    b.mat(H00_); b.f64n(b0_.data(), 6); b.mat(J_); b.f64n(DeltaX_.data(), 6);
++    portTf7(b, linearisationPoint_T_S0S1_);
++    b.u32(relPoseSet ? 1u : 0u);
++    b.u32(uint32_t(landmarks_.size()));
++    for (const auto& kv : landmarks_) { b.u64(kv.first); b.f64n(kv.second.data(), 4); }
++    for (const auto& group : observations_)
++      for (const Observation& obs : group.second) b.u32(obs.isMarginalised ? 1u : 0u);
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_COMPUTE, b);
++  }
++
+   return true;
+ }
+ 
+@@ -402,6 +464,21 @@ bool TwoPoseStandardGraphError::convertToReprojectionErrors(std::vector<Observat
+   const okvis::kinematics::Transformation T_WS0 = std::static_pointer_cast<PoseParameterBlock>(
+               poseParameterBlockInfos_[0].parameterBlock)->estimate();
+ 
++  // okvis_port (patch 0009): the landmarks mapped back to world coordinates (written at the end with the counts)
++  const bool portOn = okvis_portg::Dump::get().enabled();
++  okvis_portg::Buf portB;
++  const size_t portObs0 = observations.size(), portDup0 = duplicates.size();
++  if (portOn) {
++    okvis_portg::Buf& b = portB;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(7u);
++    portTf7(b, T_WS0);
++    b.u32(uint32_t(landmarks_.size()));
++    for (const auto& kv : landmarks_) {
++      const Eigen::Vector4d hp_W = T_WS0 * kv.second;
++      b.u64(kv.first); b.f64n(kv.second.data(), 4); b.f64n(hp_W.data(), 4);
++    }
++  }
++
+   // go through all the observations and add again...
+   for (auto &obss : observations_) {
+     for (auto &observation : obss.second) {
+@@ -447,6 +524,10 @@ bool TwoPoseStandardGraphError::convertToReprojectionErrors(std::vector<Observat
+   H00_.setZero();
+   b0_.setZero();
+   sparseSize_ = 0;
++  if (portOn) {  // okvis_port (patch 0009)
++    portB.u32(uint32_t(observations.size() - portObs0)); portB.u32(uint32_t(duplicates.size() - portDup0));
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_CONVERT, portB);
++  }
+   return true;
+ }
+ 
+@@ -601,6 +682,22 @@ bool TwoPoseStandardGraphError::EvaluateWithMinimalJacobians(double const* const
+     }
+   }
+ 
++  if (okvis_portg::Dump::get().onEval()) {  // okvis_port (patch 0009): sampled Evaluate record
++    okvis_portg::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(7u);
++    { okvis_portk::Buf p; portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size()); }
++    b.u32(2u);
++    for (int k = 0; k < 2; ++k) b.f64n(parameters[k], 7);
++    b.u32(jacobians ? 1u : 0u);
++    for (int k = 0; k < 2; ++k) b.u32(jacobians && jacobians[k] ? 1u : 0u);
++    b.u32(jacobiansMinimal ? 1u : 0u);
++    for (int k = 0; k < 2; ++k) b.u32(jacobiansMinimal && jacobiansMinimal[k] ? 1u : 0u);
++    b.u32(1u); b.u32(6u);
++    b.f64n(residuals, 6);
++    for (int k = 0; k < 2; ++k) if (jacobians && jacobians[k]) b.f64n(jacobians[k], 42);
++    for (int k = 0; k < 2; ++k) if (jacobians && jacobians[k] && jacobiansMinimal && jacobiansMinimal[k]) b.f64n(jacobiansMinimal[k], 36);
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_EVAL, b);
++  }
+   return true;
+ }
+ 
+@@ -763,6 +860,22 @@ bool TwoPoseStandardGraphErrorConst::EvaluateWithMinimalJacobians(
+     }
+   }
+ 
++  if (okvis_portg::Dump::get().onEval()) {  // okvis_port (patch 0009): sampled Evaluate record
++    okvis_portg::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this))); b.u32(8u);
++    { okvis_portk::Buf p; portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size()); }
++    b.u32(2u);
++    for (int k = 0; k < 2; ++k) b.f64n(parameters[k], 7);
++    b.u32(jacobians ? 1u : 0u);
++    for (int k = 0; k < 2; ++k) b.u32(jacobians && jacobians[k] ? 1u : 0u);
++    b.u32(jacobiansMinimal ? 1u : 0u);
++    for (int k = 0; k < 2; ++k) b.u32(jacobiansMinimal && jacobiansMinimal[k] ? 1u : 0u);
++    b.u32(1u); b.u32(6u);
++    b.f64n(residuals, 6);
++    for (int k = 0; k < 2; ++k) if (jacobians && jacobians[k]) b.f64n(jacobians[k], 42);
++    for (int k = 0; k < 2; ++k) if (jacobians && jacobians[k] && jacobiansMinimal && jacobiansMinimal[k]) b.f64n(jacobiansMinimal[k], 36);
++    okvis_portg::Dump::get().write(okvis_portg::G_TP_EVAL, b);
++  }
+   return true;
+ }
+ 
+diff --git a/okvis_ceres/src/ViGraph.cpp b/okvis_ceres/src/ViGraph.cpp
+index 1a6f019..6393b54 100644
+--- a/okvis_ceres/src/ViGraph.cpp
++++ b/okvis_ceres/src/ViGraph.cpp
+@@ -21,6 +21,7 @@
+ #include <okvis/ceres/OkvisPortDump.hpp>
+ #include <okvis/ceres/HomogeneousPointError.hpp>
+ #include <okvis/ceres/TwoPoseExtrinsicsGraphError.hpp>
++#include <okvis/ceres/OkvisPortGraphDump.hpp>  // okvis_port instrumentation (patch 0009)
+ #include <unordered_map>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/timing/Timer.hpp>
+@@ -1774,7 +1775,26 @@ bool ViGraph::softConstrainExtrinsics(double posStd, double rotStd)
+ 
+ void ViGraph::updateLandmarks()
+ {
+-  for (auto it = landmarks_.begin(); it != landmarks_.end(); ++it) {
++  // okvis_port (patch 0009): sampled dump of the per-landmark inputs and outputs (okvis_port/c/ok_graph.h)
++  static uint64_t portCall = 0;
++  const bool portOn = okvis_portg::Dump::get().onLm();
++  const uint64_t portSub = okvis_portg::Dump::get().lmSub();
++  okvis_portg::Buf portLb;
++  uint32_t portNrec = 0;
++  uint64_t portLi = 0;
++  const uint64_t portCallId = portCall++;
++  for (auto it = landmarks_.begin(); it != landmarks_.end(); ++it, ++portLi) {
++    const bool portRec = portOn && (portSub > 0) && (portLi % portSub) == 0;
++    if (portRec) {
++      okvis_portg::Buf& b = portLb;
++      b.u64(it->first.value()); b.f64n(it->second.hPoint->parameters(), 4); b.u32(uint32_t(it->second.observations.size()));
++      for (const auto& observation : it->second.observations) {
++        const State& state = states_.at(StateId(observation.first.frameId));
++        b.u64(observation.first.frameId); b.u32(uint32_t(observation.first.cameraIndex)); b.u32(uint32_t(observation.first.keypointIndex));
++        b.f64n(state.pose->parameters(), 7); b.f64n(state.extrinsics.at(observation.first.cameraIndex)->parameters(), 7);
++        okvis_portk::Buf p; observation.second.errorTerm->portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size());
++      }
++    }
+     Eigen::Vector4d hp_W = it->second.hPoint->estimate();
+     const size_t num = it->second.observations.size();
+     bool isInitialised = false;
+@@ -1850,6 +1870,16 @@ void ViGraph::updateLandmarks()
+     // update initialisation
+     it->second.hPoint->setInitialized(isInitialised);
+     it->second.quality = quality;
++    if (portRec) {  // okvis_port (patch 0009)
++      portLb.f64(it->second.quality); portLb.u32(isInitialised ? 1u : 0u); portLb.f64n(it->second.hPoint->parameters(), 4);
++      portNrec++;
++    }
++  }
++  if (portOn) {  // okvis_port (patch 0009)
++    okvis_portg::Buf b;
++    b.u64(portCallId); b.u32(uint32_t(landmarks_.size())); b.u32(uint32_t(portSub)); b.u32(portNrec);
++    b.raw(portLb.b.data(), portLb.b.size());
++    okvis_portg::Dump::get().write(okvis_portg::G_LM_UPDATE, b);
+   }
+ }
+ 
+@@ -1880,6 +1910,10 @@ void portCostPayload(uint32_t type, const ::ceres::CostFunction* cf, okvis_port_
+     case 4: dynamic_cast<const okvis::ceres::SpeedAndBiasError*>(cf)->portDump(b); break;
+     case 5: dynamic_cast<const okvis::ceres::RelativePoseError*>(cf)->portDump(b); break;
+     case 6: dynamic_cast<const okvis::ceres::HomogeneousPointError*>(cf)->portDump(b); break;
++    case 7: dynamic_cast<const okvis::ceres::TwoPoseStandardGraphError*>(cf)->portDump(b); break;  // patch 0009
++    case 8: dynamic_cast<const okvis::ceres::TwoPoseStandardGraphErrorConst*>(cf)->portDump(b); break;
++    case 9: dynamic_cast<const okvis::ceres::TwoPoseExtrinsicsGraphError*>(cf)->portDump(b); break;
++    case 10: dynamic_cast<const okvis::ceres::TwoPoseExtrinsicsGraphErrorConst*>(cf)->portDump(b); break;
+     default: break;
+   }
+   out.u64(uint64_t(b.b.size()));

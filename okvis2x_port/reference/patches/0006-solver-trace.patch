@@ -1,0 +1,251 @@
+0004: per-solve trace of ViGraph::optimise (input checksums over parameter blocks / observation sets / IMU links,
+ Ceres initial/final cost and per-iteration summary) plus a graph-mutation event log (landmark add/set,
+ observation add/remove, optimise markers). Active only with OKVIS_PORT_TRACE_DIR (solver_trace.txt, events.txt).
+ Used to localise run-to-run divergence; the solver trace is also the first dump for the future solver module.
+diff --git a/okvis_ceres/include/okvis/ViGraph.hpp b/okvis_ceres/include/okvis/ViGraph.hpp
+index e872490..c1e867d 100644
+--- a/okvis_ceres/include/okvis/ViGraph.hpp
++++ b/okvis_ceres/include/okvis/ViGraph.hpp
+@@ -19,6 +19,7 @@
+ #ifndef INCLUDE_OKVIS_VIGRAPH2_HPP_
+ #define INCLUDE_OKVIS_VIGRAPH2_HPP_
+ 
++#include <okvis/ceres/OkvisPortTrace.hpp>
+ #include <memory>
+ 
+ #pragma GCC diagnostic push
+@@ -339,6 +340,7 @@ class ViGraph
+         state.pose->parameters(), landmarks_.at(landmarkId).hPoint->parameters(),
+         state.extrinsics.at(keypointId.cameraIndex)->parameters());
+     observation.landmarkId = landmarkId;
++    okvis_port::traceEvent("A lm=%llu fr=%llu cam=%zu kp=%zu cauchy=%d", (unsigned long long)landmarkId.value(), (unsigned long long)keypointId.frameId, (size_t)keypointId.cameraIndex, (size_t)keypointId.keypointIndex, int(useCauchy));
+ 
+     // remember everywhere
+     observations_[keypointId] = observation;
+@@ -380,6 +382,7 @@ class ViGraph
+         state.pose->parameters(), landmarks_.at(landmarkId).hPoint->parameters(),
+         state.extrinsics.at(keypointId.cameraIndex)->parameters());
+     observation.landmarkId = landmarkId;
++    okvis_port::traceEvent("A lm=%llu fr=%llu cam=%zu kp=%zu cauchy=%d", (unsigned long long)landmarkId.value(), (unsigned long long)keypointId.frameId, (size_t)keypointId.cameraIndex, (size_t)keypointId.keypointIndex, int(useCauchy));
+ 
+     // remember everywhere
+     observations_[keypointId] = observation;
+diff --git a/okvis_ceres/include/okvis/ceres/OkvisPortTrace.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortTrace.hpp
+new file mode 100644
+index 0000000..4ddb959
+--- /dev/null
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortTrace.hpp
+@@ -0,0 +1,31 @@
++/* okvis_port reference instrumentation (NOT upstream code): graph-mutation event log, active only when
++ * OKVIS_PORT_TRACE_DIR is set (file events.txt). Used to localise run-to-run divergence. */
++#ifndef OKVIS_PORT_TRACE_HPP_
++#define OKVIS_PORT_TRACE_HPP_
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++namespace okvis_port {
++
++inline void traceEvent(const char* fmt, ...) {
++  static FILE* f = nullptr;
++  static bool init = false;
++  if (!init) {
++    init = true;
++    const char* d = std::getenv("OKVIS_PORT_TRACE_DIR");
++    if (d) f = std::fopen((std::string(d) + "/events.txt").c_str(), "w");
++  }
++  if (!f) return;
++  va_list ap;
++  va_start(ap, fmt);
++  std::vfprintf(f, fmt, ap);
++  va_end(ap);
++  std::fputc('\n', f);
++}
++
++}  // namespace okvis_port
++
++#endif  // OKVIS_PORT_TRACE_HPP_
+diff --git a/okvis_ceres/src/ViGraph.cpp b/okvis_ceres/src/ViGraph.cpp
+index 4c0fa7c..f471970 100644
+--- a/okvis_ceres/src/ViGraph.cpp
++++ b/okvis_ceres/src/ViGraph.cpp
+@@ -19,6 +19,9 @@
+ #include <okvis/ViGraph.hpp>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/timing/Timer.hpp>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include "ceres/covariance.h"
+ #include <cmath>
+ #include <chrono>
+@@ -598,6 +601,7 @@ bool ViGraph::addLandmark(LandmarkId landmarkId, const Eigen::Vector4d &homogene
+                               &homogeneousPointManifold_);
+   landmark.hPoint->setLocalParameterizationPtr(&homogeneousPointManifold_);
+   landmarks_[landmarkId] = landmark;
++  okvis_port::traceEvent("L1 id=%llu %a %a %a %a init=%d", (unsigned long long)landmarkId.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3], int(initialised));
+   return true;
+ }
+ 
+@@ -613,6 +617,7 @@ LandmarkId ViGraph::addLandmark(const Eigen::Vector4d &homogeneousPoint, bool in
+   landmark.hPoint->setLocalParameterizationPtr(&homogeneousPointManifold_);
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId) == 0, "Bug: landmark not added")
+   landmarks_[landmarkId] = landmark;
++  okvis_port::traceEvent("L2 id=%llu %a %a %a %a init=%d", (unsigned long long)landmarkId.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3], int(initialised));
+   return landmarkId;
+ }
+ 
+@@ -693,6 +698,7 @@ void ViGraph::checkObservations() const {
+ 
+ bool ViGraph::removeObservation(KeypointIdentifier keypointId)
+ {
++  okvis_port::traceEvent("R fr=%llu cam=%zu kp=%zu", (unsigned long long)keypointId.frameId, (size_t)keypointId.cameraIndex, (size_t)keypointId.keypointIndex);
+   OKVIS_ASSERT_TRUE_DBG(Exception, observations_.count(keypointId), "observation does not exists")
+   Observation observation = observations_.at(keypointId);
+ 
+@@ -1606,6 +1612,7 @@ bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint
+ {
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(id), "landmark does not exists")
+   auto& landmark = landmarks_.at(id).hPoint;
++  okvis_port::traceEvent("S1 id=%llu %a %a %a %a init=%d", (unsigned long long)id.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3], int(initialised));
+   landmark->setEstimate(homogeneousPoint);
+   landmark->setInitialized(initialised);
+   return true;
+@@ -1614,6 +1621,7 @@ bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint
+ {
+   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(id), "landmark does not exists")
+   auto& landmark = landmarks_.at(id).hPoint;
++  okvis_port::traceEvent("S2 id=%llu %a %a %a %a", (unsigned long long)id.value(), homogeneousPoint[0], homogeneousPoint[1], homogeneousPoint[2], homogeneousPoint[3]);
+   landmark->setEstimate(homogeneousPoint);
+   return true;
+ }
+@@ -1880,9 +1888,65 @@ void ViGraph::optimise(int maxIterations, int /*numThreads*/, bool verbose)
+ //  else
+ //      std::cout << "Covariance computation failed" << std::endl;
+ 
++  // okvis_port trace: per-solve input checksum + Ceres iteration summary (only with OKVIS_PORT_TRACE_DIR)
++  static FILE* portTrace = nullptr;
++  static bool portTraceInit = false;
++  static unsigned long long portCall = 0;
++  if (!portTraceInit) {
++    portTraceInit = true;
++    const char* d = std::getenv("OKVIS_PORT_TRACE_DIR");
++    if (d) portTrace = std::fopen((std::string(d) + "/solver_trace.txt").c_str(), "w");
++  }
++  unsigned long long portHash = 1469598103934665603ULL, portObsHash = 1469598103934665603ULL, portImuHash = 1469598103934665603ULL;
++  if (portTrace) {
++    auto mix = [&portHash](const void* p, size_t n) {
++      const unsigned char* c = static_cast<const unsigned char*>(p);
++      for (size_t i = 0; i < n; ++i) { portHash ^= c[i]; portHash *= 1099511628211ULL; }
++    };
++    for (const auto& st : states_) {
++      const uint64_t id = st.first.value();
++      mix(&id, 8);
++      mix(st.second.pose->parameters(), 7 * sizeof(double));
++      mix(st.second.speedAndBias->parameters(), 9 * sizeof(double));
++    }
++    for (const auto& lm : landmarks_) {
++      const uint64_t id = lm.first.value();
++      mix(&id, 8);
++      mix(lm.second.hPoint->parameters(), 4 * sizeof(double));
++    }
++    // structure hashes: observation sets, IMU links, pose-graph links
++    for (const auto& lm : landmarks_) {
++      const uint64_t id = lm.first.value();
++      portObsHash ^= id; portObsHash *= 1099511628211ULL;
++      for (const auto& ob : lm.second.observations) {
++        const uint64_t v[3] = {uint64_t(ob.first.frameId), uint64_t(ob.first.cameraIndex), uint64_t(ob.first.keypointIndex)};
++        for (int q = 0; q < 3; ++q) { portObsHash ^= v[q]; portObsHash *= 1099511628211ULL; }
++      }
++    }
++    for (const auto& st : states_) {
++      const uint64_t v[6] = {st.first.value(), uint64_t(st.second.observations.size()), uint64_t(st.second.twoPoseLinks.size()),
++                             uint64_t(st.second.twoPoseConstLinks.size()), uint64_t(st.second.relativePoseLinks.size()),
++                             st.second.previousImuLink.errorTerm ? (uint64_t(st.second.previousImuLink.errorTerm->t0().sec) << 32 | st.second.previousImuLink.errorTerm->t0().nsec) ^ (uint64_t(st.second.previousImuLink.errorTerm->t1().sec) << 32 | st.second.previousImuLink.errorTerm->t1().nsec) : 0ULL};
++      for (int q = 0; q < 6; ++q) { portImuHash ^= v[q]; portImuHash *= 1099511628211ULL; }
++    }
++  }
++
++  okvis_port::traceEvent("OPT %llu solver=%d", portCall, int(options_.linear_solver_type));
++
+   // call solver
+   ::ceres::Solve(options_, problem_.get(), &summary_);
+ 
++  if (portTrace) {
++    std::fprintf(portTrace, "solve %llu solver=%d states=%zu landmarks=%zu inputhash=%016llx obs=%016llx struct=%016llx nres=%d init=%.17g final=%.17g iters=%zu term=%d\n",
++                 portCall++, int(options_.linear_solver_type), states_.size(), landmarks_.size(), portHash, portObsHash, portImuHash,
++                 summary_.num_residual_blocks, summary_.initial_cost, summary_.final_cost, summary_.iterations.size(), int(summary_.termination_type));
++    for (const auto& it : summary_.iterations) {
++      std::fprintf(portTrace, "  it %d cost=%.17g gnorm=%.17g step=%.17g radius=%.17g ok=%d\n", it.iteration, it.cost,
++                   it.gradient_max_norm, it.step_norm, it.trust_region_radius, int(it.step_is_successful));
++    }
++    std::fflush(portTrace);
++  }
++
+   // summary output
+   if (verbose) {
+     LOG(INFO) << summary_.FullReport();
+diff --git a/okvis_frontend/src/Frontend.cpp b/okvis_frontend/src/Frontend.cpp
+index 2569730..20ee8eb 100755
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -56,6 +56,7 @@
+ #pragma GCC diagnostic pop
+ 
+ #include <okvis/Frontend.hpp>
++#include <okvis/ceres/OkvisPortTrace.hpp>
+ 
+ // okvis ceres
+ #include <okvis/ceres/PoseParameterBlock.hpp>
+@@ -248,6 +249,24 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
+ 
+   // extract
+   frameOut->describe(cameraIndex);
++  {  // okvis_port trace
++    unsigned long long hk = 1469598103934665603ULL, hd = 1469598103934665603ULL;
++    auto mix = [](unsigned long long& h, const void* p, size_t n) {
++      const unsigned char* c = static_cast<const unsigned char*>(p);
++      for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ULL; }
++    };
++    const size_t nk = frameOut->numKeypoints(cameraIndex);
++    for (size_t k = 0; k < nk; ++k) {
++      cv::KeyPoint kp;
++      frameOut->getCvKeypoint(cameraIndex, k, kp);
++      mix(hk, &kp.pt.x, 4); mix(hk, &kp.pt.y, 4); mix(hk, &kp.size, 4); mix(hk, &kp.angle, 4);
++      mix(hk, &kp.response, 4); mix(hk, &kp.octave, 4);
++      mix(hd, frameOut->keypointDescriptor(cameraIndex, k), 48);
++    }
++    okvis_port::traceEvent("D t=%u.%09u cam=%zu nk=%zu hk=%016llx hd=%016llx dir=%a %a %a", frameOut->timestamp().sec,
++                           frameOut->timestamp().nsec, cameraIndex, nk, hk, hd, extractionDir[0], extractionDir[1],
++                           extractionDir[2]);
++  }
+ 
+   // precompute backprojections
+   frameOut->computeBackProjections(cameraIndex);
+@@ -1494,6 +1513,24 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
+     std::vector<size_t> ctrs(num_matching_threads);
+     std::vector<double> reprErrors(num_matching_threads);
+ 
++    {  // okvis_port trace: hash of the landmark set offered to the matcher
++      unsigned long long hl = 1469598103934665603ULL;
++      auto mix = [&hl](const void* p, size_t n) {
++        const unsigned char* c = static_cast<const unsigned char*>(p);
++        for (size_t i = 0; i < n; ++i) { hl ^= c[i]; hl *= 1099511628211ULL; }
++      };
++      for (const auto& l : landmarksToMatch) {
++        const uint64_t id = l.first.value();
++        mix(&id, 8);
++        mix(l.second.projection.data(), 16);
++        const int is3 = l.second.is3d ? 1 : 0;
++        mix(&is3, 4);
++        mix(l.second.descriptors.data, size_t(l.second.descriptors.rows) * 48);
++        for (const auto& kid : l.second.kids) { const uint64_t v[3] = {kid.frameId, kid.cameraIndex, kid.keypointIndex}; mix(v, 24); }
++      }
++      okvis_port::traceEvent("MM fr=%llu im=%zu nlm=%zu nkp=%zu hl=%016llx", (unsigned long long)currentFrameId, im,
++                             landmarksToMatch.size(), numKeypoints, hl);
++    }
+     // DETERMINISTIC REFERENCE: same keypoint partition, executed sequentially on this thread.
+     for(size_t t = 0; t<num_matching_threads; ++t) {
+       matchToMapByThread<CAMERA_GEOMETRY>(

@@ -1,0 +1,173 @@
+--- a/okvis_ceres/src/ViGraph.cpp
++++ b/okvis_ceres/src/ViGraph.cpp
+@@ -365,9 +365,11 @@
+   kinematics::Transformation T_GW0;
+   T_GW0.setIdentity();
+   state.T_GW.reset(new ceres::PoseParameterBlock(T_GW0,id.value(),timestamp));
++  if (!std::getenv("X_EXP_NO_GW_BLOCK")) {  // EXPERIMENT
+   problem_->AddParameterBlock(state.T_GW->parameters(),7,&gpsExtrinsicLocalParametrisation_);
+   state.T_GW->setLocalParameterizationPtr(&gpsExtrinsicLocalParametrisation_);
+   problem_->SetParameterBlockVariable(state.T_GW->parameters());
++  }
+ 
+   // add the priors
+   Eigen::Matrix<double, 6, 1> informationDiag = Eigen::Matrix<double, 6, 1>::Ones();
+@@ -1859,6 +1861,109 @@
+         okvis_portk::Buf p; observation.second.errorTerm->portDump(p); b.u64(uint64_t(p.b.size())); b.raw(p.b.data(), p.b.size());
+       }
+     }
++    if (std::getenv("X_EXP_UL_OKVIS2")) {  // EXPERIMENT: OKVIS2 criterion (logging kept)
++    Eigen::Vector4d hp_W = it->second.hPoint->estimate();
++    const size_t num = it->second.observations.size();
++    bool isInitialised = false;
++    double quality = 0.0;
++    bool behind = false;
++    double best_err = 1.0e12;
++    Eigen::Vector4d best_pos(0.0, 0.0, 0.0, 0.0);
++    double minD = 1.0e12;
++    Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
++    if (num > 0) {
++      for (const auto &observation : it->second.observations) {
++        kinematics::Transformation T_WS, T_SCi;
++        const StateId stateId(observation.first.frameId);
++        const State &state = states_.at(stateId);
++        T_WS = state.pose->estimate();
++        T_SCi = state.extrinsics.at(observation.first.cameraIndex)->estimate();
++        kinematics::Transformation T_WCi = T_WS * T_SCi;
++        Eigen::Vector4d pos_Ci = T_WCi.inverse() * hp_W;
++        Eigen::Vector3d dir_W = (T_WCi.C() * pos_Ci.head<3>()).normalized();
++
++        if (fabs(pos_Ci[3]) > 1.0e-12) {
++          pos_Ci = pos_Ci / pos_Ci[3];
++        }
++        if (pos_Ci[2] < 0.1) {
++          behind = true;
++        }
++        if (pos_Ci[2] < 0.0) {
++          dir_W = -dir_W; // reverse!!
++        }
++
++        // consider only small reprojection errors
++        Eigen::Vector2d err;
++        double *params[3];
++        params[0] = state.pose->parameters();
++        params[1] = it->second.hPoint->parameters();
++        params[2] = state.extrinsics.at(observation.first.cameraIndex)->parameters();
++        double *jacobians[3];
++        double *jacobians_minimal[3];
++        Eigen::Matrix<double, 2, 4> J1;
++        Eigen::Matrix<double, 2, 3> J1_minimal;
++        jacobians[0] = nullptr;
++        jacobians[1] = J1.data();
++        jacobians[2] = nullptr;
++        jacobians_minimal[0] = nullptr;
++        jacobians_minimal[1] = J1_minimal.data();
++        jacobians_minimal[2] = nullptr;
++        observation.second.errorTerm->EvaluateWithMinimalJacobians(params,
++                                                                   err.data(),
++                                                                   jacobians,
++                                                                   jacobians_minimal);
++        const double err_norm = err.norm();
++
++        if (err_norm > 2.5) {
++          //bad = true;
++          continue;
++        }
++
++        if (fabs(pos_Ci[3]) > 1.0e-12) {
++          if (pos_Ci[2] < minD) {
++            minD = pos_Ci[2];
++          }
++        }
++
++        if (err_norm < best_err && pos_Ci.norm() > 0.0001) {
++          // remember best fit
++          // if it was far away, leave it far away; but make sure it's in front
++          // of the camera and at least at 10 cm...
++          const double dist = std::max(0.1, pos_Ci.norm());
++          best_pos.head<3>() = T_WCi.r() + dist * dir_W;
++          best_pos[3] = 1.0;
++          best_err = err_norm;
++        }
++
++        H += J1_minimal.transpose() * J1_minimal;
++      }
++
++      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
++      es.compute(H);
++      const double s0 = sqrt(std::max(1.0e-12, es.eigenvalues()[0]));
++      quality = (minD - 3.0 / s0) / fabs(std::max(1.0e-12, minD));
++      if (behind) {
++        quality = 0.0;
++      }
++      if(quality > 0.15) {
++        isInitialised = true;
++      } else {
++        if(behind && best_pos.norm()>1.0e-12) {
++          // reset along best ray
++          it->second.hPoint->setEstimate(best_pos);
++        }
++      }
++    }
++    // update initialisation
++    it->second.hPoint->setInitialized(isInitialised);
++    it->second.quality = std::max(0.0, quality);
++  
++      if (portRec) {
++        portLb.f64(it->second.quality); portLb.u32(it->second.hPoint->initialized() ? 1u : 0u); portLb.f64n(it->second.hPoint->parameters(), 4);
++        portNrec++;
++      }
++      continue;
++    }
+     Eigen::Vector4d hp_W = it->second.hPoint->estimate();
+     const size_t num = it->second.observations.size();
+     bool isInitialised = false;
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -808,7 +808,7 @@
+     const uint64_t id = dBoWResultOrig[f].Id;
+     if (id >= dBoWResult.size())
+       continue;
+-    if (score < 0.375) {
++    if (score < (std::getenv("X_EXP_SCORE04") ? 0.4 : 0.375)) {
+       break;
+     }
+     // check suppressed:
+@@ -1259,6 +1259,7 @@
+   }
+ 
+ 
++  if (!std::getenv("X_EXP_NO_DUP_REMOVEOUT")) {  // EXPERIMENT
+   // remove outliers, as the last matching step may have introduced some:
+   switch (distortionType) {
+   case okvis::cameras::NCameraSystem::RadialTangential: {
+@@ -1280,6 +1281,7 @@
+     OKVIS_THROW(Exception, "Unsupported distortion type.")
+     break;
+   } //ToDo:EUCM
++  }
+ 
+ #ifdef OKVIS_USE_NN
+   if(params.frontend.use_cnn) {
+--- a/okvis_ceres/src/ViSlamBackend.cpp
++++ b/okvis_ceres/src/ViSlamBackend.cpp
+@@ -29,6 +29,7 @@
+ #include <okvis/PseudoInverse.hpp>
+ #include <okvis/Component.hpp>
+ #include <okvis/timing/Timer.hpp>
++#include <cstdlib>
+ #include <okvis/ceres/OkvisPortVigraphLog.hpp>  // okvis_port (patch 0011)
+ #include <okvis/cameras/PinholeCamera.hpp>
+ #include <okvis/cameras/RadialTangentialDistortion.hpp>
+@@ -745,6 +746,11 @@
+       if(convertToPosegraphFrames.size() > 0) {
+         bool success = convertToPoseGraphMst(convertToPosegraphFrames, framesToConsider,
+                                              affectedFrames);
++        if (std::getenv("X_EXP_CLEAR_IMAGES")) {  // EXPERIMENT: OKVIS2 frees the images of pose-graph frames (affects overlapFraction)
++          for (auto id : convertToPosegraphFrames) {
++            for (size_t cam = 0; cam < multiFrames_.at(id)->numFrames(); ++cam) multiFrames_.at(id)->setImage(cam, cv::Mat());
++          }
++        }
+         ctrPg++;
+         OKVIS_ASSERT_TRUE(Exception, realtimeGraph_.states_.at(minId).observations.size()==0,
+                           "observations at ID " << minId.value() << " , success=" << int(success))

@@ -1,0 +1,797 @@
+0008: per-Solve() dump of the Ceres problem and solver internals for module M4 (okvis_port/c/check_ok_solve.c), active
+ only with OKVIS_PORT_SOLVE_DUMP_DIR (file solve.bin; OKVIS_PORT_SOLVE_EVERY / OKVIS_PORT_SOLVE_FULL_EVERY /
+ OKVIS_PORT_SOLVE_SPARSE_FULL_EVERY select the sampling level). okvis side (ViGraph::optimise): options, a
+ Problem snapshot (parameter blocks, residual blocks with cost-function payloads, loss) and arming of the hooks;
+ Ceres side (external/ceres-solver): program order, reduced/reordered program, per-iteration summary and
+ minimizer vectors, Dogleg / Gauss-Newton internals, Schur structure, the reduced dense system, the sparse J^T J
+ system, raw outputs of not-yet-ported cost functions (ORACLE), termination. Observational only: no computed value
+ changes (trajectories byte-identical). Record layouts: okvis_port/c/ok_solve.h.
+diff --git a/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h b/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h
+new file mode 100644
+index 0000000..91d2679
+--- /dev/null
++++ b/external/ceres-solver/include/ceres/okvis_port_solve_hooks.h
+@@ -0,0 +1,76 @@
++/* okvis_port reference instrumentation (NOT upstream code, patch 0008): per-Solve() dump of the Ceres problem
++ * snapshot and of the trust-region / Dogleg / linear-solver internals, used by okvis_port/c/check_ok_solve.c.
++ * Active only while okvis::ViGraph::optimise arms it (OKVIS_PORT_SOLVE_DUMP_DIR set). Purely observational:
++ * nothing here changes a computed value. The global state is defined in internal/ceres/solver.cc.
++ *
++ * Stream solve.bin = sequence of framed records: u32 tag, u64 payload length, payload (native endian).
++ * Record layouts are documented in okvis_port/c/ok_solve.h.
++ */
++#ifndef CERES_OKVIS_PORT_SOLVE_HOOKS_H_
++#define CERES_OKVIS_PORT_SOLVE_HOOKS_H_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <unordered_set>
++#include <vector>
++
++namespace okvis_port_solve {
++
++enum Record : uint32_t {
++  R_SOLVE = 1,    // ViGraph::optimise: options + sampling level
++  R_PROBLEM = 2,  // ViGraph::optimise: Problem snapshot (parameter blocks, residual blocks, cost-function payloads)
++  R_REDUCED = 3,  // solver.cc: reduced program order after preprocessing/reordering
++  R_ITER = 4,     // trust_region_minimizer.cc: one record per iteration (summary + internals)
++  R_DOGLEG = 5,   // dogleg_strategy.cc: ComputeTraditionalDoglegStep
++  R_GN = 6,       // dogleg_strategy.cc: ComputeGaussNewtonStep (mu loop)
++  R_SCHUR = 7,    // schur_complement_solver.cc: detected structure / eliminator kind (once per Solve)
++  R_DENSE = 8,    // schur_complement_solver.cc: reduced dense system (lhs, rhs, solution)
++  R_SPARSE = 9,   // sparse_normal_cholesky_solver.cc: J^T J (CRS), rhs, solution
++  R_ORACLE = 10,  // residual_block.cc: raw cost-function outputs of not-yet-ported terms
++  R_END = 11,     // solver.cc: termination, final cost, parameter hash
++  R_PROGRAM = 12  // solver.cc: the Problem program order of parameter / residual blocks before preprocessing
++};
++
++struct Buf {
++  std::vector<char> b;
++  void raw(const void* p, size_t n) { const char* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
++  void u32(uint32_t v) { raw(&v, 4); }
++  void i32(int32_t v) { raw(&v, 4); }
++  void u64(uint64_t v) { raw(&v, 8); }
++  void f64(double v) { raw(&v, 8); }
++  void f64n(const double* p, size_t n) { raw(p, 8 * n); }
++  void i32n(const int* p, size_t n) { raw(p, 4 * n); }
++};
++
++inline uint64_t fnv(const void* p, size_t n) {
++  const unsigned char* c = static_cast<const unsigned char*>(p);
++  uint64_t h = 1469598103934665603ULL;
++  for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ULL; }
++  return h;
++}
++inline uint64_t fnvd(const double* p, size_t n) { return fnv(p, 8 * n); }
++
++struct State {
++  FILE* f = nullptr;
++  bool enabled = false;  // OKVIS_PORT_SOLVE_DUMP_DIR set and file open
++  bool armed = false;    // inside ViGraph::optimise's ::ceres::Solve
++  int level = 0;         // 0: per-iteration summary only; 1: + snapshot and hashes; 2: + full vectors
++  uint64_t solve_id = 0;
++  std::unordered_set<const void*> oracle;  // cost functions whose raw Evaluate outputs are recorded
++  bool reuse = false;    // DoglegStrategy: ComputeStep took the reuse branch
++  int mu_increases = 0;  // DoglegStrategy: number of mu increases in the last ComputeGaussNewtonStep
++  bool on(int min_level) const { return enabled && armed && level >= min_level; }
++  void write(uint32_t rec, const Buf& b) {
++    if (!f) return;
++    const uint64_t n = b.b.size();
++    std::fwrite(&rec, 4, 1, f);
++    std::fwrite(&n, 8, 1, f);
++    if (n) std::fwrite(b.b.data(), 1, n, f);
++  }
++};
++extern State g;
++
++}  // namespace okvis_port_solve
++
++#endif  // CERES_OKVIS_PORT_SOLVE_HOOKS_H_
+diff --git a/external/ceres-solver/internal/ceres/dogleg_strategy.cc b/external/ceres-solver/internal/ceres/dogleg_strategy.cc
+index 877d8d9..b235e6d 100644
+--- a/external/ceres-solver/internal/ceres/dogleg_strategy.cc
++++ b/external/ceres-solver/internal/ceres/dogleg_strategy.cc
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/dogleg_strategy.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -75,6 +76,25 @@ DoglegStrategy::DoglegStrategy(const TrustRegionStrategy::Options& options)
+ // gradient) and the new Gauss-Newton step are computed from
+ // scratch. The Dogleg step is then computed as interpolation of these
+ // two vectors.
++// okvis_port (patch 0008): record the strategy state after ComputeStep (members are read, nothing is changed).
++#define okvis_port_dogleg_record(REUSE, TERM, STEP)                                                      \
++  if (okvis_port_solve::g.on(1)) {                                                                       \
++    okvis_port_solve::Buf b;                                                                             \
++    const int nn = int(gradient_.rows());                                                                \
++    b.u32((REUSE) ? 1u : 0u); b.u32(uint32_t(TERM)); b.f64(radius_); b.f64(mu_); b.f64(alpha_);          \
++    b.f64(dogleg_step_norm_); b.f64(gradient_.norm()); b.f64(gauss_newton_step_.norm()); b.u32(uint32_t(nn)); \
++    b.u64(okvis_port_solve::fnvd(gradient_.data(), size_t(nn)));                                         \
++    b.u64(okvis_port_solve::fnvd(gauss_newton_step_.data(), size_t(nn)));                                \
++    b.u64(okvis_port_solve::fnvd(diagonal_.data(), size_t(nn)));                                         \
++    const bool okstep = (REUSE) || (TERM) == int(LinearSolverTerminationType::SUCCESS);                  \
++    b.u64(okstep ? okvis_port_solve::fnvd(STEP, size_t(nn)) : 0ULL);                                      \
++    if (okvis_port_solve::g.on(2)) {                                                                     \
++      b.f64n(gradient_.data(), size_t(nn)); b.f64n(gauss_newton_step_.data(), size_t(nn));               \
++      b.f64n(diagonal_.data(), size_t(nn)); if (okstep) b.f64n(STEP, size_t(nn));                       \
++    }                                                                                                    \
++    okvis_port_solve::g.write(okvis_port_solve::R_DOGLEG, b);                                            \
++  }
++
+ TrustRegionStrategy::Summary DoglegStrategy::ComputeStep(
+     const TrustRegionStrategy::PerSolveOptions& per_solve_options,
+     SparseMatrix* jacobian,
+@@ -84,6 +104,7 @@ TrustRegionStrategy::Summary DoglegStrategy::ComputeStep(
+   CHECK(residuals != nullptr);
+   CHECK(step != nullptr);
+ 
++  okvis_port_solve::g.reuse = reuse_;  // okvis_port
+   const int n = jacobian->num_cols();
+   if (reuse_) {
+     // Gauss-Newton and gradient vectors are always available, only a
+@@ -98,6 +119,7 @@ TrustRegionStrategy::Summary DoglegStrategy::ComputeStep(
+         ComputeSubspaceDoglegStep(step);
+         break;
+     }
++    okvis_port_dogleg_record(true, 0, step);  // okvis_port
+     TrustRegionStrategy::Summary summary;
+     summary.num_iterations = 0;
+     summary.termination_type = LinearSolverTerminationType::SUCCESS;
+@@ -162,6 +184,7 @@ TrustRegionStrategy::Summary DoglegStrategy::ComputeStep(
+     }
+   }
+ 
++  okvis_port_dogleg_record(false, int(summary.termination_type), step);  // okvis_port
+   return summary;
+ }
+ 
+@@ -540,6 +563,7 @@ LinearSolver::Summary DoglegStrategy::ComputeGaussNewtonStep(
+   // When a step is declared successful, the multiplier is decreased
+   // by half of mu_increase_factor_.
+ 
++  okvis_port_solve::g.mu_increases = 0;  // okvis_port
+   while (mu_ < max_mu_) {
+     // Dogleg, as far as I (sameeragarwal) understand it, requires a
+     // reasonably good estimate of the Gauss-Newton step. This means
+@@ -593,6 +617,7 @@ LinearSolver::Summary DoglegStrategy::ComputeGaussNewtonStep(
+         !IsArrayValid(n, gauss_newton_step_.data())) {
+       mu_ *= mu_increase_factor_;
+       VLOG(2) << "Increasing mu " << mu_;
++      ++okvis_port_solve::g.mu_increases;  // okvis_port
+       linear_solver_summary.termination_type =
+           LinearSolverTerminationType::FAILURE;
+       continue;
+@@ -600,6 +625,22 @@ LinearSolver::Summary DoglegStrategy::ComputeGaussNewtonStep(
+     break;
+   }
+ 
++  if (okvis_port_solve::g.on(1)) {  // okvis_port: Gauss-Newton step as returned by the linear solver
++    okvis_port_solve::Buf b;
++    b.u32(uint32_t(linear_solver_summary.termination_type));
++    b.u32(uint32_t(okvis_port_solve::g.mu_increases));
++    b.f64(mu_);
++    b.u32(uint32_t(n));
++    const bool ok = linear_solver_summary.termination_type != LinearSolverTerminationType::FAILURE &&
++                    linear_solver_summary.termination_type != LinearSolverTerminationType::FATAL_ERROR;
++    b.u64(ok ? okvis_port_solve::fnvd(gauss_newton_step_.data(), size_t(n)) : 0ULL);
++    b.u64(okvis_port_solve::fnvd(lm_diagonal_.data(), size_t(n)));
++    if (okvis_port_solve::g.on(2)) {
++      b.f64n(lm_diagonal_.data(), size_t(n));
++      if (ok) b.f64n(gauss_newton_step_.data(), size_t(n));
++    }
++    okvis_port_solve::g.write(okvis_port_solve::R_GN, b);
++  }
+   if (linear_solver_summary.termination_type !=
+       LinearSolverTerminationType::FAILURE) {
+     // The scaled Gauss-Newton step is D * GN:
+diff --git a/external/ceres-solver/internal/ceres/residual_block.cc b/external/ceres-solver/internal/ceres/residual_block.cc
+index f5ad125..b35d901 100644
+--- a/external/ceres-solver/internal/ceres/residual_block.cc
++++ b/external/ceres-solver/internal/ceres/residual_block.cc
+@@ -30,6 +30,7 @@
+ //         sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/residual_block.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -113,6 +114,27 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
+     return false;
+   }
+ 
++  if (okvis_port_solve::g.on(1) && okvis_port_solve::g.oracle.count(cost_function_)) {  // okvis_port: raw outputs
++    okvis_port_solve::Buf b;
++    b.u64(uint64_t(reinterpret_cast<uintptr_t>(this)));
++    uint64_t hp = 1469598103934665603ULL;
++    for (int i = 0; i < num_parameter_blocks; ++i) {
++      const uint64_t h1 = okvis_port_solve::fnvd(parameters[i], size_t(parameter_blocks_[i]->Size()));
++      hp ^= h1;
++      hp *= 1099511628211ULL;
++    }
++    b.u64(hp);
++    b.u32(eval_jacobians ? 1u : 0u);
++    b.u32(uint32_t(num_parameter_blocks));
++    for (int i = 0; i < num_parameter_blocks; ++i) b.u32(eval_jacobians && eval_jacobians[i] ? 1u : 0u);
++    b.u32(uint32_t(num_residuals));
++    b.f64n(residuals, size_t(num_residuals));
++    for (int i = 0; i < num_parameter_blocks; ++i)
++      if (eval_jacobians && eval_jacobians[i])
++        b.f64n(eval_jacobians[i], size_t(num_residuals) * size_t(parameter_blocks_[i]->Size()));
++    okvis_port_solve::g.write(okvis_port_solve::R_ORACLE, b);
++  }
++
+   if (!IsEvaluationValid(*this, parameters.data(), residuals, eval_jacobians)) {
+     // clang-format off
+     std::string message =
+diff --git a/external/ceres-solver/internal/ceres/schur_complement_solver.cc b/external/ceres-solver/internal/ceres/schur_complement_solver.cc
+index 7c4b234..228d8dd 100644
+--- a/external/ceres-solver/internal/ceres/schur_complement_solver.cc
++++ b/external/ceres-solver/internal/ceres/schur_complement_solver.cc
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/schur_complement_solver.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
+ 
+ #include <algorithm>
+ #include <ctime>
+@@ -127,6 +128,14 @@ LinearSolver::Summary SchurComplementSolver::SolveImpl(
+     } else {
+       eliminator_ = SchurEliminatorBase::Create(options_);
+     }
++    if (okvis_port_solve::g.on(1)) {  // okvis_port: detected structure / eliminator kind
++      okvis_port_solve::Buf b;
++      b.i32(options_.row_block_size); b.i32(options_.e_block_size); b.i32(options_.f_block_size);
++      b.u32(uint32_t(num_eliminate_blocks)); b.u32(uint32_t(num_f_blocks));
++      b.u32((options_.row_block_size == 2 && options_.e_block_size == 3 && options_.f_block_size == 6 && num_f_blocks == 1) ? 1u : 0u);
++      b.u32(uint32_t(bs->cols.size())); b.u32(uint32_t(bs->rows.size()));
++      okvis_port_solve::g.write(okvis_port_solve::R_SCHUR, b);
++    }
+ 
+     CHECK(eliminator_);
+     const bool kFullRankETE = true;
+@@ -195,9 +204,24 @@ LinearSolver::Summary DenseSchurComplementSolver::SolveReducedLinearSystem(
+     return summary;
+   }
+ 
++  okvis_port_solve::Buf okb;  // okvis_port: reduced dense system before the (in-place) factorisation
++  const bool okon = okvis_port_solve::g.on(1);
++  if (okon) {
++    okb.u32(uint32_t(num_rows));
++    okb.u64(okvis_port_solve::fnvd(m->values(), size_t(num_rows) * size_t(num_rows)));
++    okb.u64(okvis_port_solve::fnvd(rhs().data(), size_t(num_rows)));
++    if (okvis_port_solve::g.on(2)) { okb.f64n(m->values(), size_t(num_rows) * size_t(num_rows)); okb.f64n(rhs().data(), size_t(num_rows)); }
++  }
+   summary.num_iterations = 1;
+   summary.termination_type = cholesky_->FactorAndSolve(
+       num_rows, m->mutable_values(), rhs().data(), solution, &summary.message);
++  if (okon) {
++    okb.u32(uint32_t(summary.termination_type));
++    const bool ok = summary.termination_type == LinearSolverTerminationType::SUCCESS;
++    okb.u64(ok ? okvis_port_solve::fnvd(solution, size_t(num_rows)) : 0ULL);
++    if (ok && okvis_port_solve::g.on(2)) okb.f64n(solution, size_t(num_rows));
++    okvis_port_solve::g.write(okvis_port_solve::R_DENSE, okb);
++  }
+   return summary;
+ }
+ 
+diff --git a/external/ceres-solver/internal/ceres/solver.cc b/external/ceres-solver/internal/ceres/solver.cc
+index b72661c..f3d7486 100644
+--- a/external/ceres-solver/internal/ceres/solver.cc
++++ b/external/ceres-solver/internal/ceres/solver.cc
+@@ -30,6 +30,10 @@
+ //         sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/solver.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
++#include "ceres/parameter_block.h"
++#include "ceres/residual_block.h"
++namespace okvis_port_solve { State g; }
+ 
+ #include <algorithm>
+ #include <map>
+@@ -760,6 +764,15 @@ void Solver::Solve(const Solver::Options& options,
+   // values provided by the user.
+   program->SetParameterBlockStatePtrsToUserStatePtrs();
+ 
++  if (okvis_port_solve::g.on(1)) {  // okvis_port: the Problem's program order (ParameterMap is pointer-sorted)
++    okvis_port_solve::Buf b;
++    b.u32(uint32_t(program->NumParameterBlocks()));
++    for (const auto* pb : program->parameter_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(pb->user_state())));
++    b.u32(uint32_t(program->NumResidualBlocks()));
++    for (const auto* rb : program->residual_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(rb)));
++    okvis_port_solve::g.write(okvis_port_solve::R_PROGRAM, b);
++  }
++
+   // The main thread also does work so we only need to launch num_threads - 1.
+   problem_impl->context()->EnsureMinimumThreads(options.num_threads - 1);
+ 
+@@ -769,6 +782,22 @@ void Solver::Solve(const Solver::Options& options,
+   const bool status =
+       preprocessor->Preprocess(modified_options, problem_impl, &pp);
+ 
++  if (okvis_port_solve::g.on(1)) {  // okvis_port: reduced program order after preprocessing / reordering
++    okvis_port_solve::Buf b;
++    b.u32(status ? 1u : 0u);
++    b.f64(pp.fixed_cost);
++    b.u32(uint32_t(pp.evaluator_options.num_eliminate_blocks));
++    b.u32(uint32_t(pp.linear_solver_options.type));
++    const internal::Program* rp = pp.reduced_program.get();
++    b.u32(rp ? uint32_t(rp->NumParameterBlocks()) : 0u);
++    if (rp) for (const auto* pb : rp->parameter_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(pb->user_state())));
++    b.u32(rp ? uint32_t(rp->NumResidualBlocks()) : 0u);
++    if (rp) for (const auto* rb : rp->residual_blocks()) b.u64(uint64_t(reinterpret_cast<uintptr_t>(rb)));
++    b.u32(uint32_t(pp.removed_parameter_blocks.size()));
++    for (const double* q : pp.removed_parameter_blocks) b.u64(uint64_t(reinterpret_cast<uintptr_t>(q)));
++    okvis_port_solve::g.write(okvis_port_solve::R_REDUCED, b);
++  }
++
+   // We check the linear_solver_options.type rather than
+   // modified_options.linear_solver_type because, depending on the
+   // lack of a Schur structure, the preprocessor may change the linear
+@@ -826,6 +855,27 @@ void Solver::Solve(const Solver::Options& options,
+     summary->message = gradient_checking_callback.error_log();
+   }
+ 
++  if (okvis_port_solve::g.on(0)) {  // okvis_port: termination + hash of the final parameters
++    okvis_port_solve::Buf b;
++    b.u32(uint32_t(summary->termination_type));
++    b.u32(uint32_t(summary->iterations.size()));
++    b.f64(summary->initial_cost);
++    b.f64(summary->final_cost);
++    b.f64(summary->fixed_cost);
++    std::vector<double*> pbs;
++    problem->GetParameterBlocks(&pbs);
++    uint64_t h = 1469598103934665603ULL;
++    for (double* q : pbs) {
++      const uint64_t hp = okvis_port_solve::fnvd(q, size_t(problem->ParameterBlockSize(q)));
++      h ^= hp;
++      h *= 1099511628211ULL;
++    }
++    b.u64(h);
++    b.u32(uint32_t(pbs.size()));
++    b.u32(uint32_t(summary->num_successful_steps));
++    b.u32(uint32_t(summary->num_unsuccessful_steps));
++    okvis_port_solve::g.write(okvis_port_solve::R_END, b);
++  }
+   summary->total_time_in_seconds = WallTimeInSeconds() - start_time;
+ }
+ 
+diff --git a/external/ceres-solver/internal/ceres/sparse_normal_cholesky_solver.cc b/external/ceres-solver/internal/ceres/sparse_normal_cholesky_solver.cc
+index 5746509..b4f0a44 100644
+--- a/external/ceres-solver/internal/ceres/sparse_normal_cholesky_solver.cc
++++ b/external/ceres-solver/internal/ceres/sparse_normal_cholesky_solver.cc
+@@ -29,6 +29,7 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/sparse_normal_cholesky_solver.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -100,11 +101,33 @@ LinearSolver::Summary SparseNormalCholeskySolver::SolveImpl(
+     A->DeleteRowBlocks(A->block_structure()->cols.size());
+   }
+ 
++  okvis_port_solve::Buf okb;  // okvis_port: J^T J (CRS as handed to the sparse Cholesky), rhs
++  const bool okon = okvis_port_solve::g.on(1);
++  if (okon) {
++    const CompressedRowSparseMatrix* jtj = inner_product_computer_->mutable_result();
++    okb.u32(uint32_t(num_cols)); okb.u32(uint32_t(jtj->num_nonzeros())); okb.u32(uint32_t(jtj->storage_type()));
++    okb.u32(uint32_t(sparse_cholesky_->StorageType()));
++    okb.u64(okvis_port_solve::fnvd(jtj->values(), size_t(jtj->num_nonzeros())));
++    okb.u64(okvis_port_solve::fnvd(rhs_.data(), size_t(num_cols)));
++    okb.u64(okvis_port_solve::fnv(jtj->rows(), 4 * (size_t(jtj->num_rows()) + 1)));
++    okb.u64(okvis_port_solve::fnv(jtj->cols(), 4 * size_t(jtj->num_nonzeros())));
++    if (okvis_port_solve::g.on(2)) {
++      okb.i32n(jtj->rows(), size_t(jtj->num_rows()) + 1); okb.i32n(jtj->cols(), size_t(jtj->num_nonzeros()));
++      okb.f64n(jtj->values(), size_t(jtj->num_nonzeros())); okb.f64n(rhs_.data(), size_t(num_cols));
++    }
++  }
+   summary.termination_type = sparse_cholesky_->FactorAndSolve(
+       inner_product_computer_->mutable_result(),
+       rhs_.data(),
+       x,
+       &summary.message);
++  if (okon) {
++    okb.u32(uint32_t(summary.termination_type));
++    const bool ok = summary.termination_type == LinearSolverTerminationType::SUCCESS;
++    okb.u64(ok ? okvis_port_solve::fnvd(x, size_t(num_cols)) : 0ULL);
++    if (ok && okvis_port_solve::g.on(2)) okb.f64n(x, size_t(num_cols));
++    okvis_port_solve::g.write(okvis_port_solve::R_SPARSE, okb);
++  }
+   event_logger.AddEvent("SparseCholesky::FactorAndSolve");
+   return summary;
+ }
+diff --git a/external/ceres-solver/internal/ceres/trust_region_minimizer.cc b/external/ceres-solver/internal/ceres/trust_region_minimizer.cc
+index 2e2b74c..65df59c 100644
+--- a/external/ceres-solver/internal/ceres/trust_region_minimizer.cc
++++ b/external/ceres-solver/internal/ceres/trust_region_minimizer.cc
+@@ -29,6 +29,8 @@
+ // Author: sameeragarwal@google.com (Sameer Agarwal)
+ 
+ #include "ceres/trust_region_minimizer.h"
++#include "ceres/okvis_port_solve_hooks.h"  // okvis_port instrumentation (patch 0008)
++namespace { bool okvis_port_candidate_valid = false, okvis_port_delta_valid = false, okvis_port_step_valid = false; }
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -185,6 +187,7 @@ void TrustRegionMinimizer::Init(const Minimizer::Options& options,
+   x_cost_ = std::numeric_limits<double>::max();
+   minimum_cost_ = x_cost_;
+   model_cost_change_ = 0.0;
++  okvis_port_candidate_valid = okvis_port_delta_valid = okvis_port_step_valid = false;  // okvis_port
+ }
+ 
+ // 1. Project the initial solution onto the feasible set if needed.
+@@ -334,6 +337,36 @@ bool TrustRegionMinimizer::FinalizeIterationAndCheckIfMinimizerCanContinue() {
+ 
+   solver_summary_->iterations.push_back(iteration_summary_);
+ 
++  if (okvis_port_solve::g.on(0)) {  // okvis_port: per-iteration record (summary + minimizer internals)
++    okvis_port_solve::Buf b;
++    const IterationSummary& s = iteration_summary_;
++    b.u32(uint32_t(s.iteration)); b.f64(s.cost); b.f64(s.cost_change); b.f64(s.gradient_max_norm); b.f64(s.gradient_norm);
++    b.f64(s.step_norm); b.f64(s.relative_decrease); b.f64(s.trust_region_radius);
++    b.u32(s.step_is_valid ? 1u : 0u); b.u32(s.step_is_successful ? 1u : 0u); b.u32(s.step_is_nonmonotonic ? 1u : 0u);
++    b.f64(model_cost_change_); b.f64(okvis_port_candidate_valid ? candidate_cost_ : 0.0); b.f64(x_cost_); b.f64(minimum_cost_);
++    b.u32(uint32_t(num_parameters_)); b.u32(uint32_t(num_effective_parameters_)); b.u32(uint32_t(num_residuals_));
++    b.u32(okvis_port_candidate_valid ? 1u : 0u); b.u32(okvis_port_delta_valid ? 1u : 0u); b.u32(okvis_port_step_valid ? 1u : 0u);
++    if (okvis_port_solve::g.on(1)) {
++      b.u64(okvis_port_solve::fnvd(x_.data(), size_t(x_.size())));
++      b.u64(okvis_port_candidate_valid ? okvis_port_solve::fnvd(candidate_x_.data(), size_t(candidate_x_.size())) : 0ULL);
++      b.u64(okvis_port_delta_valid ? okvis_port_solve::fnvd(delta_.data(), size_t(delta_.size())) : 0ULL);
++      b.u64(okvis_port_step_valid ? okvis_port_solve::fnvd(trust_region_step_.data(), size_t(trust_region_step_.size())) : 0ULL);
++      b.u64(okvis_port_solve::fnvd(gradient_.data(), size_t(gradient_.size())));
++      b.u64(okvis_port_solve::fnvd(jacobian_scaling_.data(), size_t(jacobian_scaling_.size())));
++      b.u64(okvis_port_solve::fnvd(residuals_.data(), size_t(residuals_.size())));
++    }
++    if (okvis_port_solve::g.on(2)) {
++      b.f64n(x_.data(), size_t(x_.size()));
++      b.f64n(gradient_.data(), size_t(gradient_.size()));
++      b.f64n(jacobian_scaling_.data(), size_t(jacobian_scaling_.size()));
++      b.f64n(residuals_.data(), size_t(residuals_.size()));
++      if (okvis_port_step_valid) b.f64n(trust_region_step_.data(), size_t(trust_region_step_.size()));
++      if (okvis_port_delta_valid) b.f64n(delta_.data(), size_t(delta_.size()));
++      if (okvis_port_candidate_valid) b.f64n(candidate_x_.data(), size_t(candidate_x_.size()));
++    }
++    okvis_port_solve::g.write(okvis_port_solve::R_ITER, b);
++  }
++
+   if (!RunCallbacks(options_, iteration_summary_, solver_summary_)) {
+     return false;
+   }
+@@ -415,6 +448,7 @@ bool TrustRegionMinimizer::ComputeTrustRegionStep() {
+       LinearSolverTerminationType::FAILURE) {
+     return true;
+   }
++  okvis_port_step_valid = true;  // okvis_port: trust_region_step_ written by the strategy
+ 
+   // new_model_cost
+   //  = 1/2 [f + J * step]^2
+@@ -446,6 +480,7 @@ bool TrustRegionMinimizer::ComputeTrustRegionStep() {
+                    options_.num_threads,
+                    delta_,
+                    (trust_region_step_.array() * jacobian_scaling_.array()));
++    okvis_port_delta_valid = true;  // okvis_port
+     num_consecutive_invalid_steps_ = 0;
+   }
+ 
+@@ -770,6 +805,7 @@ bool TrustRegionMinimizer::FunctionToleranceReached() {
+ // consider it to be a point with very high cost. This allows the user to deal
+ // with edge cases/constraints as part of the Manifold and CostFunction objects.
+ void TrustRegionMinimizer::ComputeCandidatePointAndEvaluateCost() {
++  okvis_port_candidate_valid = true;  // okvis_port
+   if (!evaluator_->Plus(x_.data(), delta_.data(), candidate_x_.data())) {
+     if (is_not_silent_) {
+       LOG(WARNING) << "x_plus_delta = Plus(x, delta) failed. "
+diff --git a/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp b/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp
+index 42232de..c921a96 100644
+--- a/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp
++++ b/okvis_ceres/include/okvis/ceres/HomogeneousPointError.hpp
+@@ -23,6 +23,7 @@
+ #include <ceres/sized_cost_function.h>
+ #include <Eigen/Core>
+ #include <okvis/ceres/ErrorInterface.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation (patch 0008)
+ #include <okvis/assert_macros.hpp>
+ 
+ /// \brief okvis Main namespace of this package.
+@@ -145,6 +146,13 @@ class HomogeneousPointError : public ::ceres::SizedCostFunction<
+   }
+ 
+   /// @brief Return parameter block type as string
++  /// okvis_port (patch 0008): solver-dump snapshot: measurement, u32 n, information_ and squareRootInformation_ (row-major).
++  void portDump(okvis_portk::Buf& b) const {
++    b.f64n(measurement_.data(), 4);
++    b.u32(uint32_t(information_.rows()));
++    for (int r = 0; r < information_.rows(); ++r) for (int c = 0; c < information_.cols(); ++c) b.f64(information_(r, c));
++    for (int r = 0; r < _squareRootInformation.rows(); ++r) for (int c = 0; c < _squareRootInformation.cols(); ++c) b.f64(_squareRootInformation(r, c));
++  }
+   virtual std::string typeInfo() const override final {
+     return "HomogeneousPointError";
+   }
+diff --git a/okvis_ceres/include/okvis/ceres/PoseError.hpp b/okvis_ceres/include/okvis/ceres/PoseError.hpp
+index 6048bf7..9912257 100644
+--- a/okvis_ceres/include/okvis/ceres/PoseError.hpp
++++ b/okvis_ceres/include/okvis/ceres/PoseError.hpp
+@@ -26,6 +26,7 @@
+ #include <okvis/kinematics/Transformation.hpp>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/ceres/ErrorInterface.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation (patch 0008)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -160,6 +161,13 @@ class PoseError : public ::ceres::SizedCostFunction<6 /* number of residuals */,
+   }
+ 
+   /// @brief Return parameter block type as string
++  /// okvis_port (patch 0008): solver-dump snapshot: measurement, u32 n, information_ and squareRootInformation_ (row-major).
++  void portDump(okvis_portk::Buf& b) const {
++    b.f64n(measurement_.coeffs().data(), 7);
++    b.u32(uint32_t(information_.rows()));
++    for (int r = 0; r < information_.rows(); ++r) for (int c = 0; c < information_.cols(); ++c) b.f64(information_(r, c));
++    for (int r = 0; r < squareRootInformation_.rows(); ++r) for (int c = 0; c < squareRootInformation_.cols(); ++c) b.f64(squareRootInformation_(r, c));
++  }
+   virtual std::string typeInfo() const override final {
+     return "PoseError";
+   }
+diff --git a/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp b/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp
+index d60382f..6814c47 100644
+--- a/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp
++++ b/okvis_ceres/include/okvis/ceres/RelativePoseError.hpp
+@@ -26,6 +26,7 @@
+ #include <okvis/kinematics/Transformation.hpp>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/ceres/ErrorInterface.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation (patch 0008)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -138,6 +139,13 @@ class RelativePoseError : public ::ceres::SizedCostFunction<
+   }
+ 
+   /// @brief Residual block type as string
++  /// okvis_port (patch 0008): solver-dump snapshot: measurement, u32 n, information_ and squareRootInformation_ (row-major).
++  void portDump(okvis_portk::Buf& b) const {
++    b.f64n(T_AB_.coeffs().data(), 7);
++    b.u32(uint32_t(information_.rows()));
++    for (int r = 0; r < information_.rows(); ++r) for (int c = 0; c < information_.cols(); ++c) b.f64(information_(r, c));
++    for (int r = 0; r < squareRootInformation_.rows(); ++r) for (int c = 0; c < squareRootInformation_.cols(); ++c) b.f64(squareRootInformation_(r, c));
++  }
+   virtual std::string typeInfo() const override final {
+     return "RelativePoseError";
+   }
+diff --git a/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp b/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp
+index ac1a42a..442db87 100644
+--- a/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp
++++ b/okvis_ceres/include/okvis/ceres/ReprojectionError.hpp
+@@ -170,6 +170,12 @@ class ReprojectionError : public ReprojectionError2dBase
+   }
+ 
+   /// @brief Residual block type as string
++  /// okvis_port (patch 0008): solver-dump snapshot: camera header, measurement[2], information_ (row-major 2x2).
++  virtual void portDump(okvis_portk::Buf& b) const override final {
++    cameraGeometry_->portHeader(b);
++    b.f64n(measurement_.data(), 2);
++    for (int r = 0; r < 2; ++r) for (int c = 0; c < 2; ++c) b.f64(information_(r, c));
++  }
+   virtual std::string typeInfo() const override final
+   {
+     return "ReprojectionError";
+diff --git a/okvis_ceres/include/okvis/ceres/ReprojectionErrorBase.hpp b/okvis_ceres/include/okvis/ceres/ReprojectionErrorBase.hpp
+index 64a1204..2018940 100644
+--- a/okvis_ceres/include/okvis/ceres/ReprojectionErrorBase.hpp
++++ b/okvis_ceres/include/okvis/ceres/ReprojectionErrorBase.hpp
+@@ -22,6 +22,7 @@
+ #include <ceres/sized_cost_function.h>
+ 
+ #include <okvis/ceres/ErrorInterface.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation (patch 0008)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -81,6 +82,8 @@ class ReprojectionError2dBase_ : public ReprojectionErrorBase_<T...> {
+   /// \brief Get the measurement.
+   /// \return The measurement vector (2d).
+   virtual const measurement_t& measurement() const = 0;
++  /// okvis_port (patch 0008): solver-dump snapshot (camera header, measurement, information row-major).
++  virtual void portDump(okvis_portk::Buf& b) const = 0;
+ 
+   /// \brief Get the information matrix.
+   /// \return The information (weight) matrix (2x2).
+diff --git a/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp b/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp
+index 72220db..de54563 100644
+--- a/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp
++++ b/okvis_ceres/include/okvis/ceres/SpeedAndBiasError.hpp
+@@ -27,6 +27,7 @@
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/FrameTypedefs.hpp>
+ #include <okvis/ceres/ErrorInterface.hpp>
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation (patch 0008)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -157,6 +158,13 @@ class SpeedAndBiasError : public ::ceres::SizedCostFunction<
+   }
+ 
+   /// @brief Residual block type as string
++  /// okvis_port (patch 0008): solver-dump snapshot: measurement, u32 n, information_ and squareRootInformation_ (row-major).
++  void portDump(okvis_portk::Buf& b) const {
++    b.f64n(measurement_.data(), 9);
++    b.u32(uint32_t(information_.rows()));
++    for (int r = 0; r < information_.rows(); ++r) for (int c = 0; c < information_.cols(); ++c) b.f64(information_(r, c));
++    for (int r = 0; r < squareRootInformation_.rows(); ++r) for (int c = 0; c < squareRootInformation_.cols(); ++c) b.f64(squareRootInformation_(r, c));
++  }
+   virtual std::string typeInfo() const override final {
+     return "SpeedAndBiasError";
+   }
+diff --git a/okvis_ceres/src/ViGraph.cpp b/okvis_ceres/src/ViGraph.cpp
+index f471970..1a6f019 100644
+--- a/okvis_ceres/src/ViGraph.cpp
++++ b/okvis_ceres/src/ViGraph.cpp
+@@ -17,6 +17,11 @@
+  */
+ 
+ #include <okvis/ViGraph.hpp>
++#include <ceres/okvis_port_solve_hooks.h>  // okvis_port instrumentation (patch 0008)
++#include <okvis/ceres/OkvisPortDump.hpp>
++#include <okvis/ceres/HomogeneousPointError.hpp>
++#include <okvis/ceres/TwoPoseExtrinsicsGraphError.hpp>
++#include <unordered_map>
+ #include <okvis/assert_macros.hpp>
+ #include <okvis/timing/Timer.hpp>
+ #include <cstdio>
+@@ -1848,6 +1853,40 @@ void ViGraph::updateLandmarks()
+   }
+ }
+ 
++// okvis_port (patch 0008): Problem snapshot helpers for the solver dump (okvis_port/c/ok_solve.h documents the layout).
++namespace {
++uint32_t portCostType(const ::ceres::CostFunction* cf, bool& oracle) {
++  oracle = false;
++  if (dynamic_cast<const okvis::ceres::ReprojectionError2dBase*>(cf)) return 1;
++  if (dynamic_cast<const okvis::ceres::ImuError*>(cf)) return 2;
++  if (dynamic_cast<const okvis::ceres::PoseError*>(cf)) return 3;
++  if (dynamic_cast<const okvis::ceres::SpeedAndBiasError*>(cf)) return 4;
++  if (dynamic_cast<const okvis::ceres::RelativePoseError*>(cf)) return 5;
++  if (dynamic_cast<const okvis::ceres::HomogeneousPointError*>(cf)) return 6;
++  oracle = true;  // not ported yet: raw Evaluate outputs are recorded (R_ORACLE)
++  if (dynamic_cast<const okvis::ceres::TwoPoseGraphError*>(cf)) return 7;
++  if (dynamic_cast<const okvis::ceres::TwoPoseGraphErrorConst*>(cf)) return 8;
++  if (dynamic_cast<const okvis::ceres::TwoPoseExtrinsicsGraphError*>(cf)) return 9;
++  if (dynamic_cast<const okvis::ceres::TwoPoseExtrinsicsGraphErrorConst*>(cf)) return 10;
++  return 0;
++}
++void portCostPayload(uint32_t type, const ::ceres::CostFunction* cf, okvis_port_solve::Buf& out) {
++  okvis_portk::Buf b;
++  switch (type) {
++    case 1: dynamic_cast<const okvis::ceres::ReprojectionError2dBase*>(cf)->portDump(b); break;
++    case 2: { okvis_port::Buf ib; dynamic_cast<const okvis::ceres::ImuError*>(cf)->portSnapshotImpl(ib, true, true);
++              b.raw(ib.b.data(), ib.b.size()); break; }
++    case 3: dynamic_cast<const okvis::ceres::PoseError*>(cf)->portDump(b); break;
++    case 4: dynamic_cast<const okvis::ceres::SpeedAndBiasError*>(cf)->portDump(b); break;
++    case 5: dynamic_cast<const okvis::ceres::RelativePoseError*>(cf)->portDump(b); break;
++    case 6: dynamic_cast<const okvis::ceres::HomogeneousPointError*>(cf)->portDump(b); break;
++    default: break;
++  }
++  out.u64(uint64_t(b.b.size()));
++  out.raw(b.b.data(), b.b.size());
++}
++}  // namespace
++
+ #ifdef USE_OPENMP
+ void ViGraph::optimise(int maxIterations, int numThreads, bool verbose)
+ #else
+@@ -1933,8 +1972,104 @@ void ViGraph::optimise(int maxIterations, int /*numThreads*/, bool verbose)
+ 
+   okvis_port::traceEvent("OPT %llu solver=%d", portCall, int(options_.linear_solver_type));
+ 
++  // okvis_port solve dump (patch 0008): options + Problem snapshot, then arm the Ceres-side hooks
++  {
++    okvis_port_solve::State& S = okvis_port_solve::g;
++    static bool sInit = false;
++    static uint64_t sRealtime = 0, sSparse = 0, sLevel1 = 0;
++    static long sEvery = 1, sFullEvery = 0, sSparseFullEvery = 10;
++    if (!sInit) {
++      sInit = true;
++      const char* d = std::getenv("OKVIS_PORT_SOLVE_DUMP_DIR");
++      if (d) {
++        S.f = std::fopen((std::string(d) + "/solve.bin").c_str(), "wb");
++        S.enabled = S.f != nullptr;
++        if (const char* e = std::getenv("OKVIS_PORT_SOLVE_EVERY")) sEvery = std::atol(e);
++        if (const char* e = std::getenv("OKVIS_PORT_SOLVE_FULL_EVERY")) sFullEvery = std::atol(e);
++        if (const char* e = std::getenv("OKVIS_PORT_SOLVE_SPARSE_FULL_EVERY")) sSparseFullEvery = std::atol(e);
++      }
++    }
++    if (S.enabled) {
++      const bool sparse = options_.linear_solver_type == ::ceres::SPARSE_NORMAL_CHOLESKY;
++      int level = 0;
++      if (sparse) {
++        level = 1;
++        if (sSparseFullEvery > 0 && (sSparse % uint64_t(sSparseFullEvery)) == 0) level = 2;
++        sSparse++;
++      } else {
++        if (sEvery > 0 && (sRealtime % uint64_t(sEvery)) == 0) {
++          level = 1;
++          if (sFullEvery > 0 && (sLevel1 % uint64_t(sFullEvery)) == 0) level = 2;
++          sLevel1++;
++        }
++        sRealtime++;
++      }
++      S.level = level;
++      S.solve_id++;
++      S.oracle.clear();
++      okvis_port_solve::Buf b;
++      b.u64(S.solve_id); b.u32(uint32_t(level));
++      b.u32(uint32_t(options_.linear_solver_type)); b.u32(uint32_t(options_.trust_region_strategy_type));
++      b.u32(uint32_t(options_.dogleg_type)); b.u32(uint32_t(options_.max_num_iterations)); b.u32(uint32_t(options_.num_threads));
++      b.f64(options_.function_tolerance); b.f64(options_.gradient_tolerance); b.f64(options_.parameter_tolerance);
++      b.f64(options_.initial_trust_region_radius); b.f64(options_.max_trust_region_radius); b.f64(options_.min_trust_region_radius);
++      b.f64(options_.min_relative_decrease); b.f64(options_.min_lm_diagonal); b.f64(options_.max_lm_diagonal);
++      b.u32(options_.jacobi_scaling ? 1u : 0u); b.u32(options_.use_nonmonotonic_steps ? 1u : 0u);
++      b.u32(uint32_t(options_.max_num_consecutive_invalid_steps));
++      b.u32(uint32_t(options_.linear_solver_ordering_type)); b.u32(uint32_t(options_.sparse_linear_algebra_library_type));
++      b.u32(uint32_t(options_.dense_linear_algebra_library_type)); b.u32(options_.linear_solver_ordering ? 1u : 0u);
++      b.u32(uint32_t(options_.callbacks.size())); b.u32(options_.use_inner_iterations ? 1u : 0u);
++      b.u32(options_.dynamic_sparsity ? 1u : 0u); b.u32(uint32_t(options_.minimizer_type));
++      b.u32(uint32_t(options_.preconditioner_type)); b.u32(options_.use_explicit_schur_complement ? 1u : 0u);
++      b.u32(uint32_t(options_.max_num_refinement_iterations)); b.u32(options_.use_mixed_precision_solves ? 1u : 0u);
++      S.write(okvis_port_solve::R_SOLVE, b);
++      if (level >= 1) {
++        okvis_port_solve::Buf p;
++        std::vector<double*> pbs;
++        problem_->GetParameterBlocks(&pbs);
++        std::unordered_map<const double*, uint32_t> pidx;
++        p.u32(uint32_t(pbs.size()));
++        for (size_t i = 0; i < pbs.size(); ++i) {
++          double* q = pbs[i];
++          pidx[q] = uint32_t(i);
++          const int size = problem_->ParameterBlockSize(q);
++          const ::ceres::Manifold* m = problem_->GetManifold(q);
++          uint32_t kind = 0;
++          if (dynamic_cast<const okvis::ceres::PoseManifold*>(m)) kind = 1;
++          else if (dynamic_cast<const okvis::ceres::HomogeneousPointManifold*>(m)) kind = 2;
++          else if (m) kind = 3;
++          p.u64(uint64_t(reinterpret_cast<uintptr_t>(q))); p.u32(uint32_t(size));
++          p.u32(uint32_t(problem_->ParameterBlockTangentSize(q))); p.u32(kind);
++          p.u32(problem_->IsParameterBlockConstant(q) ? 1u : 0u);
++          p.f64n(q, size_t(size));
++        }
++        std::vector<::ceres::ResidualBlockId> rbs;
++        problem_->GetResidualBlocks(&rbs);
++        p.u32(uint32_t(rbs.size()));
++        for (auto rb : rbs) {
++          const ::ceres::CostFunction* cf = problem_->GetCostFunctionForResidualBlock(rb);
++          const ::ceres::LossFunction* lf = problem_->GetLossFunctionForResidualBlock(rb);
++          bool oracle = false;
++          const uint32_t type = portCostType(cf, oracle);
++          if (oracle) S.oracle.insert(cf);
++          std::vector<double*> ps;
++          problem_->GetParameterBlocksForResidualBlock(rb, &ps);
++          p.u64(uint64_t(reinterpret_cast<uintptr_t>(rb))); p.u32(type);
++          p.u32(lf == nullptr ? 0u : (lf == cauchyLossFunctionPtr_.get() ? 1u : 2u));
++          p.u32(uint32_t(ps.size()));
++          for (double* q : ps) p.u32(pidx.at(q));
++          p.u32(uint32_t(cf->num_residuals()));
++          portCostPayload(type, cf, p);
++        }
++        S.write(okvis_port_solve::R_PROBLEM, p);
++      }
++      S.armed = true;
++    }
++  }
+   // call solver
+   ::ceres::Solve(options_, problem_.get(), &summary_);
++  okvis_port_solve::g.armed = false;  // okvis_port (patch 0008)
++  if (okvis_port_solve::g.f) std::fflush(okvis_port_solve::g.f);
+ 
+   if (portTrace) {
+     std::fprintf(portTrace, "solve %llu solver=%d states=%zu landmarks=%zu inputhash=%016llx obs=%016llx struct=%016llx nres=%d init=%.17g final=%.17g iters=%zu term=%d\n",

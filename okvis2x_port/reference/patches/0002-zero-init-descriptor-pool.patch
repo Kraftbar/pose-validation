@@ -1,0 +1,16 @@
+0002: zero-initialise the matcher's descriptor pool in Frontend::matchToMap (port of okvis_port patch 0002): upstream
+ allocates cv::Mat(3*numLandmarks,48,CV_8UC1) uninitialised and a landmark with no usable observation keeps garbage row 0.
+
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -1340,6 +1340,10 @@
+     const size_t numDescriptorsToKeep = 3; // use only best 3
+     descriptorPool[im] = cv::Mat(
+         int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
++    // DETERMINISTIC REFERENCE: upstream leaves this pool uninitialised, yet a landmark whose observations are all
++    // filtered out still keeps descriptor row 0 (rows = o + 1 with o = 0), which the matcher then compares against
++    // the keypoint descriptors: heap garbage => run-to-run nondeterministic matches.
++    descriptorPool[im].setTo(cv::Scalar(0));
+     uchar* dataPtr = descriptorPool[im].data;
+     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
+       if(loopClosureLandmarksToUseExclusively) {

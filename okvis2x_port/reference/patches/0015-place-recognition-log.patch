@@ -1,0 +1,261 @@
+0014: module M7d instrumentation (place recognition), active only with OKVIS_PORT_PLACE_DIR.
+ One file place.bin (framing as problem.bin) with the DBoW2 vocabulary tree as loaded (170), every database add (171: entry id,
+ frame id, feature count, BowVector), every getFilteredDBoWResult call (172: BowVector of the query, the unsorted query results,
+ the filtered state ids) and a stage record of every verifyRecognisedPlace call (173: exit code, match / landmark lists, counts,
+ distinctiveness average, RANSAC model, refined pose, Ceres summary, information matrix H); layouts in okvis_port/c/ok_dbow.h.
+ No computed value changes.
+
+diff --git a/external/DBoW2/include/DBoW2/TemplatedVocabulary.h b/external/DBoW2/include/DBoW2/TemplatedVocabulary.h
+index 6d8d621..019b770 100644
+--- a/external/DBoW2/include/DBoW2/TemplatedVocabulary.h
++++ b/external/DBoW2/include/DBoW2/TemplatedVocabulary.h
+@@ -234,6 +234,25 @@ public:
+    */
+   void load(const std::string &filename);
+   
++  /// okvis_port (patch 0014): raw dump of the loaded tree (k, L, weighting, scoring, then per node: id, parent, word id, weight,
++  /// children, descriptor bytes) as the Frontend instrumentation writes it; only instantiated for the 48-byte BRISK descriptors.
++  template <class Buf>
++  void portDump(Buf& b) const
++  {
++    b.u32(uint32_t(m_k)); b.u32(uint32_t(m_L)); b.u32(uint32_t(m_weighting)); b.u32(uint32_t(m_scoring));
++    b.u32(uint32_t(m_nodes.size())); b.u32(uint32_t(m_words.size()));
++    for(size_t i = 0; i < m_nodes.size(); ++i)
++    {
++      const Node& n = m_nodes[i];
++      b.u32(uint32_t(n.id)); b.u32(uint32_t(n.parent)); b.u32(uint32_t(n.word_id));
++      const double w = n.weight; b.f64n(&w, 1);
++      b.u32(uint32_t(n.children.size()));
++      for(size_t c = 0; c < n.children.size(); ++c) b.u32(uint32_t(n.children[c]));
++      b.u32(uint32_t(n.descriptor.size()));
++      if(!n.descriptor.empty()) b.raw(&n.descriptor[0], n.descriptor.size());
++    }
++  }
++
+   /** 
+    * Saves the vocabulary to a file storage structure
+    * @param fn node in file storage
+diff --git a/okvis_frontend/src/Frontend.cpp b/okvis_frontend/src/Frontend.cpp
+index 2db8b5c..e2b55c4 100755
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -166,6 +166,33 @@ static void portRansacOut(uint32_t kind, size_t numCorr, const R& r) {
+   portRansacWrite(162, b);
+ }
+ 
++
++// okvis_port (patch 0014): PLACE RECOGNITION log (OKVIS_PORT_PLACE_DIR/place.bin, framing as ransac.bin; layouts in
++// okvis_port/c/ok_dbow.h): 170 vocabulary tree, 171 database add, 172 query + filtered result, 173 verifyRecognisedPlace stages.
++// No numerical effect.
++static FILE* portPlaceFile() {
++  static FILE* f = []() -> FILE* {
++    const char* d = std::getenv("OKVIS_PORT_PLACE_DIR");
++    if (!d) return nullptr;
++    return std::fopen((std::string(d) + "/place.bin").c_str(), "wb");
++  }();
++  return f;
++}
++static void portPlaceWrite(uint32_t tag, const PortRansacBuf& b) {
++  FILE* f = portPlaceFile();
++  if (!f) return;
++  const uint64_t len = b.b.size();
++  std::fwrite(&tag, 4, 1, f);
++  std::fwrite(&len, 8, 1, f);
++  std::fwrite(b.b.data(), 1, b.b.size(), f);
++  std::fflush(f);
++}
++static uint64_t g_portPlaceFrame = 0;  // the multiframe id of the current place-recognition block
++static void portPutBow(PortRansacBuf& b, const DBoW2::BowVector& v) {
++  b.u32(uint32_t(v.size()));
++  for (const auto& it : v) { b.u32(uint32_t(it.first)); const double w = it.second; b.f64n(&w, 1); }
++}
++
+ static const double kptrad = 0.09;
+ //cv::Ptr<cv::CLAHE> mClahe;
+ 
+@@ -215,6 +242,11 @@ Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
+     featureDetectorMutexes_.push_back(std::unique_ptr<std::mutex>(new std::mutex()));
+   }
+   trackingLost_ = false;
++  if (portPlaceFile()) {  // okvis_port (patch 0014)
++    PortRansacBuf b;
++    dBow_->vocabulary.portDump(b);
++    portPlaceWrite(170, b);
++  }
+   initialiseBriskFeatureDetectors();
+ 
+ #ifdef OKVIS_USE_NN
+@@ -363,6 +395,25 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+                                      Eigen::Matrix<double, 6, 6>& H,
+                                      int minInliers)
+ {
++  // okvis_port (patch 0014): stage record of this call (tag 173), written at every exit
++  struct PortVerify { uint32_t ctr = 0, npoints = 0, ncorr = 0, ninl = 0, nfinal = 0, addOut = 0, ceresIters = 0, ceresTerm = 0, haveT0 = 0, haveT1 = 0, haveH = 0;
++                      double avg = 0.0, c0 = 0.0, c1 = 0.0, T0[7] = {0}, T1[7] = {0}, H[36] = {0}; } pv;
++  std::map<KeypointIdentifier, uint64_t> * portMatches = nullptr;
++  AlignedMap<LandmarkId, Eigen::Vector4d> * portLandmarks = nullptr;
++  auto portEnd = [&](uint32_t code) {
++    if (!portPlaceFile()) return;
++    PortRansacBuf pb;
++    const uint64_t fid = framesInOut->id(), oid = oldFrame->id();
++    pb.raw(&fid, 8); pb.raw(&oid, 8); pb.u32(uint32_t(minInliers)); pb.u32(code);
++    pb.u32(pv.ctr); pb.u32(pv.npoints); pb.u32(pv.ncorr); pb.u32(pv.ninl); pb.f64n(&pv.avg, 1);
++    pb.u32(pv.haveT0); pb.f64n(pv.T0, 7); pb.u32(pv.haveT1); pb.f64n(pv.T1, 7); pb.u32(pv.haveH); pb.f64n(pv.H, 36);
++    pb.u32(pv.addOut); pb.u32(pv.nfinal); pb.u32(pv.ceresIters); pb.u32(pv.ceresTerm); pb.f64n(&pv.c0, 1); pb.f64n(&pv.c1, 1);
++    pb.u32(uint32_t(portLandmarks ? portLandmarks->size() : 0));
++    if (portLandmarks) for (const auto& l : *portLandmarks) { const uint64_t id = l.first.value(); pb.raw(&id, 8); pb.f64n(l.second.data(), 4); }
++    pb.u32(uint32_t(portMatches ? portMatches->size() : 0));
++    if (portMatches) for (const auto& m : *portMatches) { pb.raw(&m.first.frameId, 8); pb.u32(uint32_t(m.first.cameraIndex)); pb.u32(uint32_t(m.first.keypointIndex)); pb.raw(&m.second, 8); }
++    portPlaceWrite(173, pb);
++  };
+   // geometric verification:
+   cameras::NCameraSystem::DistortionType distortionType = params.nCameraSystem.distortionType(0);
+   std::map<LandmarkId, std::vector<const uchar *>> descriptors;
+@@ -370,6 +421,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   int ctr = 0;
+   opengv::absolute_pose::LoopclosureNoncentralAbsoluteAdapter::Points points;
+   std::map<KeypointIdentifier, uint64_t> matches;
++  portMatches = &matches; portLandmarks = &landmarks;
+ 
+   // find matchable points
+   TimerSwitchable loopClosureDescriptorMatchingTimer("2.04 loop closure descriptor matching");
+@@ -446,7 +498,9 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+ 
+   loopClosureDescriptorMatchingTimer.stop();
+ 
++  pv.ctr = uint32_t(ctr); pv.npoints = uint32_t(points.size());
+   if (ctr < minInliers || points.size() < 8) {
++    portEnd(0);
+     return false;
+   }
+ 
+@@ -467,7 +521,9 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   ransac.max_iterations_ = 50;
+   // initial guess not needed...
+   // run the ransac
++  pv.ncorr = uint32_t(adapter.getNumberCorrespondences());
+   if (adapter.getNumberCorrespondences() < 7) {
++    portEnd(1);
+     return false;
+   }
+   TimerSwitchable ransacLoopClosureTimer("2.05 loop closure ransacking");
+@@ -480,7 +536,9 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+                              / double(adapter.getNumberCorrespondences());
+ 
+   ransacLoopClosureTimer.stop();
++  pv.ninl = uint32_t(numInliers);
+   if (numInliers < minInliers || inlierRatio < 0.7) {
++    portEnd(2);
+     return false;
+   }
+   // remember inliers
+@@ -528,9 +586,11 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   }
+ 
+   const float avg = sum / float(ransac.inliers_.size());
++  pv.avg = double(avg);
+   if (avg < 182.0 && ransac.inliers_.size() < 20) {
+     LOG(INFO) << framesInOut->id() << "->" << oldFrame->id() << " : "
+               << "Rejecting loop closure due to indistincive descriptors (" << avg << ")";
++    portEnd(3);
+     return false;
+   }
+ 
+@@ -540,6 +600,8 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   Eigen::Matrix4d T_Sold_Snew_mat = Eigen::Matrix4d::Identity();
+   T_Sold_Snew_mat.topLeftCorner<3, 4>() = ransac.model_coefficients_;
+   T_Sold_Snew = kinematics::Transformation(T_Sold_Snew_mat);
++  pv.haveT0 = 1; for (int i = 0; i < 3; ++i) pv.T0[i] = T_Sold_Snew.r()[i];
++  pv.T0[3] = T_Sold_Snew.q().x(); pv.T0[4] = T_Sold_Snew.q().y(); pv.T0[5] = T_Sold_Snew.q().z(); pv.T0[6] = T_Sold_Snew.q().w();
+ 
+   // set up ceres problem
+   ::ceres::Problem::Options problemOptions;
+@@ -663,6 +725,10 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   solverOptions.minimizer_progress_to_stdout = false;
+   ::ceres::Solve(solverOptions, &quickSolver, &summary);
+   T_Sold_Snew = pose->estimate();
++  pv.haveT1 = 1; for (int i = 0; i < 3; ++i) pv.T1[i] = T_Sold_Snew.r()[i];
++  pv.T1[3] = T_Sold_Snew.q().x(); pv.T1[4] = T_Sold_Snew.q().y(); pv.T1[5] = T_Sold_Snew.q().z(); pv.T1[6] = T_Sold_Snew.q().w();
++  pv.ceresIters = uint32_t(summary.iterations.size()); pv.ceresTerm = uint32_t(summary.termination_type);
++  pv.c0 = summary.initial_cost; pv.c1 = summary.final_cost;
+ 
+   // get uncertainty: lhs to be filled on the fly
+   H = Eigen::Matrix<double, 6, 6>::Zero();
+@@ -696,11 +762,15 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   const int numFinalInliers = int(ransac.inliers_.size())-additionalOutliers;
+   const double finalInlierRatio = double(numFinalInliers)
+                              / double(adapter.getNumberCorrespondences());
++  pv.haveH = 1; std::memcpy(pv.H, H.data(), sizeof(double) * 36);
++  pv.addOut = uint32_t(additionalOutliers); pv.nfinal = uint32_t(numFinalInliers);
+   if (numFinalInliers < minInliers || finalInlierRatio < 0.7) {
++    portEnd(4);
+     return false;
+   }
+ 
+   loopClosureRefinementTimer.stop();
++  portEnd(5);
+   return true;
+ }
+ 
+@@ -712,6 +782,17 @@ int Frontend::getFilteredDBoWResult(const std::unique_ptr<DBoW> &dBow,
+   DBoW2::QueryResults dBoWResult;
+   dBow->database.query(features, dBoWResult, -1); // get all matches
+   DBoW2::QueryResults dBoWResultOrig = dBoWResult;
++  PortRansacBuf portQuery;  // okvis_port (patch 0014)
++  if (portPlaceFile()) {
++    DBoW2::BowVector bv;
++    dBow->vocabulary.transform(features, bv);
++    portQuery.u32(dBow == dBow_ ? 0u : 1u);
++    portQuery.raw(&g_portPlaceFrame, 8); portQuery.u32(uint32_t(features.size()));
++    portPutBow(portQuery, bv);
++    portQuery.u32(uint32_t(dBow->database.size()));
++    portQuery.u32(uint32_t(dBoWResultOrig.size()));
++    for (const auto& r : dBoWResultOrig) { portQuery.u32(uint32_t(r.Id)); const double sc = r.Score; portQuery.f64n(&sc, 1); }
++  }
+   // sort ascending -- we want to match oldest...
+   std::sort(dBoWResult.begin(),
+             dBoWResult.end(),
+@@ -770,6 +851,11 @@ int Frontend::getFilteredDBoWResult(const std::unique_ptr<DBoW> &dBow,
+     stateIds.push_back(std::make_pair(StateId(poseId),p));
+   }
+ 
++  if (portPlaceFile()) {  // okvis_port (patch 0014)
++    portQuery.u32(uint32_t(stateIds.size()));
++    for (const auto& sid : stateIds) { const uint64_t v = sid.first.value(); portQuery.raw(&v, 8); const double pp = sid.second; portQuery.f64n(&pp, 1); }
++    portPlaceWrite(172, portQuery);
++  }
+   return stateIds.size();
+ }
+ 
+@@ -910,6 +996,7 @@ bool Frontend::dataAssociationAndInitialization(
+     for (uint64_t c = 0; c < componentDBows_.size(); ++c) {
+       TimerSwitchable matchDBoWTimer0("2.3.0 multi-session and multi-agent place recognition");
+       std::vector<std::pair<StateId, double>> stateIds;
++      g_portPlaceFrame = framesInOut->id();  // okvis_port (patch 0014)
+       getFilteredDBoWResult(componentDBows_.at(c), features, stateIds);
+       matchDBoWTimer0.stop();
+ 
+@@ -955,6 +1042,7 @@ bool Frontend::dataAssociationAndInitialization(
+       && !estimator.needsFullGraphOptimisation() && isInitialized_) {
+     TimerSwitchable matchDBoWTimer("2.03 loop closure query");
+     std::vector<std::pair<StateId, double>> stateIds;
++    g_portPlaceFrame = framesInOut->id();  // okvis_port (patch 0014)
+     getFilteredDBoWResult(dBow_, features, stateIds);
+     matchDBoWTimer.stop();
+     TimerSwitchable attemptLoopClosureTimer("2.07 attempt loop closure", true);
+@@ -1059,6 +1147,15 @@ bool Frontend::dataAssociationAndInitialization(
+     }
+     // if keyframe, we add to relocalisation database
+     if(*asKeyframe && !kfPrior) {
++      if (portPlaceFile()) {  // okvis_port (patch 0014)
++        DBoW2::BowVector bv;
++        dBow_->vocabulary.transform(features, bv);
++        PortRansacBuf b;
++        b.u32(uint32_t(dBow_->database.size())); const uint64_t fid = framesInOut->id(); b.raw(&fid, 8);
++        b.u32(uint32_t(features.size()));
++        portPutBow(b, bv);
++        portPlaceWrite(171, b);
++      }
+       dBow_->database.add(features);
+       dBow_->poseIds.push_back(framesInOut->id());
+     }

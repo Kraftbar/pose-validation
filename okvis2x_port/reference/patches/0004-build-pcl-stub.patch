@@ -1,0 +1,33 @@
+0004: okvis_multisensor_processing no longer needs PCL: the only use is two debug PLY dumps, replaced by a stub header
+ directory given with -DOKVIS2X_PCL_STUB=okvis2x_port/reference/pcl_stub (same stub as tools/gnss_harness/pcl_stub).
+ Build-only; no numerical effect.
+
+--- a/okvis_multisensor_processing/CMakeLists.txt
++++ b/okvis_multisensor_processing/CMakeLists.txt
+@@ -4,7 +4,8 @@
+ find_package(Eigen3 REQUIRED)
+ find_package(Glog REQUIRED)
+ find_package(OpenCV REQUIRED core imgcodecs imgproc highgui calib3d)
+-find_package(PCL REQUIRED)
++# PCL replaced by a stub header (okvis2x_port/reference/pcl_stub): the only PCL use is two debug PLY dumps
++set(OKVIS2X_PCL_STUB "" CACHE PATH "directory holding the stub pcl/ headers")
+ 
+ # Generate the configured header file
+ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/okvisConfig.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/include/okvis/okvisConfig.hpp" @ONLY)
+@@ -39,7 +40,7 @@
+     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+     $<INSTALL_INTERFACE:include>
+     ${GLOG_INCLUDE_DIRS}
+-    ${PCL_INCLUDE_DIRS}
++    ${OKVIS2X_PCL_STUB}
+ )
+ target_link_libraries(${LIB_NAME}
+   ${GLOG_LIBRARIES}
+@@ -55,7 +56,6 @@
+   okvis::Time
+   okvis::Timing
+   okvis::Util
+-  ${PCL_LIBRARIES}
+ )
+ target_compile_features(${LIB_NAME} PUBLIC cxx_std_${OKVIS_CXX_STANDARD})
+ target_compile_options(${LIB_NAME}

@@ -1,0 +1,113 @@
+0012: module M7b instrumentation (frontend inputs), active only with OKVIS_PORT_GRAPH_DUMP_DIR.
+ Two new record kinds in problem.bin (layouts in okvis_port/c/ok_frontend.h): tag 161 = the BRISK descriptors (48 bytes per keypoint)
+ of the multiframe handed to ViSlamBackend::addStates (written right after its entry record), tag 162 = one record per OpenGV
+ Ransac::computeModel run of the frontend (kind, correspondences, iterations, inliers, model coefficients). No computed value changes.
+
+diff --git a/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp b/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp
+index fa951c7..aeddf21 100644
+--- a/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp
++++ b/okvis_ceres/include/okvis/ceres/OkvisPortVigraphLog.hpp
+@@ -87,7 +87,7 @@ enum BOp : uint32_t {
+   B_ADDCAM = 128, B_ADDIMU, B_ADDSTATES, B_SETKF, B_ADDLM_ID, B_ADDLM_NEW, B_SETLM, B_SETCLASS, B_ADDOBS, B_RMOBS,
+   B_SETOBSINFO, B_MERGELMS, B_MERGELM, B_APPLYSTRATEGY, B_OPTRT, B_OPTFULL, B_SYNC, B_CLEANLM, B_LCATTEMPT,
+   B_ADDLCFRAME, B_SETPOSE, B_SETSB, B_SETEXTR, B_CLEAR, B_DETRADIUS, B_FINALBA,
+-  B_ML = 160, B_RESULT = 0x100
++  B_ML = 160, B_DESC = 161, B_RANSAC = 162, B_RESULT = 0x100
+ };
+ inline void bWrite(uint32_t tag, const Buf& b) {
+   okvis_port_solve::Buf w; w.raw(b.b.data(), b.b.size());
+@@ -98,6 +98,10 @@ inline void mlWrite(uint64_t frame, uint32_t cam, uint32_t kp, uint64_t id) {
+   Buf b; b.u64(frame); b.u32(cam); b.u32(kp); b.u64(id);
+   bWrite(B_ML, b);
+ }
++// patch 0012: B_DESC = BRISK descriptors of the multiframe just handed to addStates (u32 ncam, per camera: u32 nkp,
++// nkp x 48 descriptor bytes); B_RANSAC = one record per OpenGV Ransac::computeModel run of the frontend (u32 kind
++// 0 = 3d2d GP3P (matchToMap), 1 = rotation-only 2d2d, 2 = relative pose 2d2d (Stewenius), 3 = verifyRecognisedPlace GP3P;
++// u32 numCorrespondences, u32 iterations, u32 nInliers, nInliers x i32, u32 rows, u32 cols, rows*cols f64 column-major model).
+ struct MlInstall { MlInstall() { okvis_portk::mlHook() = &mlWrite; } };
+ static MlInstall mlInstall;
+ 
+diff --git a/okvis_ceres/src/ViSlamBackend.cpp b/okvis_ceres/src/ViSlamBackend.cpp
+index 28da265..8b0ec34 100644
+--- a/okvis_ceres/src/ViSlamBackend.cpp
++++ b/okvis_ceres/src/ViSlamBackend.cpp
+@@ -228,7 +228,15 @@ bool ViSlamBackend::addStates(MultiFramePtr multiFrame, const ImuMeasurementDequ
+ {
+   { okvis_portv::BRec br(okvis_portv::B_ADDSTATES);  // okvis_port (patch 0011)
+     if (br.live()) { okvis_portv::putTime(br.a, multiFrame->timestamp()); okvis_portv::putMeas(br.a, imuMeasurements);
+-      br.a.u32(asKeyframe ? 1u : 0u); br.a.f64(kptradius_); portPutMultiFrame(br.a, multiFrame); br.enter(); } }
++      br.a.u32(asKeyframe ? 1u : 0u); br.a.f64(kptradius_); portPutMultiFrame(br.a, multiFrame); br.enter();
++      okvis_portv::Buf d;  // okvis_port (patch 0012): the descriptors the frontend matches with
++      d.u32(uint32_t(multiFrame->numFrames()));
++      for (size_t i = 0; i < multiFrame->numFrames(); ++i) {
++        const size_t nk = multiFrame->numKeypoints(i);
++        d.u32(uint32_t(nk));
++        for (size_t k = 0; k < nk; ++k) d.raw(multiFrame->keypointDescriptor(i, k), 48);
++      }
++      okvis_portv::bWrite(okvis_portv::B_DESC, d); } }
+   AuxiliaryState auxiliaryState;
+   auxiliaryState.isImuFrame = true;
+   auxiliaryState.isKeyframe = asKeyframe;
+diff --git a/okvis_frontend/src/Frontend.cpp b/okvis_frontend/src/Frontend.cpp
+index 20ee8eb..a6fe029 100755
+--- a/okvis_frontend/src/Frontend.cpp
++++ b/okvis_frontend/src/Frontend.cpp
+@@ -57,6 +57,7 @@
+ 
+ #include <okvis/Frontend.hpp>
+ #include <okvis/ceres/OkvisPortTrace.hpp>
++#include <okvis/ceres/OkvisPortVigraphLog.hpp>  // okvis_port (patch 0012)
+ 
+ // okvis ceres
+ #include <okvis/ceres/PoseParameterBlock.hpp>
+@@ -85,6 +86,18 @@
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+ 
++// okvis_port (patch 0012): log of every OpenGV RANSAC run of the frontend (layout in OkvisPortVigraphLog.hpp)
++template <class R>
++static void portLogRansac(uint32_t kind, size_t numCorr, const R& r) {
++  if (!okvis_portv::on()) return;
++  okvis_portv::Buf b;
++  b.u32(kind); b.u32(uint32_t(numCorr)); b.u32(uint32_t(r.iterations_)); b.u32(uint32_t(r.inliers_.size()));
++  for (int i : r.inliers_) b.u32(uint32_t(i));
++  b.u32(uint32_t(r.model_coefficients_.rows())); b.u32(uint32_t(r.model_coefficients_.cols()));
++  b.f64n(r.model_coefficients_.data(), size_t(r.model_coefficients_.size()));
++  okvis_portv::bWrite(okvis_portv::B_RANSAC, b);
++}
++
+ static const double kptrad = 0.09;
+ //cv::Ptr<cv::CLAHE> mClahe;
+ 
+@@ -391,6 +404,7 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
+   }
+   TimerSwitchable ransacLoopClosureTimer("2.05 loop closure ransacking");
+   ransac.computeModel(0);
++  portLogRansac(3, adapter.getNumberCorrespondences(), ransac);
+   const int numInliers = int(ransac.inliers_.size());
+   const double inlierRatio = double(ransac.inliers_.size())
+                              / double(adapter.getNumberCorrespondences());
+@@ -2472,6 +2486,7 @@ bool Frontend::runRansac3d2d(
+   // initial guess not needed...
+   // run the ransac
+   ransac.computeModel(0);
++  portLogRansac(0, numCorrespondences, ransac);
+ 
+   // deal with outliers and assign transformation
+   numInliers = int(ransac.inliers_.size());
+@@ -2547,6 +2562,7 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
+ 
+     // run the ransac
+     rotation_only_ransac.computeModel(0);
++    portLogRansac(1, numCorrespondences, rotation_only_ransac);
+ 
+     // get quality
+     int rotation_only_inliers = int(rotation_only_ransac.inliers_.size());
+@@ -2564,6 +2580,7 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
+ 
+     // run the ransac
+     rel_pose_ransac.computeModel(0);
++    portLogRansac(2, numCorrespondences, rel_pose_ransac);
+ 
+     // assess success
+     int rel_pose_inliers = int(rel_pose_ransac.inliers_.size());

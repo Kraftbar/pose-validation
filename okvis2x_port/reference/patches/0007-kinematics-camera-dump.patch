@@ -1,0 +1,737 @@
+0005: okvis_port module M2 instrumentation (kinematics, camera models, NCameraSystem overlaps). Adds
+ okvis_kinematics/.../OkvisPortKinDump.hpp (active only with OKVIS_PORT_KIN_DUMP_DIR, per-kind sampling via
+ OKVIS_PORT_KIN_EVERY, call counts printed at exit). Transformation operations, sinc/deltaQ/rightJacobian,
+ PinholeCamera project/backProject variants (public entry points wrap renamed *PortImpl bodies) and the
+ NCameraSystem::computeOverlaps result are dumped. No numerical effect; record layouts documented in
+ okvis_port/c/ok_kin.h and okvis_port/c/ok_cam.h.
+diff --git a/okvis_cv/include/okvis/cameras/PinholeCamera.hpp b/okvis_cv/include/okvis/cameras/PinholeCamera.hpp
+index 9df1080..3b46cd7 100644
+--- a/okvis_cv/include/okvis/cameras/PinholeCamera.hpp
++++ b/okvis_cv/include/okvis/cameras/PinholeCamera.hpp
+@@ -32,6 +32,7 @@
+ #include "okvis/cameras/CameraBase.hpp"
+ #include "okvis/cameras/DistortionBase.hpp"
+ #include "okvis/cameras/NoDistortion.hpp"
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -374,6 +375,36 @@ class PinholeCamera : public PinholeCameraBase
+   /// @}
+ 
+   /// \brief get a test instance
++  // okvis_port: un-instrumented implementations (the public entry points dump when enabled)
++  inline ProjectionStatus projectPortImpl(
++      const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint) const;
++  inline ProjectionStatus projectPortImpl(
++      const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint,
++      Eigen::Matrix<double, 2, 3> * pointJacobian,
++      Eigen::Matrix2Xd * intrinsicsJacobian) const;
++  inline ProjectionStatus projectWithExternalParametersPortImpl(
++      const Eigen::Vector3d & point, const Eigen::VectorXd & parameters,
++      Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 3> * pointJacobian,
++      Eigen::Matrix2Xd * intrinsicsJacobian) const;
++  inline ProjectionStatus projectHomogeneousPortImpl(
++      const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint) const;
++  inline ProjectionStatus projectHomogeneousPortImpl(
++      const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint,
++      Eigen::Matrix<double, 2, 4> * pointJacobian,
++      Eigen::Matrix2Xd * intrinsicsJacobian) const;
++  inline ProjectionStatus projectHomogeneousWithExternalParametersPortImpl(
++      const Eigen::Vector4d & point, const Eigen::VectorXd & parameters,
++      Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 4> * pointJacobian,
++      Eigen::Matrix2Xd * intrinsicsJacobian) const;
++  inline bool backProjectPortImpl(const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction) const;
++  inline bool backProjectPortImpl(const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction,
++                                  Eigen::Matrix<double, 3, 2> * pointJacobian) const;
++  inline bool backProjectHomogeneousPortImpl(const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction) const;
++  inline bool backProjectHomogeneousPortImpl(const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction,
++                                             Eigen::Matrix<double, 4, 2> * pointJacobian) const;
++  /// okvis_port: serialise [u32 distortion tag][u32 w][u32 h][f64 fu fv cu cv][u32 nd][f64 dist params]
++  inline void portHeader(okvis_portk::Buf & b) const;
++
+   static std::shared_ptr<CameraBase> createTestObject()
+   {
+     return std::shared_ptr<CameraBase>(new PinholeCamera(752, 480, 350, 360, 378, 238,
+diff --git a/okvis_cv/include/okvis/cameras/implementation/PinholeCamera.hpp b/okvis_cv/include/okvis/cameras/implementation/PinholeCamera.hpp
+index fb6f5c2..cf2a3ac 100644
+--- a/okvis_cv/include/okvis/cameras/implementation/PinholeCamera.hpp
++++ b/okvis_cv/include/okvis/cameras/implementation/PinholeCamera.hpp
+@@ -246,7 +246,7 @@ void PinholeCamera<DISTORTION_T>::getIntrinsics(Eigen::VectorXd & intrinsics) co
+ 
+ // Projects a Euclidean point to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::project(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectPortImpl(
+     const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint) const
+ {
+   // handle singularity
+@@ -285,7 +285,7 @@ ProjectionStatus PinholeCamera<DISTORTION_T>::project(
+ 
+ // Projects a Euclidean point to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::project(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectPortImpl(
+     const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint,
+     Eigen::Matrix<double, 2, 3> * pointJacobian,
+     Eigen::Matrix2Xd * intrinsicsJacobian) const
+@@ -367,7 +367,7 @@ ProjectionStatus PinholeCamera<DISTORTION_T>::project(
+ 
+ // Projects a Euclidean point to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::projectWithExternalParameters(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectWithExternalParametersPortImpl(
+     const Eigen::Vector3d & point, const Eigen::VectorXd & parameters,
+     Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 3> * pointJacobian,
+     Eigen::Matrix2Xd * intrinsicsJacobian) const
+@@ -482,7 +482,7 @@ void PinholeCamera<DISTORTION_T>::projectBatch(
+ 
+ // Projects a point in homogenous coordinates to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneousPortImpl(
+     const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint) const
+ {
+   Eigen::Vector3d head = point.head<3>();
+@@ -495,7 +495,7 @@ ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
+ 
+ // Projects a point in homogenous coordinates to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneousPortImpl(
+     const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint,
+     Eigen::Matrix<double, 2, 4> * pointJacobian,
+     Eigen::Matrix2Xd * intrinsicsJacobian) const
+@@ -519,7 +519,7 @@ ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
+ 
+ // Projects a point in homogenous coordinates to a 2d image point (projection).
+ template<class DISTORTION_T>
+-ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneousWithExternalParameters(
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneousWithExternalParametersPortImpl(
+     const Eigen::Vector4d & point, const Eigen::VectorXd & parameters,
+     Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 4> * pointJacobian,
+     Eigen::Matrix2Xd * intrinsicsJacobian) const
+@@ -563,7 +563,7 @@ void PinholeCamera<DISTORTION_T>::projectHomogeneousBatch(
+ 
+ // Back-project a 2d image point into Euclidean space (direction vector).
+ template<class DISTORTION_T>
+-bool PinholeCamera<DISTORTION_T>::backProject(
++bool PinholeCamera<DISTORTION_T>::backProjectPortImpl(
+     const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction) const
+ {
+   // unscale and center
+@@ -585,7 +585,7 @@ bool PinholeCamera<DISTORTION_T>::backProject(
+ 
+ // Back-project a 2d image point into Euclidean space (direction vector).
+ template<class DISTORTION_T>
+-inline bool PinholeCamera<DISTORTION_T>::backProject(
++inline bool PinholeCamera<DISTORTION_T>::backProjectPortImpl(
+     const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction,
+     Eigen::Matrix<double, 3, 2> * pointJacobian) const
+ {
+@@ -636,7 +636,7 @@ bool PinholeCamera<DISTORTION_T>::backProjectBatch(
+ 
+ // Back-project a 2d image point into homogeneous point (direction vector).
+ template<class DISTORTION_T>
+-bool PinholeCamera<DISTORTION_T>::backProjectHomogeneous(
++bool PinholeCamera<DISTORTION_T>::backProjectHomogeneousPortImpl(
+     const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction) const
+ {
+   Eigen::Vector3d ray;
+@@ -648,7 +648,7 @@ bool PinholeCamera<DISTORTION_T>::backProjectHomogeneous(
+ 
+ // Back-project a 2d image point into homogeneous point (direction vector).
+ template<class DISTORTION_T>
+-bool PinholeCamera<DISTORTION_T>::backProjectHomogeneous(
++bool PinholeCamera<DISTORTION_T>::backProjectHomogeneousPortImpl(
+     const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction,
+     Eigen::Matrix<double, 4, 2> * pointJacobian) const
+ {
+@@ -681,5 +681,197 @@ bool PinholeCamera<DISTORTION_T>::backProjectHomogeneousBatch(
+   return true;
+ }
+ 
++
++// ---- okvis_port instrumentation wrappers (dump, then return the unmodified implementation's result) ----
++template<class DISTORTION_T>
++void PinholeCamera<DISTORTION_T>::portHeader(okvis_portk::Buf & b) const {
++  const std::string t = distortion_.type();
++  b.u32(t == "RadialTangentialDistortion" ? 0u : t == "EquidistantDistortion" ? 1u
++        : t == "RadialTangentialDistortion8" ? 2u : 3u);
++  b.u32(uint32_t(imageWidth_)); b.u32(uint32_t(imageHeight_));
++  b.f64(fu_); b.f64(fv_); b.f64(cu_); b.f64(cv_);
++  Eigen::VectorXd dp;
++  if (distortion_t::NumDistortionIntrinsics > 0) distortion_.getParameters(dp);
++  b.u32(uint32_t(dp.size()));
++  b.mat(dp);
++}
++
++#define OKP_CAM_ON(K) (okvis_portk::Dump::get().on(okvis_portk::K))
++#define OKP_CAM_WRITE(K, B) okvis_portk::Dump::get().write(okvis_portk::K, B)
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::project(
++    const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint) const
++{
++  const ProjectionStatus st = projectPortImpl(point, imagePoint);
++  if (OKP_CAM_ON(C_PROJ)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    const bool w = st != ProjectionStatus::Invalid;
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) b.mat(*imagePoint);
++    OKP_CAM_WRITE(C_PROJ, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::project(
++    const Eigen::Vector3d & point, Eigen::Vector2d * imagePoint,
++    Eigen::Matrix<double, 2, 3> * pointJacobian,
++    Eigen::Matrix2Xd * intrinsicsJacobian) const
++{
++  const ProjectionStatus st = projectPortImpl(point, imagePoint, pointJacobian, intrinsicsJacobian);
++  if (OKP_CAM_ON(C_PROJJ)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    const bool w = !(fabs(point[2]) < 1.0e-12);
++    b.u32(intrinsicsJacobian ? 1u : 0u);
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) {
++      b.mat(*imagePoint); b.mat(*pointJacobian);
++      if (intrinsicsJacobian) { b.u32(uint32_t(intrinsicsJacobian->cols())); b.mat(*intrinsicsJacobian); }
++    }
++    OKP_CAM_WRITE(C_PROJJ, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectWithExternalParameters(
++    const Eigen::Vector3d & point, const Eigen::VectorXd & parameters,
++    Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 3> * pointJacobian,
++    Eigen::Matrix2Xd * intrinsicsJacobian) const
++{
++  const ProjectionStatus st = projectWithExternalParametersPortImpl(point, parameters, imagePoint, pointJacobian,
++                                                                    intrinsicsJacobian);
++  if (OKP_CAM_ON(C_PROJX)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    b.u32(uint32_t(parameters.size())); b.mat(parameters);
++    const bool w = !(fabs(point[2]) < 1.0e-12);
++    b.u32(pointJacobian ? 1u : 0u); b.u32(intrinsicsJacobian ? 1u : 0u);
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) {
++      b.mat(*imagePoint);
++      if (pointJacobian) b.mat(*pointJacobian);
++      if (intrinsicsJacobian) { b.u32(uint32_t(intrinsicsJacobian->cols())); b.mat(*intrinsicsJacobian); }
++    }
++    OKP_CAM_WRITE(C_PROJX, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
++    const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint) const
++{
++  const ProjectionStatus st = projectHomogeneousPortImpl(point, imagePoint);
++  if (OKP_CAM_ON(C_PROJH)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    const bool w = st != ProjectionStatus::Invalid;
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) b.mat(*imagePoint);
++    OKP_CAM_WRITE(C_PROJH, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneous(
++    const Eigen::Vector4d & point, Eigen::Vector2d * imagePoint,
++    Eigen::Matrix<double, 2, 4> * pointJacobian,
++    Eigen::Matrix2Xd * intrinsicsJacobian) const
++{
++  const ProjectionStatus st = projectHomogeneousPortImpl(point, imagePoint, pointJacobian, intrinsicsJacobian);
++  if (OKP_CAM_ON(C_PROJHJ)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    const bool w = !(fabs(point[2]) < 1.0e-12);
++    b.u32(intrinsicsJacobian ? 1u : 0u);
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) {
++      b.mat(*imagePoint); b.mat(*pointJacobian);
++      if (intrinsicsJacobian) { b.u32(uint32_t(intrinsicsJacobian->cols())); b.mat(*intrinsicsJacobian); }
++    }
++    OKP_CAM_WRITE(C_PROJHJ, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++ProjectionStatus PinholeCamera<DISTORTION_T>::projectHomogeneousWithExternalParameters(
++    const Eigen::Vector4d & point, const Eigen::VectorXd & parameters,
++    Eigen::Vector2d * imagePoint, Eigen::Matrix<double, 2, 4> * pointJacobian,
++    Eigen::Matrix2Xd * intrinsicsJacobian) const
++{
++  const ProjectionStatus st = projectHomogeneousWithExternalParametersPortImpl(point, parameters, imagePoint,
++                                                                               pointJacobian, intrinsicsJacobian);
++  if (OKP_CAM_ON(C_PROJHX)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(point);
++    b.u32(uint32_t(parameters.size())); b.mat(parameters);
++    const bool w = !(fabs(point[2]) < 1.0e-12);
++    b.u32(pointJacobian ? 1u : 0u); b.u32(intrinsicsJacobian ? 1u : 0u);
++    b.i32(int32_t(st)); b.u32(w ? 1u : 0u);
++    if (w) {
++      b.mat(*imagePoint);
++      if (pointJacobian) b.mat(*pointJacobian);
++      if (intrinsicsJacobian) { b.u32(uint32_t(intrinsicsJacobian->cols())); b.mat(*intrinsicsJacobian); }
++    }
++    OKP_CAM_WRITE(C_PROJHX, b);
++  }
++  return st;
++}
++
++template<class DISTORTION_T>
++bool PinholeCamera<DISTORTION_T>::backProject(
++    const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction) const
++{
++  const bool ok = backProjectPortImpl(imagePoint, direction);
++  if (OKP_CAM_ON(C_BACK)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(imagePoint);
++    b.u32(ok ? 1u : 0u); b.mat(*direction);
++    OKP_CAM_WRITE(C_BACK, b);
++  }
++  return ok;
++}
++
++template<class DISTORTION_T>
++bool PinholeCamera<DISTORTION_T>::backProject(
++    const Eigen::Vector2d & imagePoint, Eigen::Vector3d * direction,
++    Eigen::Matrix<double, 3, 2> * pointJacobian) const
++{
++  const bool ok = backProjectPortImpl(imagePoint, direction, pointJacobian);
++  if (OKP_CAM_ON(C_BACKJ)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(imagePoint);
++    b.u32(ok ? 1u : 0u); b.mat(*direction); b.mat(*pointJacobian);
++    OKP_CAM_WRITE(C_BACKJ, b);
++  }
++  return ok;
++}
++
++template<class DISTORTION_T>
++bool PinholeCamera<DISTORTION_T>::backProjectHomogeneous(
++    const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction) const
++{
++  const bool ok = backProjectHomogeneousPortImpl(imagePoint, direction);
++  if (OKP_CAM_ON(C_BACKH)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(imagePoint);
++    b.u32(ok ? 1u : 0u); b.mat(*direction);
++    OKP_CAM_WRITE(C_BACKH, b);
++  }
++  return ok;
++}
++
++template<class DISTORTION_T>
++bool PinholeCamera<DISTORTION_T>::backProjectHomogeneous(
++    const Eigen::Vector2d & imagePoint, Eigen::Vector4d * direction,
++    Eigen::Matrix<double, 4, 2> * pointJacobian) const
++{
++  const bool ok = backProjectHomogeneousPortImpl(imagePoint, direction, pointJacobian);
++  if (OKP_CAM_ON(C_BACKHJ)) {
++    okvis_portk::Buf b; portHeader(b); b.mat(imagePoint);
++    b.u32(ok ? 1u : 0u); b.mat(*direction); b.mat(*pointJacobian);
++    OKP_CAM_WRITE(C_BACKHJ, b);
++  }
++  return ok;
++}
++
+ }  // namespace cameras
+ }  // namespace okvis
+diff --git a/okvis_cv/src/NCameraSystem.cpp b/okvis_cv/src/NCameraSystem.cpp
+index 2a50f06..77083de 100644
+--- a/okvis_cv/src/NCameraSystem.cpp
++++ b/okvis_cv/src/NCameraSystem.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "okvis/cameras/NCameraSystem.hpp"
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -96,6 +97,33 @@ void NCameraSystem::computeOverlaps()
+       }
+     }
+   }
++  // okvis_port: dump the camera system and the computed overlap maps
++  if (okvis_portk::Dump::get().on(okvis_portk::C_OVERLAP)) {
++    okvis_portk::Buf b;
++    const size_t n = cameraGeometries_.size();
++    b.u32(uint32_t(n));
++    for (size_t c = 0; c < n; ++c) {
++      const std::string t = cameraGeometries_[c]->distortionType();
++      b.u32(t == "RadialTangentialDistortion" ? 0u : t == "EquidistantDistortion" ? 1u
++            : t == "RadialTangentialDistortion8" ? 2u : 3u);
++      b.u32(cameraGeometries_[c]->imageWidth()); b.u32(cameraGeometries_[c]->imageHeight());
++      Eigen::VectorXd in;
++      cameraGeometries_[c]->getIntrinsics(in);
++      b.mat(in.head<4>());
++      b.u32(uint32_t(in.size() - 4));
++      b.mat(in.tail(in.size() - 4));
++    }
++    for (size_t c = 0; c < n; ++c) { b.mat(T_SC_[c]->coeffs()); b.mat(T_SC_[c]->C()); }
++    for (size_t s = 0; s < n; ++s) {
++      for (size_t c = 0; c < n; ++c) {
++        const cv::Mat& m = overlapMats_[s][c];
++        b.u32(overlaps_[s][c] ? 1u : 0u); b.u32(uint32_t(m.cols)); b.u32(uint32_t(m.rows));
++        for (int v = 0; v < m.rows; ++v)
++          for (int u = 0; u < m.cols; ++u) { const uint8_t x = m.at<uchar>(v, u); b.raw(&x, 1); }
++      }
++    }
++    okvis_portk::Dump::get().write(okvis_portk::C_OVERLAP, b);
++  }
+ }
+ 
+ }  // namespace cameras
+diff --git a/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp b/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp
+new file mode 100644
+index 0000000..c8fbd8f
+--- /dev/null
++++ b/okvis_kinematics/include/okvis/kinematics/OkvisPortKinDump.hpp
+@@ -0,0 +1,125 @@
++/*
++ * okvis_port reference instrumentation (NOT upstream code): binary dumps of Transformation / kinematics helper /
++ * camera model calls for the pure-C port's bit-exactness checks (module M2). Active only when
++ * OKVIS_PORT_KIN_DUMP_DIR is set; with the variable unset (or a kind sampled with every=0) there is no effect.
++ * OKVIS_PORT_KIN_EVERY="mulT=1000,projh=50,..." selects every-N sampling per record kind (0 = count only).
++ * Everything is native-endian raw doubles / u32 / u64. One file per kind: kin_<name>.bin. Layouts are documented in
++ * okvis_port/c/ok_kin.h (kinematics) and okvis_port/c/ok_cam.h (cameras). The destructor prints the call counts
++ * (calls / written) of every kind to stderr, so the reference log shows which functions the pipeline really uses.
++ * No dump code reads uninitialised memory.
++ */
++#ifndef OKVIS_PORT_KIN_DUMP_HPP_
++#define OKVIS_PORT_KIN_DUMP_HPP_
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include <Eigen/Core>
++
++namespace okvis_portk {
++
++#define OKP_KINDS(X) \
++  X(T_CTOR_RQ, "ctor_rq") X(T_CTOR_M4, "ctor_m4") X(T_SET_M4, "set_m4") X(T_SET_RQ, "set_rq") \
++  X(T_SETCOEFFS, "setcoeffs") X(T_INV, "inv") X(T_MUL_T, "mul_t") X(T_MUL_V3, "mul_v3") X(T_MUL_V4, "mul_v4") \
++  X(T_OPLUS, "oplus") X(T_OPLUSJ, "oplusj") X(T_LIFTJ, "liftj") X(T_T4, "t4") X(T_T3X4, "t3x4") X(T_C, "c") \
++  X(T_CONVERT, "convert") X(K_SINC, "sinc") X(K_DELTAQ, "deltaq") X(K_RJAC, "rjac") \
++  X(C_PROJ, "proj") X(C_PROJJ, "projj") X(C_PROJX, "projx") X(C_PROJH, "projh") X(C_PROJHJ, "projhj") \
++  X(C_PROJHX, "projhx") X(C_BACK, "back") X(C_BACKJ, "backj") X(C_BACKH, "backh") X(C_BACKHJ, "backhj") \
++  X(C_OVERLAP, "overlap")
++
++enum Kind {
++#define X(k, n) k,
++  OKP_KINDS(X)
++#undef X
++  NUM_KINDS
++};
++
++struct Buf {
++  std::vector<char> b;
++  void raw(const void* p, size_t n) { const char* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
++  void u32(uint32_t v) { raw(&v, 4); }
++  void i32(int32_t v) { raw(&v, 4); }
++  void u64(uint64_t v) { raw(&v, 8); }
++  void f64(double v) { raw(&v, 8); }
++  void f64n(const double* p, size_t n) { raw(p, 8 * n); }
++  template <typename D>
++  void mat(const Eigen::MatrixBase<D>& m) {  // column-major
++    for (Eigen::Index c = 0; c < m.cols(); ++c)
++      for (Eigen::Index r = 0; r < m.rows(); ++r) f64(m(r, c));
++  }
++};
++
++class Dump {
++ public:
++  static Dump& get() { static Dump d; return d; }
++  bool enabled() const { return enabled_; }
++  bool on(Kind k) {  // counts every call; true if this call should be recorded
++    if (!enabled_) return false;
++    std::lock_guard<std::mutex> l(m_);
++    const uint64_t c = calls_[k]++;
++    return every_[k] > 0 && (c % every_[k]) == 0;
++  }
++  void write(Kind k, const Buf& b) {
++    std::lock_guard<std::mutex> l(m_);
++    if (!f_[k]) f_[k] = std::fopen((dir_ + "/kin_" + name(k) + ".bin").c_str(), "wb");
++    std::fwrite(b.b.data(), 1, b.b.size(), f_[k]);
++    written_[k]++;
++  }
++  static const char* name(int k) {
++    static const char* names[] = {
++#define X(kk, n) n,
++        OKP_KINDS(X)
++#undef X
++    };
++    return names[k];
++  }
++  ~Dump() {
++    if (!enabled_) return;
++    for (int k = 0; k < NUM_KINDS; ++k) {
++      if (f_[k]) std::fclose(f_[k]);
++      std::fprintf(stderr, "okvis_port kin dump %s: calls=%llu written=%llu\n", name(k),
++                   (unsigned long long)calls_[k], (unsigned long long)written_[k]);
++    }
++  }
++
++ private:
++  Dump() {
++    const char* d = std::getenv("OKVIS_PORT_KIN_DUMP_DIR");
++    enabled_ = d != nullptr;
++    if (d) dir_ = d;
++    for (int k = 0; k < NUM_KINDS; ++k) { every_[k] = 1; calls_[k] = 0; written_[k] = 0; f_[k] = nullptr; }
++    const char* e = std::getenv("OKVIS_PORT_KIN_EVERY");
++    if (e) {
++      // "name=N,name=N"; "all=N" sets the default for every kind first
++      std::string s(e);
++      size_t pos = 0;
++      while (pos < s.size()) {
++        size_t end = s.find(',', pos);
++        if (end == std::string::npos) end = s.size();
++        const std::string tok = s.substr(pos, end - pos);
++        const size_t eq = tok.find('=');
++        if (eq != std::string::npos) {
++          const std::string nm = tok.substr(0, eq);
++          const uint64_t v = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
++          for (int k = 0; k < NUM_KINDS; ++k)
++            if (nm == "all" || nm == name(k)) every_[k] = v;
++        }
++        pos = end + 1;
++      }
++    }
++  }
++  bool enabled_ = false;
++  std::string dir_;
++  std::mutex m_;
++  uint64_t every_[NUM_KINDS], calls_[NUM_KINDS], written_[NUM_KINDS];
++  FILE* f_[NUM_KINDS];
++};
++
++}  // namespace okvis_portk
++
++#endif  // OKVIS_PORT_KIN_DUMP_HPP_
+diff --git a/okvis_kinematics/include/okvis/kinematics/implementation/Transformation.hpp b/okvis_kinematics/include/okvis/kinematics/implementation/Transformation.hpp
+index 3094f38..268827c 100644
+--- a/okvis_kinematics/include/okvis/kinematics/implementation/Transformation.hpp
++++ b/okvis_kinematics/include/okvis/kinematics/implementation/Transformation.hpp
+@@ -20,6 +20,10 @@
+ 
+ #include <okvis/kinematics/Transformation.hpp>
+ #include "okvis/kinematics/operators.hpp"
++#include <okvis/kinematics/OkvisPortKinDump.hpp>  // okvis_port instrumentation
++
++#define OKP_ON(K) (::okvis_portk::Dump::get().on(::okvis_portk::K))
++#define OKP_WRITE(K, B) ::okvis_portk::Dump::get().write(::okvis_portk::K, B)
+ 
+ /// \brief okvis Main namespace of this package.
+ namespace okvis {
+@@ -27,7 +31,22 @@ namespace okvis {
+ /// \brief kinematics Namespace for kinematics functionality, i.e. TransformationTs and stuff.
+ namespace kinematics {
+ 
++__inline__ double sincImplPort(double x);
++// okvis_port: serialise a transformation as [u32 cache][coeffs 7][C 9, cached only]
++template<bool CACHE_C>
++inline void okpPose(::okvis_portk::Buf& b, const TransformationT<CACHE_C>& t) {
++  b.u32(CACHE_C ? 1u : 0u);
++  b.mat(t.coeffs());
++  if (CACHE_C) b.mat(t.C());
++}
++
+ __inline__ double sinc(double x) {
++  double ret = sincImplPort(x);
++  if (OKP_ON(K_SINC)) { ::okvis_portk::Buf b; b.f64(x); b.f64(ret); OKP_WRITE(K_SINC, b); }
++  return ret;
++}
++
++__inline__ double sincImplPort(double x) {
+   if (fabs(x) > 1.0e-6) {
+     return sin(x) / x;
+   } else {
+@@ -47,7 +66,9 @@ __inline__ Eigen::Quaterniond deltaQ(const Eigen::Vector3d& dAlpha)
+   const double halfnorm = 0.5 * dAlpha.norm();
+   dq.template head<3>() = sinc(halfnorm) * 0.5 * dAlpha;
+   dq[3] = cos(halfnorm);
+-  return Eigen::Quaterniond(dq);
++  Eigen::Quaterniond ret(dq);
++  if (OKP_ON(K_DELTAQ)) { ::okvis_portk::Buf b; b.mat(dAlpha); b.mat(ret.coeffs()); OKP_WRITE(K_DELTAQ, b); }
++  return ret;
+ }
+ 
+ // Right Jacobian, see Forster et al. RSS 2015 eqn. (8)
+@@ -63,6 +84,7 @@ __inline__ Eigen::Matrix3d rightJacobian(const Eigen::Vector3d & PhiVec) {
+     const double Phi3 = Phi2*Phi;
+     retMat += -(1.0-cos(Phi))/(Phi2)*Phi_x + (Phi-sin(Phi))/Phi3*Phi_x2;
+   }
++  if (OKP_ON(K_RJAC)) { ::okvis_portk::Buf b; b.mat(PhiVec); b.mat(retMat); OKP_WRITE(K_RJAC, b); }
+   return retMat;
+ }
+ 
+@@ -80,6 +102,7 @@ inline TransformationT<CACHE_C>::TransformationT(const TransformationT<!CACHE_C>
+       q_(&parameters_[3]),
+       C_(other.C_) {
+   if(CACHE_C) C_ = q_.toRotationMatrix();
++  if(CACHE_C && OKP_ON(T_CONVERT)) { ::okvis_portk::Buf b; b.mat(other.parameters_); okpPose(b, *this); OKP_WRITE(T_CONVERT, b); }
+ }
+ 
+ template<bool CACHE_C>
+@@ -96,6 +119,7 @@ inline TransformationT<CACHE_C>::TransformationT(TransformationT<!CACHE_C> && ot
+       q_(&parameters_[3]),
+       C_(std::move(other.C_)) {
+   if(CACHE_C) C_ = q_.toRotationMatrix();
++  if(CACHE_C && OKP_ON(T_CONVERT)) { ::okvis_portk::Buf b; b.mat(parameters_); okpPose(b, *this); OKP_WRITE(T_CONVERT, b); }
+ }
+ 
+ template<bool CACHE_C>
+@@ -115,6 +139,7 @@ inline TransformationT<CACHE_C>::TransformationT(const Eigen::Vector3d & r_AB,
+   r_ = r_AB;
+   q_ = q_AB.normalized();
+   if(CACHE_C) updateC();
++  if(OKP_ON(T_CTOR_RQ)) { ::okvis_portk::Buf b; b.mat(r_AB); b.mat(q_AB.coeffs()); okpPose(b, *this); OKP_WRITE(T_CTOR_RQ, b); }
+ }
+ 
+ template<bool CACHE_C>
+@@ -128,6 +153,7 @@ inline TransformationT<CACHE_C>::TransformationT(const Eigen::Matrix4d & T_AB)
+   assert(fabs(T_AB(3, 1)) < 1.0e-12);
+   assert(fabs(T_AB(3, 2)) < 1.0e-12);
+   assert(fabs(T_AB(3, 3) - 1.0) < 1.0e-12);
++  if(OKP_ON(T_CTOR_M4)) { ::okvis_portk::Buf b; b.mat(T_AB); okpPose(b, *this); OKP_WRITE(T_CTOR_M4, b); }
+ }
+ 
+ template<bool CACHE_C>
+@@ -142,6 +168,7 @@ inline bool TransformationT<CACHE_C>::setCoeffs(
+   EIGEN_STATIC_ASSERT_VECTOR_SPECIFIC_SIZE(Derived_coeffs, 7);
+   parameters_ = coeffs;
+   if(CACHE_C) updateC();
++  if(OKP_ON(T_SETCOEFFS)) { ::okvis_portk::Buf b; b.mat(coeffs); okpPose(b, *this); OKP_WRITE(T_SETCOEFFS, b); }
+   return true;
+ }
+ 
+@@ -153,13 +180,18 @@ inline Eigen::Matrix4d TransformationT<CACHE_C>::T() const {
+   T_ret.topRightCorner<3, 1>() = r_;
+   T_ret.bottomLeftCorner<1, 3>().setZero();
+   T_ret(3, 3) = 1.0;
++  if(OKP_ON(T_T4)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(T_ret); OKP_WRITE(T_T4, b); }
+   return T_ret;
+ }
+ 
+ // return the rotation matrix
+ template<bool CACHE_C>
+ inline Eigen::Matrix3d TransformationT<CACHE_C>::C() const {
+-  if(!CACHE_C) return q_.toRotationMatrix();
++  if(!CACHE_C) {
++    Eigen::Matrix3d Cret = q_.toRotationMatrix();
++    if(OKP_ON(T_C)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(Cret); OKP_WRITE(T_C, b); }
++    return Cret;
++  }
+   return C_;
+ }
+ 
+@@ -179,14 +211,17 @@ inline Eigen::Matrix<double, 3, 4> TransformationT<CACHE_C>::T3x4() const {
+   Eigen::Matrix<double, 3, 4> T3x4_ret;
+   T3x4_ret.topLeftCorner<3, 3>() = CACHE_C ? C_ : q_.toRotationMatrix();
+   T3x4_ret.topRightCorner<3, 1>() = r_;
++  if(OKP_ON(T_T3X4)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(T3x4_ret); OKP_WRITE(T_T3X4, b); }
+   return T3x4_ret;
+ }
+ 
+ // Return a copy of the TransformationT inverted.
+ template<bool CACHE_C>
+ inline TransformationT<CACHE_C> TransformationT<CACHE_C>::inverse() const {
+-  return CACHE_C ? TransformationT(-(C_.transpose() * r_), q_.inverse()) :
++  TransformationT<CACHE_C> ret = CACHE_C ? TransformationT(-(C_.transpose() * r_), q_.inverse()) :
+                    TransformationT(-(q_.toRotationMatrix().transpose() * r_), q_.inverse());
++  if(OKP_ON(T_INV)) { ::okvis_portk::Buf b; okpPose(b, *this); okpPose(b, ret); OKP_WRITE(T_INV, b); }
++  return ret;
+ }
+ 
+ // Set this to a random TransformationT.
+@@ -213,6 +248,7 @@ inline void TransformationT<CACHE_C>::set(const Eigen::Matrix4d & T_AB) {
+   r_ = (T_AB.topRightCorner<3, 1>());
+   q_ = (T_AB.topLeftCorner<3, 3>());
+   if(CACHE_C) updateC();
++  if(OKP_ON(T_SET_M4)) { ::okvis_portk::Buf b; b.mat(T_AB); okpPose(b, *this); OKP_WRITE(T_SET_M4, b); }
+ }
+ 
+ template<bool CACHE_C>
+@@ -221,6 +257,7 @@ inline void TransformationT<CACHE_C>::set(const Eigen::Vector3d & r_AB,
+   r_ = r_AB;
+   q_ = q_AB.normalized();
+   if(CACHE_C) updateC();
++  if(OKP_ON(T_SET_RQ)) { ::okvis_portk::Buf b; b.mat(r_AB); b.mat(q_AB.coeffs()); okpPose(b, *this); OKP_WRITE(T_SET_RQ, b); }
+ }
+ 
+ // Set this TransformationT to identity
+@@ -240,12 +277,16 @@ inline TransformationT<CACHE_C> TransformationT<CACHE_C>::Identity() {
+ template<bool CACHE_C>
+ inline TransformationT<CACHE_C> TransformationT<CACHE_C>::operator*(
+     const TransformationT<CACHE_C> & rhs) const {
+-  return TransformationT((CACHE_C ? C_ : q_.toRotationMatrix()) * rhs.r_ + r_, q_ * rhs.q_);
++  TransformationT<CACHE_C> ret((CACHE_C ? C_ : q_.toRotationMatrix()) * rhs.r_ + r_, q_ * rhs.q_);
++  if(OKP_ON(T_MUL_T)) { ::okvis_portk::Buf b; okpPose(b, *this); okpPose(b, rhs); okpPose(b, ret); OKP_WRITE(T_MUL_T, b); }
++  return ret;
+ }
+ template<bool CACHE_C>
+ inline Eigen::Vector3d TransformationT<CACHE_C>::operator*(
+     const Eigen::Vector3d & rhs) const {
+-  return (CACHE_C ? C_ : q_.toRotationMatrix()) * rhs;
++  Eigen::Vector3d ret = (CACHE_C ? C_ : q_.toRotationMatrix()) * rhs;
++  if(OKP_ON(T_MUL_V3)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(rhs); b.mat(ret); OKP_WRITE(T_MUL_V3, b); }
++  return ret;
+ }
+ template<bool CACHE_C>
+ inline Eigen::Vector4d TransformationT<CACHE_C>::operator*(
+@@ -254,6 +295,7 @@ inline Eigen::Vector4d TransformationT<CACHE_C>::operator*(
+   Eigen::Vector4d retVec;
+   retVec.head<3>() = (CACHE_C ? C_ : q_.toRotationMatrix()) * rhs.head<3>() + r_ * s;
+   retVec[3] = s;
++  if(OKP_ON(T_MUL_V4)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(rhs); b.mat(retVec); OKP_WRITE(T_MUL_V4, b); }
+   return retVec;
+ }
+ 
+@@ -286,6 +328,9 @@ template<typename Derived_delta>
+ inline bool TransformationT<CACHE_C>::oplus(
+     const Eigen::MatrixBase<Derived_delta> & delta) {
+   EIGEN_STATIC_ASSERT_VECTOR_SPECIFIC_SIZE(Derived_delta, 6);
++  ::okvis_portk::Buf okpb;
++  const bool okpOn = OKP_ON(T_OPLUS);
++  if(okpOn) { okpPose(okpb, *this); okpb.mat(delta); }
+   r_ += delta.template head<3>();
+   const Eigen::Vector3d dalpha = delta.template tail<3>();
+   Eigen::Vector4d dq;
+@@ -295,6 +340,7 @@ inline bool TransformationT<CACHE_C>::oplus(
+   q_ = (Eigen::Quaterniond(dq) * q_);
+   q_.normalize();
+   if(CACHE_C) updateC();
++  if(okpOn) { okpPose(okpb, *this); OKP_WRITE(T_OPLUS, okpb); }
+   return true;
+ }
+ 
+@@ -325,6 +371,7 @@ inline bool TransformationT<CACHE_C>::oplusJacobian(
+   S(2, 2) = 0.5;
+   const_cast<Eigen::MatrixBase<Derived_jacobian>&>(jacobian)
+       .template bottomRightCorner<4, 3>() = okvis::kinematics::oplus(q_) * S;
++  if(OKP_ON(T_OPLUSJ)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(jacobian); OKP_WRITE(T_OPLUSJ, b); }
+   return true;
+ }
+ 
+@@ -339,6 +386,7 @@ inline bool TransformationT<CACHE_C>::liftJacobian(
+       = Eigen::Matrix3d::Identity();
+   const_cast<Eigen::MatrixBase<Derived_jacobian>&>(jacobian).template bottomRightCorner<3,4>()
+       = 2*okvis::kinematics::oplus(q_.inverse()).template topLeftCorner<3,4>();
++  if(OKP_ON(T_LIFTJ)) { ::okvis_portk::Buf b; okpPose(b, *this); b.mat(jacobian); OKP_WRITE(T_LIFTJ, b); }
+   return true;
+ }
+ 
