@@ -13,4 +13,10 @@ int rd_cv_undistort_maps(const double K[4],const double D[4],int equidistant,
  * zero and INTER_LINEAR. src==dst is supported. Nonfinite map entries produce
  * zero like native cvRound's INT_MIN conversion. */
 int rd_cv_remap_linear(const uint8_t *src,int w,int h,const float *m1,const float *m2,uint8_t *dst);
+/* Same result as rd_cv_remap_linear for fixed maps, faster for repeated use
+ * (per-pixel offsets/weights computed once). m1/m2 must outlive the plan. */
+typedef struct rd_cv_remap_plan rd_cv_remap_plan;
+rd_cv_remap_plan *rd_cv_remap_plan_new(int w,int h,const float *m1,const float *m2);
+int rd_cv_remap_plan_apply(const rd_cv_remap_plan *plan,const uint8_t *src,uint8_t *dst);
+void rd_cv_remap_plan_free(rd_cv_remap_plan *plan);
 #endif

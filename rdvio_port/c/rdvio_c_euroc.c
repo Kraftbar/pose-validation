@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     const char *gray_path = NULL, *mask_path = NULL, *png_dir = NULL;
     int undistorted = 0;
     float *m1 = NULL, *m2 = NULL;
+    rd_cv_remap_plan *remap_plan = NULL;
     uint8_t* raw = NULL;
     double maxs = 1e18;
     rd_cfg cfg;
@@ -183,6 +184,8 @@ int main(int argc, char** argv) {
         if (!rd_cv_undistort_maps(Kc, cfg.distortion, cfg.distortion_equidistant, (int)gh[0], (int)gh[1], m1, m2)) {
             fprintf(stderr, "undistortion maps failed\n"); return 1;
         }
+        remap_plan = rd_cv_remap_plan_new((int)gh[0], (int)gh[1], m1, m2);
+        if (!remap_plan) { fprintf(stderr, "remap plan failed\n"); return 1; }
     }
     for (k = 0; k < ncam; ++k) {
         const cam_row* c = &cams[k];
@@ -215,7 +218,7 @@ int main(int argc, char** argv) {
             memcpy(raw, px, (size_t)gh[0] * gh[1]);
             free(px);
         }
-        if (!undistorted) rd_cv_remap_linear(raw, (int)gh[0], (int)gh[1], m1, m2, pix);   /* cv::remap INTER_LINEAR */
+        if (!undistorted) rd_cv_remap_plan_apply(remap_plan, raw, pix);   /* cv::remap INTER_LINEAR */
         im = rd_sys_image_new(c->t, pix, (int)gh[0], (int)gh[1]);
         rd_sys_track_camera(sys, im, NULL);
         frames++;
@@ -237,6 +240,6 @@ int main(int argc, char** argv) {
     rd_sys_free(sys);
     rd_sys_image_reset_statics();
     if (mk.f) fclose(mk.f);
-    free(pix); free(raw); free(m1); free(m2); free(imus); free(cams);
+    rd_cv_remap_plan_free(remap_plan); free(pix); free(raw); free(m1); free(m2); free(imus); free(cams);
     return 0;
 }

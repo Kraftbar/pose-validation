@@ -4,6 +4,7 @@
  * ../reference_cv/LICENSE-M7b-OpenCV. No SIMD intrinsics. */
 #include "rd_cv_undist.h"
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 static int dims(int w,int h) { return w>0&&h>0&&w<32767&&h<32767; }
@@ -56,29 +57,78 @@ int rd_cv_undistort_maps(const double K[4],const double D[4],int fish,int w,int 
     }
     return 1;
 }
-static int quantize(float x) {
-    float f=x*32.f;
-    if(!isfinite(f)||f>=2147483648.f||f< -2147483648.f)return (-2147483647-1);
+static inline int rint_i(float f) {
+    /* == (int)lrintf(f) for |f| < 2^22 (round half even): the 1.5*2^23 trick is exact in float arithmetic */
+    if(fabsf(f)<4194304.f) { float t=f+12582912.f; return (int)(t-12582912.f); }
     return (int)lrintf(f);
 }
-static int floor32(int x) { return x>=0?x/32:-1-((-1-x)/32); }
+static inline int quantize(float x) {
+    float f=x*32.f;
+    if(!(f>=-2147483648.f&&f<2147483648.f))return (-2147483647-1); /* NaN, inf and out of range */
+    return rint_i(f);
+}
+/* One output pixel from the maps, general (border-checked) form. */
+static inline uint8_t remap_px(const uint8_t *src,int w,int h,float m1,float m2) {
+    int u=quantize(m1),v=quantize(m2);
+    int x=u>>5,y=v>>5; /* arithmetic shift == floor division by 32 */
+    int a=(int)((uint32_t)u&31),b=(int)((uint32_t)v&31);
+    if(x< -32768)x=-32768;
+    if(x>32767)x=32767;
+    if(y< -32768)y=-32768;
+    if(y>32767)y=32767;
+    int wt[4]={32*(32-a)*(32-b),32*a*(32-b),32*(32-a)*b,32*a*b};
+    if(!a&&!b) {wt[0]=32767;wt[3]=1;}
+    int sum=0;
+    for(int j=0;j<2;j++)for(int k=0;k<2;k++)
+        if(x+k>=0&&x+k<w&&y+j>=0&&y+j<h)sum+=src[(size_t)(y+j)*w+x+k]*wt[j*2+k];
+    return (uint8_t)((sum+16384)>>15);
+}
+/* A plan caches, for every pixel whose 2x2 neighbourhood lies inside the
+ * image, the source offset and the four weights (the maps never change from
+ * frame to frame). Other pixels are recomputed from the maps, which must
+ * outlive the plan. */
+struct rd_cv_remap_plan { int w,h; int32_t *off; uint16_t *wt; const float *m1,*m2; };
+rd_cv_remap_plan *rd_cv_remap_plan_new(int w,int h,const float *m1,const float *m2) {
+    if(!m1||!m2||!dims(w,h))return NULL;
+    size_t n=(size_t)w*h;
+    rd_cv_remap_plan *p=malloc(sizeof *p);
+    if(!p)return NULL;
+    p->w=w;p->h=h;p->m1=m1;p->m2=m2;
+    p->off=malloc(n*sizeof *p->off);p->wt=malloc(n*4*sizeof *p->wt);
+    if(!p->off||!p->wt){free(p->off);free(p->wt);free(p);return NULL;}
+    for(size_t i=0;i<n;i++) {
+        int u=quantize(m1[i]),v=quantize(m2[i]);
+        int x=u>>5,y=v>>5,a=(int)((uint32_t)u&31),b=(int)((uint32_t)v&31);
+        if(x>=0&&x+1<w&&y>=0&&y+1<h) {
+            int wt0=32*(32-a)*(32-b),wt1=32*a*(32-b),wt2=32*(32-a)*b,wt3=32*a*b;
+            if(!a&&!b) {wt0=32767;wt3=1;}
+            p->off[i]=y*w+x;
+            p->wt[4*i]=(uint16_t)wt0;p->wt[4*i+1]=(uint16_t)wt1;p->wt[4*i+2]=(uint16_t)wt2;p->wt[4*i+3]=(uint16_t)wt3;
+        } else p->off[i]=-1;
+    }
+    return p;
+}
+void rd_cv_remap_plan_free(rd_cv_remap_plan *p) { if(p){free(p->off);free(p->wt);free(p);} }
+int rd_cv_remap_plan_apply(const rd_cv_remap_plan *p,const uint8_t *src,uint8_t *dst) {
+    if(!p||!src||!dst)return 0;
+    const int w=p->w,h=p->h;
+    size_t n=(size_t)w*h;
+    uint8_t *copy=NULL;
+    if(src==dst) {copy=malloc(n);if(!copy)return 0;memcpy(copy,src,n);src=copy;}
+    for(size_t i=0;i<n;i++) {
+        int o=p->off[i];
+        if(o>=0) {
+            const uint8_t *q=src+o;const uint16_t *t=p->wt+4*i;
+            int sum=q[0]*t[0]+q[1]*t[1]+q[w]*t[2]+q[w+1]*t[3];
+            dst[i]=(uint8_t)((sum+16384)>>15);
+        } else dst[i]=remap_px(src,w,h,p->m1[i],p->m2[i]);
+    }
+    free(copy);return 1;
+}
 int rd_cv_remap_linear(const uint8_t *src,int w,int h,const float *m1,const float *m2,uint8_t *dst) {
     if(!src||!m1||!m2||!dst||!dims(w,h))return 0;
     uint8_t *copy=NULL;
     if(src==dst) {copy=malloc((size_t)w*h);if(!copy)return 0;memcpy(copy,src,(size_t)w*h);src=copy;}
-    for(size_t i=0;i<(size_t)w*h;i++) {
-        int u=quantize(m1[i]),v=quantize(m2[i]),x=floor32(u),y=floor32(v);
-        int a=(int)((uint32_t)u&31),b=(int)((uint32_t)v&31);
-        if(x< -32768)x=-32768;
-        if(x>32767)x=32767;
-        if(y< -32768)y=-32768;
-        if(y>32767)y=32767;
-        int wt[4]={32*(32-a)*(32-b),32*a*(32-b),32*(32-a)*b,32*a*b};
-        if(!a&&!b) {wt[0]=32767;wt[3]=1;}
-        int sum=0;
-        for(int j=0;j<2;j++)for(int k=0;k<2;k++)
-            if(x+k>=0&&x+k<w&&y+j>=0&&y+j<h)sum+=src[(size_t)(y+j)*w+x+k]*wt[j*2+k];
-        dst[i]=(uint8_t)((sum+16384)/32768);
-    }
+    for(size_t i=0;i<(size_t)w*h;i++) dst[i]=remap_px(src,w,h,m1[i],m2[i]);
     free(copy);return 1;
 }

@@ -529,3 +529,75 @@ Not covered / not exact yet
 * The map layer that decides WHICH tracks / observations reach `marginalize` (valid, anchored in a keyframe victim, factor existence) is C++ in the dump patch only; M6 has to port that selection.
 
 Why it scores what it scores (M5, from source reading + measurements): see PLAN.md section 6, "Marginalisation keeps linearisation points".
+
+## Speed (2026-10-08): the C port is about 2.1-2.5x faster, every output bit unchanged
+
+Goal: remove overhead without touching any arithmetic. Result: MH_01 pure-C system (`rdvio_c_euroc --gray <raw pack>`) hash
+`f0d60a3e03c1...` on every run; image leaf 37 ms -> 7 ms per frame. Files changed, all in `rdvio_port/c/`:
+`rd_cv.c` (CLAHE, pyramid), `rd_cv_lk.c`, `rd_cv_gftt.c` (corner response + GFTT), `rd_cv_undist.{c,h}` (remap plan), `rdvio_c_euroc.c` (uses the plan).
+Scratch, benches and logs: `runs/rdvio_port/speed/` (`b.sh` build, `r.sh` run+hash, `bench.c`/`bb.sh` leaf micro-benchmark with a checksum over every output,
+`fixvar.py` replays the 70 fixtures against a leaf built with extra defines, `orig/` and `origc/` = the pre-change sources).
+
+### Numbers (this machine was shared with other agents the whole time, load average 5-15; compare only A/B pairs)
+
+| What | before | after |
+|---|---:|---:|
+| MH_01 sys wall, base and new run concurrently (2 procs, 1 thread each) | 348.7 s / 382.1 s / 249.9 s / 224.6 s | 143.1 s / 182.8 s / 97.9 s / 111.9 s (earlier v7 build) |
+| MH_01 sys wall, solo, load ~6 | 224 s (same load; 193 s when quiet) | 90.7 s (v8, == final except two cosmetic edits) |
+| speed-up | | 2.44x, 2.09x, 2.55x (final build), 2.0x (v7) concurrent; 2.5x solo |
+| leaf micro-bench, ms/frame (min of 5 x 60 frames): CLAHE | 3.95 | 1.09 |
+| pyramid + Scharr | 8.5 | 0.43 |
+| corner response (Harris, 752x480) | 17.0 | 1.40 |
+| GFTT incl. corner response | 15.4 | 2.13 |
+| LK forward + backward (<=150 pts) | 9.5 | 2.9-3.2 |
+| MH_04_difficult pure C wall (51.6 s) / V1_03_difficult (73.2 s) | | trajectories IDENTICAL to the reference |
+
+gprof flat profile, first 60 s of MH_01 (`runs/rdvio_port/speed/prof_{base,final}.txt`, shares of self time; the remaining LK cost is memory latency of the
+~70 scattered cache lines per 21x21 window and shows up in `lk_patch_avx2`):
+
+| | before | after |
+|---|---:|---:|
+| rd_cv_lk (+ `sample`) | 23.5 % + 12.7 % | 2.8 % + 14.8 % (patch) + 8.7 % (dot) + 4.5 % (patch_row) |
+| corner response | 20.5 % | 3.4 % (cov_row 1.6, src_row 1.2, slide 0.8, harris 0.5) |
+| pyramid | 11.3 % | 2.1 % |
+| CLAHE | 4.7 % | 2.2 % |
+| remap (undistortion) | 5.6 % | 3.2 % |
+| image leaf total | 79.8 % | 45.2 % of a 2.2x shorter profile |
+
+### What was done (none of it changes a value)
+
+- `rd_cv_lk.c`: `descale` is `>>` (floor division); `sample` is a row kernel; `lrintf` -> `rnd()` (add 2^23, exact for 0 <= f < 2^22);
+  every integer product/sum runs as `pmaddwd` (SSE2, exact: |values| < 2^31) with the reference's float lane order kept: lane k of the
+  window sums takes columns k and k+4 BEFORE the int->float conversion, columns 16..20 are separate ordered scalar sums. Each image row is loaded and
+  widened once and used as the top row (A) of one output row and the bottom row (B) of the previous one. The patch is stored in "pair layout"
+  (32-bit lane k = column k | column k+4 << 16), so one pmaddwd per 8 columns replaces the shuffle work. An AVX2 copy (columns 0..15 in one ymm, in-lane
+  ops only, so it behaves as two SSE groups) is chosen at run time (`__builtin_cpu_supports`); a scalar C path remains under `#else`.
+  The error sum is an int sum (441*8160 < 2^24, so the reference's float sum is exact).
+- `rd_cv_gftt.c`: streaming evaluation (Sobel row -> derivative/covariance row -> double row sum (3-row ring) -> double sliding sum -> float -> response)
+  instead of five whole-image passes and a 3-channel double image; identical operations per value. Row kernels exist twice: portable C and an
+  `avx2,fma` clone (`fmaf` becomes `vfmadd` instead of a libm call; `-ffp-contract=off` still holds because only explicit `fmaf` calls fuse).
+  GFTT: SSE2 max / threshold / 3x3 non-maximum suppression (same scan order), scratch buffers kept between calls, exactly sized result.
+- `rd_cv.c`: pyramid buffers are recycled (a small free list keyed by size; deriv border re-zeroed on reuse), the 5-tap filter is separable
+  (integer, exact) and uses the already-present reflect-101 border instead of `reflect()` per tap, Scharr in SSE2 int16 (|v| <= 4080).
+  CLAHE: 4 sub-histograms, per-column interpolation tables, runs of columns sharing the same two LUT columns, SSE2 float interpolation of 4 pixels
+  (same operation order per lane) with the 2^23 rounding trick.
+- `rd_cv_undist.{c,h}`: `rd_cv_remap_plan_{new,apply,free}` precompute offset + 4 weights per pixel once (the maps never change); border pixels fall back
+  to the original per-pixel code. `rd_cv_remap_linear` is unchanged in behaviour (shares `remap_px`). `rdvio_c_euroc.c` builds one plan.
+- Rejected: an exact-integer shortcut for the float chains (bound sum|d|(|gx|+|gy|) <= 2^24 so any summation order is exact): it holds for < 1 % of
+  windows (CLAHE images have large Scharr gradients), so it only added work. Software prefetch of the next windows: no measurable effect
+  (patch is ~2.7k cycles slower cold than warm even so; it is L3/DRAM latency under the shared load).
+- Caveats: the leaf now has file-static caches (pyramid free list, GFTT scratch), so it is single-threaded like the rest of the port. Builds
+  with `-DRD_CV_NO_AVX2` (SSE2 only) and `-DRD_CV_NO_SIMD` (plain C99) give identical bits (hash and all 70 fixtures checked for both).
+
+### Checks (all after the last source edit unless noted)
+
+- `tools/check_rdvio_port.py --modules m7`: 70 cases, 894,791,369 bytes, 0 mismatches; `--sanitize` too; `fixvar.py` with `-DRD_CV_NO_AVX2` and
+  `-DRD_CV_NO_SIMD`: 0 mismatches. 18 API checks and 3 negative fixtures pass.
+- Full MH_01 stream (`run_reference.py --tag speed/m7_stream_final`, final sources): 3681 + 3681 + 3680 calls, 12,150,696,647 bytes, 0 mismatches,
+  trajectory sha256 `f0d60a3e03c1...` (an earlier run of the same check on a slightly earlier build, `speed/m7_stream`, also 0 mismatches).
+  Sanitizer stream smoke (3 s, 176 calls, 194,591,160 bytes): 0 mismatches.
+- Whole pure-C system under ASan+UBSan+LeakSanitizer, first 25 s of MH_01 (500 frames, 451 poses): clean, poses equal the head of the reference.
+- `--modules m1,m2,m3,m4,m5,m6,m7,m7b,m9,m10,sys` (m2/m3 with `--oracle`): all 0 mismatches; `sys` prints IDENTICAL for all three variants
+  (pure C, logged PnP masks, OpenCV EPnP shim) on MH_01; m7b 0/1,577,965,197.
+- Two more sequences, pure C vs reference `traj.tum`: MH_04_difficult `7c55fdae...` and V1_03_difficult `3cfd3085...` IDENTICAL (images fetched with
+  `fetch_seq_stream.py`, raw pack via `okvis_png2gray`, deleted afterwards).
