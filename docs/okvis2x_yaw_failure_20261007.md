@@ -128,3 +128,79 @@ init / freeze where the window allows it.
   (`benchmark_native.py`): no files of the pose_slam implementations changed.
 - The cause of the small window on o1 (<= 28 points) versus m14 (69) is a front-end property (keyframe / state elimination); I measured it, I did not trace it.
 - With `FIX_RANSAC_SMALL` o1 stays in `Initialising` for the rest of the run (the gate never gets below 1 deg with <= 29 window points, minimum 1.79 deg), so T_GW is never frozen; the GNSS factors keep refining it.
+
+## 7. Validation on more GNSS data: unmodified vs `FIX_RANSAC_SMALL` vs the loose smoother (2026-10-08)
+
+Setup: C port (`okvis_port/c`, `OKVIS_PORT_OKVIS2X=1`), single-threaded deterministic configs (`okvis2x_port/reference/configs/okvis2x_mono_{gvins,phone}_deterministic.yaml` = the shipped
+configs of the earlier GNSS study with `parallelise_detection: false`, 1 realtime / 1 full-graph thread, `do_final_ba: false`; `robust_gps_init: true`, `yaw_error_threshold: 1.0`).
+Driver `tools/okvis2x_val.py` (run / score / loose / cmp; python `external/gnss/venv/bin/python`), scoring = `tools/gnss_harness/gnss_eval.py` as in the drone benchmark: SE3 = rigid-aligned ATE of
+`final.csv`, geo = RMS / median / max of `global_final.csv` against the reference with NO alignment, scored at the antenna (lever of the config). "loose" = `tools/gnss_loose_fusion.py` (batch) on the
+GNSS-free C-port VIO trajectory (`final.csv` of a run without `gps_parameters`) with the same fixes. Data and outputs: `runs/okvis2x_port/val/` (not committed; raw downloads never stored,
+images deleted afterwards; the converted `m14` PNGs of section 1 were also deleted for disk, `o1` kept). Fetch: GVINS-Dataset by HTTP range from Hugging Face straight into PNG
+(`gvins_bag_to_euroc.py` now accepts a URL), Mobile-GVIO from Zenodo (`mobilegvio_to_euroc.py --png`).
+
+Sequences actually obtained (GNSS input variants are simulated from the receiver's RTK epochs with `tools/gnss_harness/make_gps.py`: `rtk10` = RTK fixes as is, 10 Hz; `rtk5` = RTK at 5 Hz; `sim5` /
+`sim1` = SPP/phone-grade AR(1) noise 1.5 m horizontal / 3 m vertical (tau 30 s) at 5 / 1 Hz; the RTK rows are optimistic because RTK is also the scoring reference):
+
+- `gv_complex`: GVINS-Dataset `complex_environment`, first 300 s (6000 frames, 20 Hz, handheld walk, moving from the first frame, RTK float/no-carrier in the last 60 s).
+- `gv_sports`: GVINS-Dataset `sports_field`, first 240 s (4800 frames, walking 1.1-1.4 m/s from the start, 327 m, RTK fixed for 100% of epochs).
+- `o1cut`: INSANE `o1` cut at t = 50 s (988 frames, 5 s of stationary ground then take-off and flight; real PX4 receiver 5 Hz; same files/reference as section 1). This is the "short stationary start" case.
+- `ph_o1`: Mobile-GVIO Outdoor-1 (Honor phone, iPhone fixes 1 Hz), first 85 s only (the Zenodo stream broke at 85 s: `ValueError: buffer is smaller than requested size`). The dataset GT starts at t = 287 s, so
+  the only global reference in this window is the iPhone fixes themselves: "geo" is the error against those fixes (floor = their own error), not against truth.
+- NOT obtained: further INSANE sequences. `cns-data.aau.at` stopped answering (TCP connect timeouts for the whole session after the first probe, which showed only `outdoor_1` among the outdoor_* names
+  and `mars_1,2,3,4,7,8,9,14` with nav-cam zips of 1.7-5.6 GB). So there is no new INSANE sequence beyond `o1`/`m14` and the `o1cut` re-cut; stationary-start evidence is `o1`, `o1cut`, `m14`.
+
+### 7.1 Results (geo = no alignment to the reference; "med / max" for geo)
+
+| seq / GNSS input | VIO only SE3 | unmodified SE3 \| geo RMS (med / max) | `RANSAC_SMALL` SE3 \| geo RMS (med / max) | loose smoother SE3 \| geo | GNSS state: Initialising / Initialised [s] unmod -> fix |
+|---|---|---|---|---|---|
+| o1 (100 s, PX4 5 Hz) [sec. 4.1] | 0.724 | 0.724 \| 47.52 (0.61 / 130.0) | 0.206 \| 8.57 (8.80 / 9.02) | 1.47 \| 10.45 (drone doc) | never -> 74.6 / never |
+| m14 (181 s, PX4 5 Hz) [sec. 4.1] | | 1.343 \| 4.50 (3.92 / 7.64) | 1.343 \| 4.50 (byte-identical) | 1.46 \| 4.15 (drone doc) | 71.0 / 83.2 both |
+| o1cut (50 -> 100 s, PX4 5 Hz) | 0.418 | 0.418 \| **64.49** (50.7 / 130.7) | 0.400 \| **8.32** (8.32 / 8.97) | 0.827 \| 11.28 | never -> yes / never |
+| gv_complex rtk10 | 4.332 | 0.199 \| 0.207 (0.04 / 0.8) | 0.235 \| 0.238 (0.04 / 1.2) | 0.062 \| 0.079 | 62.9 / 63.0 -> 10.0 / 62.9 |
+| gv_complex rtk5 | | 1.201 \| 1.515 (0.06 / 6.6) | 0.448 \| 0.472 (0.06 / 1.8) | 0.099 \| 0.101 | 116.1 / 116.3 -> 14.0 / 116.1 |
+| gv_complex sim5 | | 1.364 \| 5.830 (5.67 / 6.7) | 1.565 \| 5.660 (5.60 / 8.0) | 1.324 \| 3.304 | 116.1 / 116.3 -> 17.4 / 113.1 |
+| gv_complex sim1 (1 Hz) | | 4.332 \| **302.58** (233.1 / 561.1) | 4.230 \| **7.18** (5.65 / 19.1) | 1.741 \| 4.736 | never -> 81.0 / never |
+| gv_sports rtk10 | 5.957 | 0.871 \| 0.890 (0.05 / 6.2) | 0.341 \| 0.358 (0.03 / 1.7) | 0.069 \| 0.075 | 122.4 / 122.5 -> 13.6 / 112.7 |
+| gv_sports rtk5 | | 1.193 \| 1.235 (0.11 / 6.0) | 0.429 \| 0.434 (0.05 / 1.9) | 0.083 \| 0.096 | 227.9 / 228.1 -> 38.6 / 224.3 |
+| gv_sports sim5 | | 1.693 \| 2.958 (2.54 / 6.6) | 1.695 \| 2.845 (2.48 / 6.3) | 1.013 \| 3.422 | 227.9 / 228.1 -> 38.6 / 227.9 |
+| gv_sports sim1 (1 Hz) | | 5.944 \| **134.90** (141.2 / 175.2) | 5.727 \| **8.89** (9.09 / 12.6) | 1.477 \| 4.905 | never -> 227.1 / never |
+| ph_o1 85 s, iPhone fixes as given (hErr 14.25 m) | 3.818 | 3.818 \| 57.77 (41.3 / 112.0) | identical, same hashes | | GNSS never used: every fix `CV reject-inaccurate` (cov > 6 m sigma gate in `checkValidGpsMeasurements`); the fix cannot act |
+| ph_o1 what-if: same fixes, reported sigma set to 5 m / 8 m | 3.818 | 3.818 \| 57.77 | 3.966 \| **5.31** (3.87 / 10.1) | 2.484 \| 3.863 | never -> yes / never |
+
+VIO-only SE3 = the same C port without `gps_parameters`. The unmodified `sim1` and `ph_o1` runs have the causal trajectory byte-identical to the VIO-only run: with no GNSS state ever
+initialised, GNSS has no effect at all. Where unmodified never initialises (1 Hz, 5 Hz PX4 short windows) the geo error is the identity-frame error; the fix removes it (302.6 -> 7.2, 134.9 -> 8.9,
+64.5 -> 8.3, 47.5 -> 8.6, 57.8 -> 5.3 m) down to the noise level of the fixes (about the same floor as the loose smoother, 3.3-11.3 m). With the fix off, higher rates also initialise late
+(window of 40 points: first Initialising 63-228 s on the 5-10 Hz GVINS data versus 10-39 s with the fix, Initialised at the same time or a few seconds earlier) and the 10 Hz cases are 2-3x
+better (sports rtk10 0.890 -> 0.358, rtk5 1.235 -> 0.434, complex rtk5 1.515 -> 0.472). The loose smoother is better than OKVIS2-X on RTK-grade data (0.075-0.10 vs 0.24-1.2 m: it uses the full VIO trajectory
+as a batch, OKVIS2-X is causal in the estimate it freezes) and comparable on noisy data.
+
+### 7.2 Where the fix is not better, and the noise floor
+
+- `gv_complex rtk10`: 0.207 -> 0.238 geo (+0.031), SE3 0.199 -> 0.235. Per time (RMS): t < 240 s 0.192 vs 0.176 (fix better), t >= 240 s (the RTK-float region) 0.277 vs 0.452; t < 60 s 0.246 vs 0.048.
+  Noise floor of the experiment: dropping the first three fixes (`rtk10p`, which cannot matter physically) changes the unmodified result 0.207 -> 0.265 geo (SE3 0.199 -> 0.257) and the fix result
+  0.238 -> 0.408 (SE3 0.235 -> 0.385; t < 60 s 0.048 -> 0.794 because the preliminary 6-point T_GW before the 40-point `Initialised` differs). So the +0.03 is inside the sensitivity of the unmodified
+  run to a 0.3 s change of the input (+/-0.06), but the fix is the more sensitive one on this sequence (0.24 vs 0.41 for the two inputs; mean +0.09 m on RTK-grade 10 Hz data). `rtk5p` unmodified = byte-identical to `rtk5` unmodified (causal hash
+  `a2e2d38d9cfd`), so no extra sample there.
+- `gv_complex sim5`: SE3 1.364 -> 1.565 (+0.20), geo 5.83 -> 5.66; `gv_sports sim5`: SE3 1.693 -> 1.695, geo 2.96 -> 2.85. The geo error here is the 30 s-correlated simulated bias (floor), the SE3 difference is again
+  the sensitivity of the later part of the run.
+- Everything else moves in the direction of the fix: 7 of 8 GVINS pairs better in geo, 1 worse by 0.03 (inside the noise); m14 unchanged (byte-identical); EuRoC cases of section 4.2 neutral.
+
+### 7.3 Upstream transfer (C == X) spot-check
+
+`gv_complex sim1` (one of the failing, never-initialising cases), unmodified C vs the deterministic OKVIS2-X reference built in `runs/okvis2x_port/reference_build` (`tools/okvis2x_run_reference.py gvsim1 --tag x_sim1`,
+data root `runs/okvis2x_port/val/xroot`, the same deterministic gvins config, X wall 531 s): `tools/okvis2x_val.py cmp gv_complex sim1 unmod gvsim1/x_sim1` -> PASS, causal.csv byte-identical (`00ccc166654c`), final.csv cols 1-17
+identical, global_final.csv byte-identical (`8580344e3212`). So the failure (identity T_GW, 302.6 m geo) is upstream behaviour on this data, not a port artefact. Together with o1 and m14 (section 2) that is three real sequences with C == X.
+
+### 7.4 Verdict: ADOPT `FIX_RANSAC_SMALL` as the recommended opt-in (keep default off to preserve bit-exactness); no refinement variant needed
+
+- Evidence for: five independent cases of "GNSS never initialises" (o1, o1cut, gv_complex sim1, gv_sports sim1, ph_o1 what-if, plus EuRoC `gps_b_mono1`) go from 47-302 m geo error to 5-9 m (noise level of the fixes), and 5-10 Hz data initialises
+  5-200 s earlier; the changed code path is exactly the one that fails (the first Idle -> Initialising check with 6 <= n < 40 window points), later `Initialising -> Initialised` still uses the 40-point rule.
+- Evidence against / limits: one RTK-grade sequence (complex rtk10) is +0.03 to +0.17 m worse (inside the +/-0.06 m input-sensitivity of the unmodified code; fix variance larger), the 6-point preliminary T_GW can be poor for tens of seconds
+  (0.79 m RMS in the first 60 s of `rtk10p_fix`); with <= 1 Hz data the state never reaches `Initialised` (stays `Initialising`, T_GW never frozen, the GNSS factors keep refining it) - same as o1.
+- No regression above the repo's 0.01 m neutral band was found that is attributable to the fix rather than to chaotic divergence; the one place that looks like a real cost (early preliminary T_GW) was not worth a refined
+  variant: `FIX_HISTORY` already showed (section 4.1) that using more points earlier regresses m14, and tightening the minimum n would re-introduce the exclusions the fix removes (earlier 20..39-point variants regressed `gps_b_r2_1`, section 4.2).
+- Caveats: phone data is not a test of the fix with the stock gate: the iPhone's reported 14 m sigma is rejected by `reject-inaccurate` (> 6 m) before any init logic; only with the sigma lowered to 5 m does the fix matter (what-if row,
+  reference = the fixes, 85 s). Phone OKVIS2-X mono VIO itself is poor (scale collapse in the earlier study). No stationary-start INSANE sequence beyond o1/o1cut/m14 could be added because the INSANE server was unreachable; no new
+  INSANE outdoor sequence (only `outdoor_1` exists under outdoor_*). `do_final_ba: false` throughout. Single deterministic runs, simulated GNSS noise for 3 of the 5 GVINS inputs.
+- Files added: `tools/okvis2x_val.py`, configs `okvis2x_mono_{gvins,phone}[_nogps]_deterministic.yaml`, `okvis2x_mono_drone_o1_nogps_deterministic.yaml`; `gvins_bag_to_euroc.py` (URL streaming) and `mobilegvio_to_euroc.py` (`--png`) extended.

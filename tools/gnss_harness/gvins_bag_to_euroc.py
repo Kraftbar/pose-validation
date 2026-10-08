@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """GVINS-Dataset bag (full or truncated head) -> EuRoC-style folder + GNSS/GT csv. Own code, no ROS.
-usage: gvins_bag_to_euroc.py <bag> <out_dir> [max_seconds] [--stereo]
+usage: gvins_bag_to_euroc.py <bag file or https URL (streamed)> <out_dir> [max_seconds] [--stereo]
 Writes: cam0/data/*.png + cam0/data.csv, imu0/data.csv, gps0/data.csv (cartesian ENU, ns, UTC-aligned),
         gt_pvt.csv (t_s, E, N, U, fix_type, carr_soln, num_sv, h_acc, v_acc), origin.json (lla0).
 Time: sensor stamps are UTC unix; GNSS stamps (PVT week/tow) are GPS time = UTC + 18 s (leap seconds, Jan 2021) -> subtract 18."""
@@ -41,7 +41,11 @@ def main():
     for f in camcsv.values(): f.write('#timestamp [ns], filename\n')
     imu = open(out / 'imu0' / 'data.csv', 'w'); imu.write('#timestamp [ns], w_x, w_y, w_z, a_x, a_y, a_z\n')
     pvt = []; t0 = None
-    for topic, tbag, m in iter_msgs(bag, {'/cam0/image_raw', '/cam1/image_raw', '/imu0', '/ublox_driver/receiver_pvt'}):
+    sz = None
+    if str(bag).startswith('http'):  # stream from the URL (HTTP range requests), nothing but the output is stored
+        import io; from http_zip import HTTPFile
+        raw = HTTPFile(bag); bag = io.BufferedReader(raw, buffer_size=1 << 20); sz = raw.size
+    for topic, tbag, m in iter_msgs(bag, {'/cam0/image_raw', '/cam1/image_raw', '/imu0', '/ublox_driver/receiver_pvt'}, size=sz):
         if topic == '/ublox_driver/receiver_pvt':
             t = GPS_EPOCH_UNIX + m.time.week * 604800 + m.time.tow - LEAP
             pvt.append([t, m.latitude, m.longitude, m.altitude, m.fix_type, m.carr_soln, m.num_sv, m.h_acc, m.v_acc, m.p_dop, m.valid_fix])

@@ -39,7 +39,9 @@ for topic, tb, m in iter_msgs(st, {'/cam0/image_raw', '/imu0', '/gnss0'}, size=b
         img = np.frombuffer(m.data, np.uint8).reshape(m.height, m.step)
         if enc in ('bgr8', 'rgb8'): img = cv2.cvtColor(img.reshape(m.height, m.width, 3), cv2.COLOR_BGR2GRAY if enc == 'bgr8' else cv2.COLOR_RGB2GRAY)
         else: img = img[:, :m.width]
-        cv2.imwrite(str(out / 'cam0' / 'data' / f'{tn}.jpg'), img, [cv2.IMWRITE_JPEG_QUALITY, 95]); fc.write(f'{tn},{tn}.jpg\n'); n += 1
+        if '--png' in sys.argv: cv2.imwrite(str(out / 'cam0' / 'data' / f'{tn}.png'), img, [cv2.IMWRITE_PNG_COMPRESSION, 1]); fc.write(f'{tn},{tn}.png\n')
+        else: cv2.imwrite(str(out / 'cam0' / 'data' / f'{tn}.jpg'), img, [cv2.IMWRITE_JPEG_QUALITY, 95]); fc.write(f'{tn},{tn}.jpg\n')
+        n += 1
 for f in (fc, fi, fg): f.close()
 json.dump({'t0': t0, 'frames': n, 'every': every, 'enc': enc}, open(out / 'info.json', 'w'))
 print('done', n, 'frames', 'duration', t - t0)
