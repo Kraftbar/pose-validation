@@ -32,6 +32,8 @@
  * (BoW database registration, keyframe protection flags), data/map_database.cc (add_keyframe, clear,
  * frame statistics), data/frame_statistics.cc, io/trajectory_io.cc (save_frame_trajectory).
  * See sv_system.h. This file only orchestrates the already validated modules 1-7 and the relocalizer. */
+#include <stdio.h>
+#include <stdlib.h>
 #include "sv_system.h"
 #include "sv_bundle_adjuster.h"
 #include "sv_eigen_mat4.h"
@@ -174,6 +176,8 @@ struct sv_system {
     double cal_t0, cal_len, cal_vold, cal_c0[3];
     double ema_vel[3];             /* smoothed centre velocity of tracked frames [map units / s] (R-frame extrapolation, bridge scale) */
     int ema_valid;
+    double rs_t[512], rs_c[512][3], rs_v[512]; /* rframe_speed: ring of tracked centres (time, centre, chord speed over the last 2 s) */
+    unsigned int rs_n, rs_head;
     int r_on;
     unsigned int r_last_inl;
     double r_last_par;
@@ -310,6 +314,8 @@ void sv_system_params_default(sv_system_params* p, const sv_bow_vocab* vocab) {
     p->rframe_scale = 1;
     p->rframe_gyro_max = 40;
     p->rframe_calib_sec = 4.0;
+    p->rframe_speed = 0;
+    p->rframe_speed_win = 12.0;
     p->merge_maps = 0;
     p->servo_gain = 0.0;
     p->servo_win = 12.0;
@@ -728,6 +734,12 @@ sv_system* sv_system_create(const sv_system_params* p) {
     s->p = *p;
     sv_compute_image_bounds(&p->cam, p->cols, p->rows, &s->bounds);
     sv_tr_config_init(&s->cfg, p->cam.fx, p->cam.fy, p->cam.cx, p->cam.cy, &s->bounds, p->vocab);
+    if (p->kf_min_interval > 0.0) {
+        s->cfg.min_interval = p->kf_min_interval;
+    }
+    if (p->kf_enough_lms > 0.0) {
+        s->cfg.enough_lms_thr = (unsigned int)p->kf_enough_lms;
+    }
     s->cam.fx = p->cam.fx;
     s->cam.fy = p->cam.fy;
     s->cam.cx = p->cam.cx;
@@ -1301,6 +1313,10 @@ static int bridge_transform(sv_system* s, sv_map_init_map* imap, const sv_sys_fd
     }
     else {
         sigma = depth_prior;
+    }
+    if (getenv("SV_BRIDGE_DEBUG")) {
+        fprintf(stderr, "sv_system: bridge ref_ts %.3f cur_ts %.3f vnorm %.4f ema_speed %.4f base_new %.4f speed_prior %.4f depth_prior %.4f sigma %.4f\n", ref->ts, cur->ts, vnorm,
+                s->ema_speed, base_new, speed_prior, depth_prior, sigma);
     }
     if (!(sigma > 1e-6) || !(sigma < 1e6)) {
         return 0;
@@ -1885,6 +1901,75 @@ unsigned int sv_system_map_up(const sv_system* s, int map_id, double up[3]) {
     return s->up_n[map_id];
 }
 
+
+/* rframe_speed: robust pre-gap speed. Ring of the last 512 tracked centres; chord velocity over >= 1.5 s (target 2 s); ema_speed = median of the chord speeds of the last
+ * rframe_speed_win seconds, ema_vel = the latest chord velocity. */
+static int cmp_dbl_rs(const void* a, const void* b) {
+    const double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void rspeed_update(sv_system* s, double ts, const double c[3]) {
+    const unsigned int N = 512;
+    unsigned int i, k, idx;
+    double vel[3] = {0.0, 0.0, 0.0}, sp = -1.0;
+    double buf[512];
+    unsigned int nb = 0;
+    idx = (s->rs_head + s->rs_n) % N;
+    if (s->rs_n == N) {
+        s->rs_head = (s->rs_head + 1) % N;
+        idx = (s->rs_head + s->rs_n - 1) % N;
+    }
+    else {
+        s->rs_n++;
+    }
+    s->rs_t[idx] = ts;
+    memcpy(s->rs_c[idx], c, 3 * sizeof(double));
+    s->rs_v[idx] = -1.0;
+    for (i = s->rs_n; i > 0; --i) { /* newest to oldest: first sample at least 1.5 s back */
+        const unsigned int j = (s->rs_head + i - 1) % N;
+        const double dt = ts - s->rs_t[j];
+        if (dt >= 1.5) {
+            for (k = 0; k < 3; ++k) {
+                vel[k] = (c[k] - s->rs_c[j][k]) / dt;
+            }
+            sp = sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+            break;
+        }
+    }
+    if (sp < 0.0) {
+        return;
+    }
+    s->rs_v[idx] = sp;
+    for (i = 0; i < s->rs_n; ++i) {
+        const unsigned int j = (s->rs_head + i) % N;
+        if (s->rs_v[j] >= 0.0 && ts - s->rs_t[j] <= s->p.rframe_speed_win) {
+            buf[nb++] = s->rs_v[j];
+        }
+    }
+    qsort(buf, nb, sizeof(double), cmp_dbl_rs);
+    s->ema_speed = buf[nb / 2];
+    for (k = 0; k < 3; ++k) { /* direction of the latest chord, length of the median chord speed */
+        s->ema_vel[k] = sp > 1e-12 ? vel[k] * (s->ema_speed / sp) : 0.0;
+    }
+    s->ema_valid = 1;
+}
+
+static void rspeed_scale(sv_system* s, double t_from, const double c0[3], double f) {
+    unsigned int i, k;
+    for (i = 0; i < s->rs_n; ++i) {
+        const unsigned int j = (s->rs_head + i) % 512;
+        if (s->rs_t[j] >= t_from) {
+            for (k = 0; k < 3; ++k) {
+                s->rs_c[j][k] = c0[k] + f * (s->rs_c[j][k] - c0[k]);
+            }
+            if (s->rs_v[j] >= 0.0) {
+                s->rs_v[j] *= f;
+            }
+        }
+    }
+}
+
 /* The bridged part (keyframes >= cal_k0, landmarks >= cal_lm0) is a self-consistent similarity copy: scale it by f about the bridge point. */
 static void scale_section(sv_system* s, unsigned int cal_k0, unsigned int cal_lm0, const double* c0, double f) {
     sv_tracker* t = &s->trk;
@@ -1942,6 +2027,9 @@ static void scale_section(sv_system* s, unsigned int cal_k0, unsigned int cal_lm
         s->ema_vel[k] *= f;
     }
     s->ema_speed *= f;
+    if (s->p.rframe_speed && cal_k0 < s->kf_cap && s->map.kfs[cal_k0]) {
+        rspeed_scale(s, s->map.kfs[cal_k0]->timestamp, c0, f);
+    }
 }
 
 static void calibrate_scale(sv_system* s, double f) {
@@ -2264,11 +2352,19 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
                 double d2 = 0.0;
                 for (k = 0; k < 3; ++k) {
                     const double dc = t->curr_frm.trans_wc[k] - t->last_frm.trans_wc[k], v = dc / dt;
-                    s->ema_vel[k] = s->ema_valid ? 0.9 * s->ema_vel[k] + 0.1 * v : v;
+                    if (!s->p.rframe_speed) {
+                        s->ema_vel[k] = s->ema_valid ? 0.9 * s->ema_vel[k] + 0.1 * v : v;
+                    }
                     d2 += dc * dc;
                 }
-                s->ema_speed = s->ema_valid ? 0.97 * s->ema_speed + 0.03 * sqrt(d2) / dt : sqrt(d2) / dt;
-                s->ema_valid = 1;
+                if (s->p.rframe_speed) {
+                    rspeed_update(s, timestamp, t->curr_frm.trans_wc);
+                }
+                else {
+                    s->ema_speed = s->ema_valid ? 0.97 * s->ema_speed + 0.03 * sqrt(d2) / dt : sqrt(d2) / dt;
+                    s->ema_valid = 1;
+                }
+                res->dbg_dc = sqrt(d2);
                 if (s->cal_on && t->last_frm.ref_kf >= (int)s->cal_k0) { /* path length of the bridged part */
                     s->cal_len += sqrt(d2);
                 }
@@ -2419,6 +2515,8 @@ int sv_system_feed(sv_system* s, const uint8_t* gray, double timestamp, sv_frame
         s->fd_prev = fd;
         fd_release_if_unused(s, old);
     }
+    res->dbg_ema_speed = s->ema_speed;
+    res->dbg_ema_vel = sqrt(s->ema_vel[0] * s->ema_vel[0] + s->ema_vel[1] * s->ema_vel[1] + s->ema_vel[2] * s->ema_vel[2]);
     fill_report(s, res, fd, state_before);
     return 0;
 }

@@ -71,6 +71,12 @@ typedef struct sv_system_params {
     double rframe_hold_sec;            /* the constant-velocity position extrapolation fades to a hold over this time (default 1 s) */
     int rframe_scale;                  /* scale of the bridged map: 0 median-depth prior, 1 speed prior, 2 geometric mean (default 1) */
     unsigned int rframe_gyro_max;      /* consecutive vision-less (gyro only) R-frames allowed (default 40) */
+    double kf_min_interval;            /* stella_vio, opt-in (0 = stella's 0.1 s): minimum time between two keyframes (Outdoor-1 pause study: the keyframe flood while the user stands still) */
+    double kf_enough_lms;              /* stella_vio, opt-in (0 = stella's 100): 'not enough reliable landmarks' keyframe trigger threshold */
+    int rframe_speed;                  /* stella_vio, opt-in (0 = off, the old per-frame EMAs): the pre-gap speed / velocity used by the R-frame extrapolation, the bridge prior and the bridge calibration
+                                        * come from a chord (2 s baseline) of the tracked centres and the median of those chord speeds over rframe_speed_win seconds, which a handful of
+                                        * jumped frames (BA corrections, a flickering track at the end of a good stretch) cannot inflate (Outdoor-1 blow-up study) */
+    double rframe_speed_win;           /* seconds of chord speeds the median runs over (default 12) */
     double rframe_calib_sec;           /* the scale of a bridged map part is re-fitted after this long by matching its mean speed to the speed before the
                                         * gap (default 4 s; 0 = keep the initial scale prior) */
     int merge_maps;                    /* 1: keep the old map when a new one is started (reinit) and merge the maps again when place recognition
@@ -119,6 +125,7 @@ typedef struct sv_frame_result {
     unsigned int rframe_inliers;   /* rotation inliers of the R-frame step */
     double rframe_par_deg;         /* median residual angle of the rotation inliers [deg] (the parallax the pure-rotation model leaves) */
     double cal_f, cal_vold, cal_vnew; /* stella_vio: scale calibration of a bridged part applied in this frame (cal_f != 0) */
+    double dbg_ema_speed, dbg_ema_vel, dbg_dc;  /* stella_vio diagnostics: path-length EMA speed, |vector EMA velocity|, |curr - last frame centre| of this frame (map units, valid after a tracked frame with R-frames on) */
     int loop_accepted;             /* correct_loop() ran (and the map was corrected) */
     int loop_cur_kf, loop_cand_kf;
     unsigned int n_keyframes, n_landmarks;   /* map after the frame (get_num_keyframes / get_num_landmarks) */

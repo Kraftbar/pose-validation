@@ -213,6 +213,7 @@ typedef struct sv_run_opts {
     const char* set[32]; /* --set key=value (stella_vio parameters, see apply_set) */
     int width, height; /* --size WxH; 0 = take the size from the first fixture image */
     int has_camera;
+    const char* diag_log; /* --diag-log F: compact per-frame (F lines) and per-keyframe (K lines) trace for the Outdoor-1 blow-up study (opt-in, off by default) */
     const char* servo_log; /* --servo-log F: trace of the gait scale servo decisions */
     const char* live_out; /* --live-out F: per-frame LIVE poses (opt-in, off by default): "t x y z qx qy qz qw map rframe seg loop_accepted scale_cal up_n ux uy uz", valid frames only */
     const char* imu_path; /* --imu imu.csv (t_ns,gx,gy,gz,ax,ay,az) */
@@ -221,6 +222,61 @@ typedef struct sv_run_opts {
     double imu_bg[3];     /* --imu-bg x,y,z */
     double camera[9]; /* --camera fx,fy,cx,cy,k1,k2,p1,p2,k3: override the default (fr1) camera, e.g. TUM_RGBD_mono_2/3.yaml */
 } sv_run_opts;
+
+
+static int cmp_dbl(const void* a, const void* b) {
+    const double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+static double quantile_dbl(double* v, unsigned int n, double q) {
+    if (n == 0) {
+        return 0.0;
+    }
+    qsort(v, n, sizeof(double), cmp_dbl);
+    return v[(unsigned int)(q * (double)(n - 1) + 0.5)];
+}
+
+/* --diag-log: "F frame ts state_after pose_valid n_tracked n_reliable path ref_kf inserted_kf cx cy cz rframe_kind" for every frame and, for an inserted keyframe,
+ * "K kf ts parent baseline_to_parent n_lm depth_q10 depth_q50 depth_q90 n_new new_depth_q50 n_covis max_covis_w" (depths in map units along the optical axis of that keyframe;
+ * "new" = landmarks whose reference keyframe is this one, i.e. created by its mapping step; the K line is written right after the mapping step, before later BA). */
+static void run_diag_frame(FILE* fd, sv_system* sys, unsigned int i, double ts, const sv_frame_result* r) {
+    fprintf(fd, "F %u %.4f %d %d %u %u %d %d %d %.5g %.5g %.5g %d\n", i, ts, r->tracking_state_after, r->pose_valid, r->num_tracked, r->num_reliable, r->track_path, r->ref_kf,
+            r->inserted_kf, r->pose_wc[12], r->pose_wc[13], r->pose_wc[14], r->rframe_kind);
+    fprintf(fd, "E %u %.5g %.5g %.5g\n", i, r->dbg_ema_speed, r->dbg_ema_vel, r->dbg_dc);
+    if (r->inserted_kf >= 0) {
+        const sv_tr_map* m = sv_system_map(sys);
+        const sv_tr_kf* kf = m->kfs[r->inserted_kf];
+        double *d, *dn, base = 0.0;
+        unsigned int k, n = 0, nn = 0;
+        if (!kf) {
+            return;
+        }
+        d = (double*)malloc((kf->obs->num_kp + 1) * sizeof(double));
+        dn = (double*)malloc((kf->obs->num_kp + 1) * sizeof(double));
+        for (k = 0; k < kf->obs->num_kp; ++k) {
+            const sv_tr_lm* lm;
+            double z;
+            if (kf->lm[k] < 0 || !(lm = m->lms[kf->lm[k]]) || !lm->alive) {
+                continue;
+            }
+            z = kf->pose_cw[2] * lm->pos_w[0] + kf->pose_cw[6] * lm->pos_w[1] + kf->pose_cw[10] * lm->pos_w[2] + kf->pose_cw[14];
+            d[n++] = z;
+            if (lm->ref_kf == r->inserted_kf) {
+                dn[nn++] = z;
+            }
+        }
+        if (kf->parent >= 0 && m->kfs[kf->parent]) {
+            const sv_tr_kf* pk = m->kfs[kf->parent];
+            base = sqrt((kf->trans_wc[0] - pk->trans_wc[0]) * (kf->trans_wc[0] - pk->trans_wc[0]) + (kf->trans_wc[1] - pk->trans_wc[1]) * (kf->trans_wc[1] - pk->trans_wc[1]) +
+                        (kf->trans_wc[2] - pk->trans_wc[2]) * (kf->trans_wc[2] - pk->trans_wc[2]));
+        }
+        fprintf(fd, "K %d %.4f %d %.5g %u %.4g %.4g %.4g %u %.4g %u %u\n", r->inserted_kf, kf->timestamp, kf->parent, base, n, quantile_dbl(d, n, 0.1), quantile_dbl(d, n, 0.5),
+                quantile_dbl(d, n, 0.9), nn, quantile_dbl(dn, nn, 0.5), kf->n_covis, kf->n_covis ? kf->covis_w[0] : 0);
+        free(d);
+        free(dn);
+    }
+}
 
 static void write_snapshot(FILE* fk, FILE* fl, sv_system* sys, long frame) {
     const sv_tr_map* m = sv_system_map(sys);
@@ -361,6 +417,18 @@ static int apply_set(sv_system_params* p, const char* kv) {
     else if (!strcmp(key, "rf_scale")) {
         p->rframe_scale = (int)v;
     }
+    else if (!strcmp(key, "kf_min_interval")) {
+        p->kf_min_interval = v;
+    }
+    else if (!strcmp(key, "kf_enough_lms")) {
+        p->kf_enough_lms = v;
+    }
+    else if (!strcmp(key, "rf_speed")) {
+        p->rframe_speed = (int)v;
+    }
+    else if (!strcmp(key, "rf_speed_win")) {
+        p->rframe_speed_win = v;
+    }
     else if (!strcmp(key, "rf_calib")) {
         p->rframe_calib_sec = v;
     }
@@ -416,7 +484,7 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
     sv_imu_buf imu;
     sv_system* sys;
     char path[4096];
-    FILE *fb = NULL, *ft = NULL, *fdc = NULL, *fm = NULL, *fa = NULL, *fk = NULL, *fl = NULL, *flog = NULL, *flive = NULL;
+    FILE *fb = NULL, *ft = NULL, *fdc = NULL, *fm = NULL, *fa = NULL, *fk = NULL, *fl = NULL, *flog = NULL, *flive = NULL, *fdiag = NULL;
     unsigned int i, k;
     long processed = 0, last_frame = -1;
     int rc = 0;
@@ -541,6 +609,13 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
             return 2;
         }
     }
+    if (o->diag_log) {
+        fdiag = fopen(o->diag_log, "w");
+        if (!fdiag) {
+            fprintf(stderr, "sv_run: cannot write %s\n", o->diag_log);
+            return 2;
+        }
+    }
     for (i = (unsigned int)o->skip; i < n_frames; ++i) {
         sv_frame_result r;
         int w, h;
@@ -584,6 +659,9 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
             sv_quat_from_mat3(rot, &q);
             fprintf(flive, "%.15g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %d %d %d %u %.9g %.9g %.9g\n", ts[i], r.pose_wc[12], r.pose_wc[13], r.pose_wc[14], q.x, q.y, q.z,
                     q.w, r.live_map_id, r.live_rframe, r.live_seg, r.loop_accepted ? 1 : 0, r.cal_f != 0.0 ? 1 : 0, r.live_up_n, r.live_up[0], r.live_up[1], r.live_up[2]);
+        }
+        if (fdiag) {
+            run_diag_frame(fdiag, sys, i, ts[i], &r);
         }
         if (sv_run_frame_hook) {
             sv_run_frame_hook(sv_run_frame_hook_user, i, ts[i], &r, sys);
@@ -678,6 +756,9 @@ static int sv_run_sequence(const char* vocab_path, const char* fixtures_dir, con
     }
     if (flive) {
         fclose(flive);
+    }
+    if (fdiag) {
+        fclose(fdiag);
     }
     fclose(fb);
     fclose(ft);
@@ -878,6 +959,9 @@ int sv_run_main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--live-out") && i + 1 < argc) {
             o.live_out = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--diag-log") && i + 1 < argc) {
+            o.diag_log = argv[++i];
         }
         else if (!strcmp(argv[i], "--servo-log") && i + 1 < argc) {
             o.servo_log = argv[++i];
