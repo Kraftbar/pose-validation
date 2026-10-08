@@ -41,6 +41,7 @@ static void set_del(u64set* s, uint64_t v) {
 
 typedef struct entry { uint64_t sid; ok_gps_fix f; } entry;     /* gpsInitMap_ element */
 
+typedef struct hpt { uint64_t key; double gps[3], world[3], cov[9]; } hpt;     /* OUR modification (FIX_HISTORY) */
 typedef struct ok_vgps {
     int status;                           /* gpsStatus_ */
     int observable, fixed;                /* gpsObservability_, gpsFixed_ */
@@ -51,6 +52,7 @@ typedef struct ok_vgps {
     int needs_initial, needs_pos, needs_full;
     uint64_t dropout_id, pos_aligned_id;
     int reinitialised;
+    struct hpt* hist; int nhist, caphist;  /* OUR modification FIX_HISTORY: points of states already eliminated from the window (not upstream) */
     int name;                             /* log tag: 0 realtime, 1 full */
 } ok_vgps;
 
@@ -58,7 +60,7 @@ static ok_vgps* P_(const ok_vg* g) { return (ok_vgps*)ok_vg_gps_policy(g); }
 static void policy_free(void* p) {
     ok_vgps* P = (ok_vgps*)p;
     if (!P) return;
-    free(P->gps_states.a); free(P->reinit_states.a); free(P->imap); free(P->imuq); free(P);
+    free(P->hist); free(P->gps_states.a); free(P->reinit_states.a); free(P->imap); free(P->imuq); free(P);
 }
 static void policy_removed(void* p, uint64_t id) {
     ok_vgps* P = (ok_vgps*)p;
@@ -126,6 +128,29 @@ static void align4_on_end(void* ctx, const ok_sv_end* e) {
 }
 
 /* ---- :1014 checkForGpsInit (robust: last 100 states + RANSAC + Align4DoF_Ceres) ---- */
+static uint64_t* hist_keys_; static int nkeys_cap_;       /* OUR modification: fix time of each gathered point (FIX_HISTORY key) */
+
+/* OUR observe-only diagnostic (OKVIS_PORT_FIX_DIAG=1 + OKVIS_PORT_GNSS_LOG): what the yaw gate would say for the points handed to the check, WITHOUT the
+ * RANSAC size requirement: spread (rms distance from the centroid, xy) of the VIO-world points and of the GNSS points, the travelled path length of the
+ * world points, and the yaw sigma (degrees) of the Hessian at the Umeyama fit of all points. Pure functions, no state touched. */
+static void diag_points(const ok_vgps* P, int nstates, int npts, const double* gps, const double* world, const double* cov) {
+    double cw[3] = {0, 0, 0}, cg[3] = {0, 0, 0}, sw = 0, sg = 0, path = 0, Hess[16], Pm[16], ysig = -1.0, bounds[4] = {1e300, -1e300, 1e300, -1e300};
+    ok_tf T;
+    int i, k;
+    if (!ok_gnss_log_enabled() || npts < 3) return;
+    for (i = 0; i < npts; ++i) for (k = 0; k < 3; ++k) { cw[k] += world[3 * i + k] / npts; cg[k] += gps[3 * i + k] / npts; }
+    for (i = 0; i < npts; ++i) {
+        for (k = 0; k < 2; ++k) { const double a = world[3 * i + k] - cw[k], b = gps[3 * i + k] - cg[k]; sw += a * a; sg += b * b; }
+        if (i) { const double dx = world[3 * i] - world[3 * i - 3], dy = world[3 * i + 1] - world[3 * i - 2], dz = world[3 * i + 2] - world[3 * i - 1]; path += sqrt(dx * dx + dy * dy + dz * dz); }
+    }
+    (void)bounds;
+    ok_gps_umeyama(npts, gps, world, &T);
+    ok_gps_yaw_hessian(npts, world, cov, T.C, Hess);
+    ok_gps_inverse4(Hess, Pm);
+    ysig = sqrt(Pm[3 + 4 * 3]) / 3.14159265358979323846 * 180.0;
+    ok_gnss_logf("CD %d n=%d npts=%d spreadW=%.4f spreadG=%.4f pathW=%.4f yawAll=%.6f cov00=%.4f\n", P->name, nstates, npts, sqrt(sw / npts), sqrt(sg / npts), path, ysig, cov[0]);
+}
+
 static int check_for_gps_init(ok_vg* g, ok_tf* T_GW, const u64set* considered, double* yaw_error) {
     ok_vgps* P = P_(g);
     const int robust = ok_vg_gps_robust(g);
@@ -151,6 +176,8 @@ static int check_for_gps_init(ok_vg* g, ok_tf* T_GW, const u64set* considered, d
                 gps = (double*)realloc(gps, sizeof(double) * 3 * (size_t)cap); world = (double*)realloc(world, sizeof(double) * 3 * (size_t)cap);
                 cov = (double*)realloc(cov, sizeof(double) * 9 * (size_t)cap);
             }
+            if (npts >= nkeys_cap_) { nkeys_cap_ = nkeys_cap_ ? 2 * nkeys_cap_ : 128; hist_keys_ = (uint64_t*)realloc(hist_keys_, sizeof(uint64_t) * (size_t)nkeys_cap_); }
+            hist_keys_[npts] = (uint64_t)e->imu.t1.sec * 1000000000ull + (uint64_t)e->imu.t1.nsec;
             memcpy(gps + 3 * npts, e->meas, sizeof(double) * 3);
             ok_gps_async_apply_preint(e, &T_WS_state, sb, &T_prop);
             ok_m3_mulv(T_prop.C, r_SA, lv);                                /* T_WS_prop.r() + T_WS_prop.C() * r_SA */
@@ -159,6 +186,33 @@ static int check_for_gps_init(ok_vg* g, ok_tf* T_GW, const u64set* considered, d
             npts++;
         }
     }
+    /* OUR modification FIX_HISTORY (not upstream): upstream only sees the fixes of the states still in the sliding window (at 5 Hz ~28 fixes,
+     * too few for RANSAC and for a 1 degree yaw sigma). With the switch (robust, initial init only) every point seen in a check is stored
+     * (keyed by the fix time, newest estimate wins) and the check uses the last OKVIS_PORT_FIX_HISTORY_N (default 200) stored points: the
+     * window points plus the world positions the eliminated states had at their last check. */
+    if (robust && considered == &P->gps_states && ok_port_fix("HISTORY")) {
+        const char* en = getenv("OKVIS_PORT_FIX_HISTORY_N");
+        const int nmax = en && atoi(en) > 0 ? atoi(en) : 200;
+        int j, nn, from;
+        for (i = 0, j = 0; i < npts; ++i) {
+            hpt h; int lo = 0, hi = P->nhist;
+            uint64_t key = hist_keys_[i];
+            h.key = key; memcpy(h.gps, gps + 3 * i, sizeof h.gps); memcpy(h.world, world + 3 * i, sizeof h.world); memcpy(h.cov, cov + 9 * i, sizeof h.cov);
+            while (lo < hi) { const int m = (lo + hi) / 2; if (P->hist[m].key < key) lo = m + 1; else hi = m; }
+            if (lo < P->nhist && P->hist[lo].key == key) { P->hist[lo] = h; continue; }
+            if (P->nhist == P->caphist) { P->caphist = P->caphist ? 2 * P->caphist : 256; P->hist = (hpt*)realloc(P->hist, sizeof(hpt) * (size_t)P->caphist); }
+            memmove(P->hist + lo + 1, P->hist + lo, sizeof(hpt) * (size_t)(P->nhist - lo));
+            P->hist[lo] = h; P->nhist++; (void)j;
+        }
+        nn = P->nhist < nmax ? P->nhist : nmax; from = P->nhist - nn;
+        if (nn > cap) { cap = nn; gps = (double*)realloc(gps, sizeof(double) * 3 * (size_t)cap); world = (double*)realloc(world, sizeof(double) * 3 * (size_t)cap); cov = (double*)realloc(cov, sizeof(double) * 9 * (size_t)cap); }
+        for (i = 0; i < nn; ++i) { memcpy(gps + 3 * i, P->hist[from + i].gps, 24); memcpy(world + 3 * i, P->hist[from + i].world, 24); memcpy(cov + 9 * i, P->hist[from + i].cov, 72); }
+        npts = nn;
+    }
+    /* OUR modification FIX_RANSAC_SMALL, see ok_gps_init.c: allowed only for the first (Idle -> Initialising, yaw_error != NULL) check of the initial
+     * initialisation; Initialising -> Initialised (1 degree gate, Align4DoF_Ceres, freeze) and the re-initialisation keep the upstream 40-point rule. */
+    ok_port_set_small_allowed(robust && yaw_error != NULL && considered == &P->gps_states);
+    if (ok_port_fix("DIAG")) diag_points(P, considered->n, npts, gps, world, cov);
     r = ok_gps_init_core(npts, gps, world, cov, robust, T_GW, &yaw, &ratio);
     if (r) { ok_gnss_logf("CI %d n=%d npts=%d RANSACREJECT\n", P->name, considered->n, npts); free(gps); free(world); free(cov); return 0; }
     if (yaw_error) *yaw_error = yaw;

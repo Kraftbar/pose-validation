@@ -57,4 +57,9 @@ void ok_gps_yaw_hessian(int n, const double* world, const double* cov, const dou
 int ok_gps_init_core(int n, const double* gps, const double* world, const double* cov, int robust, ok_tf* T_GW,
                      double* yaw_error_deg, double* ransac_ratio);
 
+/* ---- OUR modifications (not upstream), opt-in only: OKVIS_PORT_FIX_<NAME>=1 in the environment (default off = bit-exact). ----
+ * ok_port_fix("RANSAC_SMALL") etc. reads getenv once per name and caches the result. */
+int ok_port_fix(const char* name);
+void ok_port_set_small_allowed(int v);   /* FIX_RANSAC_SMALL: the caller allows the reduced RANSAC for the next check (see ok_vggps.c) */
+
 #endif

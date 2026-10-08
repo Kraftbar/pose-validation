@@ -1,0 +1,90 @@
+%YAML:1.0
+cameras:
+     - {T_SC:
+        [ -0.999546268782, 0.00577097757292, 0.0295626856258, -0.254664291266,
+          0.00902664872545, 0.993756151922, 0.111208048858, -0.0478333607892,
+          -0.028736321552, 0.111424442273, -0.99335734632, -0.0259821493512,
+          0, 0, 0, 1],
+        image_dimension: [1028, 771],
+        distortion_coefficients: [-0.2789624778746687, 0.08326114116558676, -0.0002778237201036228, -0.0003520215650091775],
+        distortion_type: radialtangential,
+        focal_length: [567.0981168357, 567.754716221882],
+        principal_point: [517.2126467714646, 375.24278098845735],
+        cam_model: pinhole,
+        camera_type: gray,
+        mapping: false,
+        mapping_rectification: false,
+        slam_use: okvis}
+
+camera_parameters:
+    timestamp_tolerance: 0.005
+    sync_cameras: [0]
+    image_delay: 0.0
+    online_calibration:
+        do_extrinsics: false
+        do_extrinsics_final_ba: false
+        sigma_r: 0.01
+        sigma_alpha: 0.1
+        sigma_r_final_ba: 0.03
+        sigma_alpha_final_ba: 0.3
+    deep_stereo_indices: [0]
+    fov_scale: 1.0
+
+imu_parameters:
+    use: true
+    a_max: 156.0
+    g_max: 34.0
+    sigma_g_c: 0.004
+    sigma_a_c: 0.04
+    sigma_bg: 0.03
+    sigma_ba: 0.1
+    sigma_gw_c: 0.0002
+    sigma_aw_c: 0.002
+    g: 9.80665
+    g0: [0.0, 0.0, 0.0]
+    a0: [0.0, 0.0, 0.0]
+    s_a: [1.0, 1.0, 1.0]
+    T_BS:
+        [1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, 0.0,
+         0.0, 0.0, 0.0, 1.0]
+
+frontend_parameters:
+    detection_threshold: 34.0
+    absolute_threshold: 4.0
+    matching_threshold: 60.0
+    octaves: 0
+    max_num_keypoints: 1000
+    keyframe_overlap: 0.6
+    use_cnn: false
+    parallelise_detection: false
+    num_matching_threads: 4
+
+estimator_parameters:
+    num_keyframes: 5
+    num_loop_closure_frames: 3
+    num_imu_frames: 3
+    do_loop_closures: false
+    do_final_ba: false
+    enforce_realtime: false
+    realtime_min_iterations: 3
+    realtime_max_iterations: 10
+    realtime_time_limit: 0.035
+    realtime_num_threads: 1
+    full_graph_iterations: 50
+    full_graph_num_threads: 1
+    p_dbow: 0.55
+    drift_percentage_heuristic: 5.5
+
+output_parameters:
+    display_topview: false
+    display_matches: false
+    display_overhead: false
+    enable_submapping: false
+
+gps_parameters:
+    data_type: cartesian
+    r_SA: [0.0, 0.0, 0.0]
+    yaw_error_threshold: 1.0
+    robust_gps_init: true

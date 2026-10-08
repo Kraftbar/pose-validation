@@ -2,10 +2,30 @@
 /* OKVIS2-X GNSS initialisation helpers, see ok_gps_init.h for provenance and conventions. */
 #include "ok_gps_init.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PI_ 3.14159265358979323846 /* M_PI */
+
+/* ---- OUR modification switches (opt-in; not upstream) ---- */
+static int g_small_allowed;                 /* FIX_RANSAC_SMALL: set by the caller (ok_vggps.c) for the Idle -> Initialising check only */
+void ok_port_set_small_allowed(int v) { g_small_allowed = v; }
+int ok_port_fix(const char* name) {
+    static struct { char n[40]; int v; } cache[16];
+    static int ncache;
+    char var[96];
+    int i;
+    for (i = 0; i < ncache; ++i) if (!strcmp(cache[i].n, name)) return cache[i].v;
+    snprintf(var, sizeof var, "OKVIS_PORT_FIX_%s", name);
+    if (ncache < 16 && strlen(name) < 40) {
+        const char* e = getenv(var);
+        strcpy(cache[ncache].n, name);
+        cache[ncache].v = (e && atoi(e)) ? 1 : 0;
+        return cache[ncache++].v;
+    }
+    return 0;
+}
 
 /* ---- std::mt19937 + libstdc++ uniform_int_distribution<int> ---- */
 void ok_mt19937_seed(ok_mt19937* g, unsigned int seed) {
@@ -255,7 +275,12 @@ int ok_gps_init_core(int n, const double* gps, const double* world, const double
         ok_rigid_result rr;
         double M[16];
         int i, k;
-        ok_gps_estimate_rigid_ransac(n, gps, world, 20, 20, 4.0, 0.7, &rr, NULL);
+        int n_points = 20;
+        /* OUR modification FIX_RANSAC_SMALL (not upstream): upstream returns "no result" when n < 2 * 20 = 40 points, which never happens
+         * with 5 Hz GNSS and the ~28 fixes of the realtime window. With the switch, for the first check of the initial initialisation (the
+         * caller sets the flag, ok_vggps.c), 6..39 points use n_points = n / 2. */
+        if (n < 40 && n >= 6 && g_small_allowed && ok_port_fix("RANSAC_SMALL")) n_points = n / 2;
+        ok_gps_estimate_rigid_ransac(n, gps, world, 20, n_points, 4.0, 0.7, &rr, NULL);
         if (ransac_ratio) *ransac_ratio = rr.inlier_ratio;
         if (rr.inlier_ratio < 0.25) return 1;
         memset(M, 0, sizeof M);
