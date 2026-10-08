@@ -5,6 +5,9 @@
 #include <float.h>
 #include <math.h>
 #include <string.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 /* ------------------------------------------------------------------ patterns (patterns.h) */
 
@@ -37,19 +40,19 @@ int bs_pattern_init(float out[2 * BS_PAT], int pattern) {
 #define PX(im, x, y) ((float)(im)->p[(size_t)(y) * (size_t)(im)->pitch + (size_t)(x)])
 
 /* InBounds(MatrixBase p, Scalar border): border <= p0 && p0 < ((int)w - border - 1) && same for y (float arithmetic) */
-int bs_img_inbounds(const bs_imgv *im, float x, float y, float border) {
+static inline int img_inbounds_i(const bs_imgv *im, float x, float y, float border) {
     const float offset = 1.0f;
     return border <= x && x < ((float)im->w - border - offset) && border <= y && y < ((float)im->h - border - offset);
 }
 
-float bs_img_interp(const bs_imgv *im, float x, float y) {
+static inline float img_interp_i(const bs_imgv *im, float x, float y) {
     const int ix = (int)x, iy = (int)y;
     const float dx = x - (float)ix, dy = y - (float)iy;
     const float ddx = 1.0f - dx, ddy = 1.0f - dy;
     return ddx * ddy * PX(im, ix, iy) + ddx * dy * PX(im, ix, iy + 1) + dx * ddy * PX(im, ix + 1, iy) + dx * dy * PX(im, ix + 1, iy + 1);
 }
 
-void bs_img_interp_grad(const bs_imgv *im, float x, float y, float o[3]) {
+static inline void img_interp_grad_i(const bs_imgv *im, float x, float y, float o[3]) {
     const int ix = (int)x, iy = (int)y;
     const float dx = x - (float)ix, dy = y - (float)iy;
     const float ddx = 1.0f - dx, ddy = 1.0f - dy;
@@ -67,6 +70,10 @@ void bs_img_interp_grad(const bs_imgv *im, float x, float y, float o[3]) {
     res_py = ddx * ddy * px0y1 + ddx * dy * px0y2 + dx * ddy * px1y1 + dx * dy * px1y2;
     o[2] = 0.5f * (res_py - res_my);
 }
+
+int bs_img_inbounds(const bs_imgv *im, float x, float y, float border) { return img_inbounds_i(im, x, y, border); }
+float bs_img_interp(const bs_imgv *im, float x, float y) { return img_interp_i(im, x, y); }
+void bs_img_interp_grad(const bs_imgv *im, float x, float y, float o[3]) { img_interp_grad_i(im, x, y, o); }
 
 /* ------------------------------------------------------------------ Eigen 3.4.0 models (SSE, packet 4, no FMA) */
 
@@ -154,12 +161,15 @@ void bs_patch_dbg_ldlt3_inverse(const float H[9], float Hinv[9]) {
 
 /* Eigen: inc = -HJ * res (3x52 * 52 vector): per row a scalar left fold (rows are strided, not packet-vectorisable) */
 void bs_patch_dbg_inc(const float HJ[3 * BS_PAT], const float res[BS_PAT], float inc[3]) {
-    int r, k;
-    for (r = 0; r < 3; r++) {
-        float acc = (-HJ[r]) * res[0];
-        for (k = 1; k < BS_PAT; k++) acc = acc + (-HJ[r + 3 * k]) * res[k];
-        inc[r] = acc;
+    int k;
+    float a0 = (-HJ[0]) * res[0], a1 = (-HJ[1]) * res[0], a2 = (-HJ[2]) * res[0];   /* the three row folds interleaved (independent chains) */
+    for (k = 1; k < BS_PAT; k++) {
+        const float r = res[k];
+        a0 = a0 + (-HJ[3 * k]) * r;
+        a1 = a1 + (-HJ[1 + 3 * k]) * r;
+        a2 = a2 + (-HJ[2 + 3 * k]) * r;
     }
+    inc[0] = a0; inc[1] = a1; inc[2] = a2;
 }
 
 /* ------------------------------------------------------------------ OpticalFlowPatch (patch.h) */
@@ -167,15 +177,15 @@ void bs_patch_dbg_inc(const float HJ[3 * BS_PAT], const float res[BS_PAT], float
 void bs_patch_set(bs_patch *pt, const bs_imgv *im, const float pat[2 * BS_PAT], const float pos[2]) {
     float J[BS_PAT * 3];     /* MatrixP3, column-major: J[i + 52*c] */
     float sum = 0.0f, gs[3] = {0.0f, 0.0f, 0.0f}, mean_inv, H[9], Hinv[9];
-    int nv = 0, i, a, b, c;
+    int nv = 0, i, a, c;
     pt->pos[0] = pos[0];
     pt->pos[1] = pos[1];
     for (i = 0; i < BS_PAT; i++) {
         const float px = pos[0] + pat[2 * i], py = pos[1] + pat[2 * i + 1];
         const float jw02 = -pat[2 * i + 1], jw12 = pat[2 * i];      /* Jw_se2(0,2) = -pattern(1,i), Jw_se2(1,2) = pattern(0,i) */
-        if (bs_img_inbounds(im, px, py, 2.0f)) {
+        if (img_inbounds_i(im, px, py, 2.0f)) {
             float vg[3];
-            bs_img_interp_grad(im, px, py, vg);
+            img_interp_grad_i(im, px, py, vg);
             pt->data[i] = vg[0];
             sum += vg[0];
             /* J.row(i) = valGrad.tail<2>().transpose() * Jw_se2  (1x2 * 2x3 = [1 0 jw02; 0 1 jw12]) */
@@ -200,8 +210,18 @@ void bs_patch_set(bs_patch *pt, const bs_imgv *im, const float pat[2 * BS_PAT], 
     }
     for (i = 0; i < BS_PAT * 3; i++) J[i] = J[i] * mean_inv;
 
-    for (a = 0; a < 3; a++)
-        for (b = 0; b < 3; b++) H[a + 3 * b] = bs_patch_dbg_dot52(&J[BS_PAT * a], &J[BS_PAT * b]);   /* J^T * J: lazy coefficient product, vectorised redux */
+    {   /* J^T * J: each coefficient a left fold over k (bs_patch_dbg_dot52); the six distinct ones (a*b == b*a bitwise) run interleaved */
+        const float *j0 = &J[0], *j1 = &J[BS_PAT], *j2 = &J[2 * BS_PAT];
+        float h00 = 0.0f, h01 = 0.0f, h02 = 0.0f, h11 = 0.0f, h12 = 0.0f, h22 = 0.0f;
+        for (i = 0; i < BS_PAT; i++) {
+            const float x0 = j0[i], x1 = j1[i], x2 = j2[i];
+            h00 = h00 + x0 * x0; h01 = h01 + x0 * x1; h02 = h02 + x0 * x2;
+            h11 = h11 + x1 * x1; h12 = h12 + x1 * x2; h22 = h22 + x2 * x2;
+        }
+        H[0] = 1.0f * h00; H[1] = 1.0f * h01; H[2] = 1.0f * h02;
+        H[3] = 1.0f * h01; H[4] = 1.0f * h11; H[5] = 1.0f * h12;
+        H[6] = 1.0f * h02; H[7] = 1.0f * h12; H[8] = 1.0f * h22;
+    }
     bs_patch_dbg_ldlt3_inverse(H, Hinv);
     for (i = 0; i < BS_PAT; i++)
         for (a = 0; a < 3; a++)      /* Hinv * J^T: x0 + (x1 + x2) per coefficient */
@@ -219,8 +239,38 @@ int bs_patch_residual(const bs_patch *pt, const bs_imgv *im, const float tp[2 * 
     float sum = 0.0f;
     int nv = 0, nres = 0, i;
     for (i = 0; i < BS_PAT; i++) {
-        if (bs_img_inbounds(im, tp[2 * i], tp[2 * i + 1], 2.0f)) {
-            res[i] = bs_img_interp(im, tp[2 * i], tp[2 * i + 1]);
+#ifdef __SSE2__
+        /* 4 pixels at once when all four are inside: the same per-pixel IEEE operations in the same order, just 4 lanes (BS_PAT = 52 = 13 * 4) */
+        if ((i & 3) == 0 && img_inbounds_i(im, tp[2 * i], tp[2 * i + 1], 2.0f) && img_inbounds_i(im, tp[2 * i + 2], tp[2 * i + 3], 2.0f) &&
+            img_inbounds_i(im, tp[2 * i + 4], tp[2 * i + 5], 2.0f) && img_inbounds_i(im, tp[2 * i + 6], tp[2 * i + 7], 2.0f)) {
+            const __m128 v0 = _mm_loadu_ps(tp + 2 * i), v1 = _mm_loadu_ps(tp + 2 * i + 4);
+            const __m128 x = _mm_shuffle_ps(v0, v1, _MM_SHUFFLE(2, 0, 2, 0)), y = _mm_shuffle_ps(v0, v1, _MM_SHUFFLE(3, 1, 3, 1));
+            const __m128i xi = _mm_cvttps_epi32(x), yi = _mm_cvttps_epi32(y);
+            const __m128 dx = _mm_sub_ps(x, _mm_cvtepi32_ps(xi)), dy = _mm_sub_ps(y, _mm_cvtepi32_ps(yi));
+            const __m128 one = _mm_set1_ps(1.0f), ddx = _mm_sub_ps(one, dx), ddy = _mm_sub_ps(one, dy);
+            int ixs[4], iys[4];
+            const uint16_t* q[4];
+            float r4[4];
+            int l;
+            __m128 p00, p01, p10, p11, r;
+            _mm_storeu_si128((__m128i*)ixs, xi); _mm_storeu_si128((__m128i*)iys, yi);
+            for (l = 0; l < 4; l++) q[l] = im->p + (size_t)iys[l] * (size_t)im->pitch + (size_t)ixs[l];
+            p00 = _mm_set_ps((float)q[3][0], (float)q[2][0], (float)q[1][0], (float)q[0][0]);
+            p10 = _mm_set_ps((float)q[3][1], (float)q[2][1], (float)q[1][1], (float)q[0][1]);
+            p01 = _mm_set_ps((float)q[3][im->pitch], (float)q[2][im->pitch], (float)q[1][im->pitch], (float)q[0][im->pitch]);
+            p11 = _mm_set_ps((float)q[3][im->pitch + 1], (float)q[2][im->pitch + 1], (float)q[1][im->pitch + 1], (float)q[0][im->pitch + 1]);
+            r = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(ddx, ddy), p00), _mm_mul_ps(_mm_mul_ps(ddx, dy), p01));
+            r = _mm_add_ps(r, _mm_mul_ps(_mm_mul_ps(dx, ddy), p10));
+            r = _mm_add_ps(r, _mm_mul_ps(_mm_mul_ps(dx, dy), p11));
+            _mm_storeu_ps(r4, r);
+            for (l = 0; l < 4; l++) { res[i + l] = r4[l]; sum += r4[l]; }
+            nv += 4;
+            i += 3;
+            continue;
+        }
+#endif
+        if (img_inbounds_i(im, tp[2 * i], tp[2 * i + 1], 2.0f)) {
+            res[i] = img_interp_i(im, tp[2 * i], tp[2 * i + 1]);
             sum += res[i];
             nv++;
         } else {
@@ -231,6 +281,19 @@ int bs_patch_residual(const bs_patch *pt, const bs_imgv *im, const float tp[2 * 
         for (i = 0; i < BS_PAT; i++) res[i] = 0.0f;
         return 0;
     }
+#ifdef __SSE2__
+    {   /* 4 lanes of the same operations: (nv * val) / sum - data where res >= 0 and data >= 0, else +0 */
+        const __m128 nvf = _mm_set1_ps((float)nv), sumv = _mm_set1_ps(sum), zero = _mm_setzero_ps();
+        for (i = 0; i < BS_PAT; i += 4) {
+            const __m128 val = _mm_loadu_ps(res + i), d = _mm_loadu_ps(pt->data + i);
+            const __m128 m = _mm_and_ps(_mm_cmpge_ps(val, zero), _mm_cmpge_ps(d, zero));
+            const __m128 r = _mm_sub_ps(_mm_div_ps(_mm_mul_ps(nvf, val), sumv), d);
+            _mm_storeu_ps(res + i, _mm_and_ps(m, r));
+            { const int mm = _mm_movemask_ps(m); nres += (mm & 1) + ((mm >> 1) & 1) + ((mm >> 2) & 1) + ((mm >> 3) & 1); }
+        }
+    }
+    return nres > BS_PAT / 2;
+#endif
     for (i = 0; i < BS_PAT; i++) {
         if (res[i] >= 0.0f && pt->data[i] >= 0.0f) {
             const float val = res[i];
@@ -300,7 +363,7 @@ int bs_track_point_at_level(const bs_imgv *img2, const bs_patch *dp, const float
             if (valid) {
                 bs_se2_exp_matrix(inc, M);
                 bs_affine_mul_assign(tr, M);
-                valid &= bs_img_inbounds(img2, tr[4], tr[5], 2.0f);
+                valid &= img_inbounds_i(img2, tr[4], tr[5], 2.0f);
             }
         }
     }

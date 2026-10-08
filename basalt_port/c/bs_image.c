@@ -12,6 +12,279 @@
 
 static uint32_t be32(const unsigned char *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 
+
+/* ---- fast path for the one PNG flavour EuRoC uses (8-bit gray, no interlace, chunks IHDR / IDAT.. / IEND only, valid CRC / Adler-32).
+ * Same pixels as ok_png_decode_gray for such files; anything else (or any error) returns 0 and the caller falls back to ok_png_decode_gray. */
+typedef struct { unsigned short fast[1024], count[16], first[16], offset[16], symbol[288]; } fhuff;
+typedef struct { const unsigned char *p; size_t n, pos; uint64_t v; unsigned bits; } fbits;
+
+static void fb_fill(fbits *b)
+{
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (b->pos + 8 <= b->n) {   /* whole 8-byte load, keep the bytes that fit (bits |= 56) */
+        uint64_t w;
+        memcpy(&w, b->p + b->pos, 8);
+        b->v |= w << b->bits;
+        b->pos += (63 - b->bits) >> 3;
+        b->bits |= 56;
+        return;
+    }
+#endif
+    while (b->bits <= 56) {
+        b->v |= (uint64_t)(b->pos < b->n ? b->p[b->pos] : 0) << b->bits;   /* zero padding past the end; overrun is checked at the end */
+        b->pos++;
+        b->bits += 8;
+    }
+}
+static unsigned fb_take(fbits *b, unsigned n)
+{
+    unsigned r;
+    if (b->bits < n) fb_fill(b);
+    r = (unsigned)(b->v & ((1u << n) - 1u));
+    b->v >>= n; b->bits -= n;
+    return r;
+}
+static int fh_build(fhuff *h, const unsigned char *len, unsigned n)
+{
+    unsigned i, k, code = 0, off = 0, next[16];
+    int left = 1;
+    memset(h, 0, sizeof(*h));
+    for (i = 0; i < n; ++i) { if (len[i] > 15) return 0; if (len[i]) ++h->count[len[i]]; }
+    for (k = 1; k <= 15; ++k) {
+        left = 2 * left - h->count[k];
+        if (left < 0) return 0;
+        code = (code + h->count[k - 1]) << 1;
+        h->first[k] = (unsigned short)code; h->offset[k] = (unsigned short)off; next[k] = off;
+        off += h->count[k];
+    }
+    for (i = 0; i < n; ++i) if (len[i]) h->symbol[next[len[i]]++] = (unsigned short)i;
+    for (k = 1; k <= 10; ++k) for (i = 0; i < h->count[k]; ++i) {
+        unsigned c = h->first[k] + i, rev = 0, j;
+        for (j = 0; j < k; ++j) { rev = (rev << 1) | (c & 1); c >>= 1; }
+        for (j = rev; j < 1024; j += 1u << k) h->fast[j] = (unsigned short)((k << 9) | h->symbol[h->offset[k] + i]);
+    }
+    return 1;
+}
+static int fh_sym(fbits *b, const fhuff *h)
+{
+    unsigned f, code = 0, k;
+    if (b->bits < 15) fb_fill(b);
+    f = h->fast[b->v & 1023];
+    if (f) { b->v >>= f >> 9; b->bits -= f >> 9; return (int)(f & 511); }
+    for (k = 1; k <= 15; ++k) {
+        code = (code << 1) | (unsigned)((b->v >> (k - 1)) & 1);
+        if (code >= h->first[k] && code - h->first[k] < h->count[k]) {
+            b->v >>= k; b->bits -= k;
+            return h->symbol[h->offset[k] + code - h->first[k]];
+        }
+    }
+    return -1;
+}
+static int fast_inflate(const unsigned char *src, size_t n, unsigned char *out, size_t cap)
+{
+    static const unsigned short lb[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const unsigned char le[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const unsigned short db[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const unsigned char de[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    static const unsigned char order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    fbits b;
+    fhuff lit, dist, cl;
+    size_t used = 0, i;
+    unsigned final = 0;
+    uint32_t a = 1, s = 0;
+    if (n < 6 || (src[0] & 15) != 8 || (src[0] >> 4) > 7 || (((unsigned)src[0] << 8) + src[1]) % 31 || (src[1] & 32)) return 0;
+    memset(&b, 0, sizeof(b)); b.p = src + 2; b.n = n - 6;
+    while (!final) {
+        unsigned type;
+        if (b.pos > b.n + 8) return 0;
+        final = fb_take(&b, 1); type = fb_take(&b, 2);
+        if (type == 3) return 0;
+        if (type == 0) {
+            unsigned len, inv;
+            fb_take(&b, b.bits % 8);
+            len = fb_take(&b, 16); inv = fb_take(&b, 16);
+            if ((len ^ inv) != 65535 || len > cap - used) return 0;
+            b.pos -= b.bits / 8; b.v = 0; b.bits = 0;   /* give the prefetched whole bytes back, then copy the stored bytes */
+            if (len > (b.pos <= b.n ? b.n - b.pos : 0)) return 0;
+            memcpy(out + used, b.p + b.pos, len); used += len; b.pos += len;
+            continue;
+        }
+        if (type == 1) {
+            unsigned char l[288], d[32];
+            for (i = 0; i < 288; ++i) l[i] = (unsigned char)(i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8);
+            memset(d, 5, sizeof(d));
+            if (!fh_build(&lit, l, 288) || !fh_build(&dist, d, 32)) return 0;
+        } else {
+            unsigned nl = fb_take(&b, 5) + 257, nd = fb_take(&b, 5) + 1, nc = fb_take(&b, 4) + 4, j = 0;
+            unsigned char c[19] = {0}, lengths[318];
+            if (nl > 286 || nd > 32) return 0;
+            for (i = 0; i < nc; ++i) c[order[i]] = (unsigned char)fb_take(&b, 3);
+            if (!fh_build(&cl, c, 19)) return 0;
+            while (j < nl + nd) {
+                int v = fh_sym(&b, &cl);
+                unsigned repeat, value;
+                if (v < 0) return 0;
+                if (v <= 15) { lengths[j++] = (unsigned char)v; continue; }
+                if (v == 16) { if (!j) return 0; repeat = fb_take(&b, 2) + 3; value = lengths[j - 1]; }
+                else { repeat = fb_take(&b, v == 17 ? 3 : 7) + (v == 17 ? 3 : 11); value = 0; }
+                if (repeat > nl + nd - j) return 0;
+                while (repeat--) lengths[j++] = (unsigned char)value;
+            }
+            if (!lengths[256] || !fh_build(&lit, lengths, nl) || !fh_build(&dist, lengths + nl, nd)) return 0;
+        }
+        for (;;) {
+            int v, d;
+            unsigned len, distance;
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            {   /* run of literals with the bit reservoir in registers (stores through unsigned char* would otherwise force reloads of b) */
+                uint64_t rv = b.v;
+                unsigned rbits = b.bits;
+                size_t rpos = b.pos;
+                unsigned char *o = out + used, *oend = out + cap;
+                const unsigned char *rp = b.p;
+                const size_t rn = b.n;
+                while (oend - o >= 4 && rpos + 8 <= rn) {
+                    unsigned f;
+                    uint64_t w;
+                    memcpy(&w, rp + rpos, 8);
+                    rv |= w << rbits; rpos += (63 - rbits) >> 3; rbits |= 56;
+                    f = lit.fast[rv & 1023];
+                    if (!f || (f & 511) >= 256) break;
+                    rv >>= f >> 9; rbits -= f >> 9; *o++ = (unsigned char)f;
+                    f = lit.fast[rv & 1023];
+                    if (!f || (f & 511) >= 256) break;
+                    rv >>= f >> 9; rbits -= f >> 9; *o++ = (unsigned char)f;
+                    f = lit.fast[rv & 1023];
+                    if (!f || (f & 511) >= 256) break;
+                    rv >>= f >> 9; rbits -= f >> 9; *o++ = (unsigned char)f;
+                }
+                b.v = rv; b.bits = rbits; b.pos = rpos; used = (size_t)(o - out);
+            }
+#endif
+            v = fh_sym(&b, &lit);
+            if (v < 0) return 0;
+            if (v < 256) {
+                if (used == cap) return 0;
+                out[used++] = (unsigned char)v;
+                continue;
+            }
+            if (v == 256) break;
+            if (v > 285) return 0;
+            len = lb[v - 257] + fb_take(&b, le[v - 257]);
+            d = fh_sym(&b, &dist);
+            if (d < 0 || d > 29) return 0;
+            distance = db[d] + fb_take(&b, de[d]);
+            if (distance > used || len > cap - used) return 0;
+            if (distance >= len) { memcpy(out + used, out + used - distance, len); used += len; }
+            else for (i = 0; i < len; ++i) { out[used] = out[used - distance]; ++used; }
+        }
+    }
+    /* the stream must end exactly before the Adler-32 (as ok_png: consumed bytes == n - 6 once the unread whole bytes are given back) */
+    if (used != cap || b.pos - b.bits / 8 != b.n) return 0;
+    for (i = 0; i < cap;) {
+        size_t end = cap - i > 5552 ? i + 5552 : cap;
+        for (; i < end; ++i) { a += out[i]; s += a; }
+        a %= 65521; s %= 65521;
+    }
+    return ((s << 16) | a) == be32(src + n - 4);
+}
+static uint32_t fast_crc(const unsigned char *p, size_t n)
+{
+    static uint32_t tab[8][256];   /* slicing-by-8, same CRC-32 */
+    static int init;
+    uint32_t c = 0xffffffffu;
+    if (!init) {
+        unsigned i, j;
+        for (i = 0; i < 256; ++i) { uint32_t v = i; for (j = 0; j < 8; ++j) v = (v >> 1) ^ (0xedb88320u & (0u - (v & 1))); tab[0][i] = v; }
+        for (i = 0; i < 256; ++i) for (j = 1; j < 8; ++j) tab[j][i] = (tab[j - 1][i] >> 8) ^ tab[0][tab[j - 1][i] & 255];
+        init = 1;
+    }
+    while (n >= 8) {
+        uint32_t lo = c ^ ((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
+        c = tab[7][lo & 255] ^ tab[6][(lo >> 8) & 255] ^ tab[5][(lo >> 16) & 255] ^ tab[4][lo >> 24] ^
+            tab[3][p[4]] ^ tab[2][p[5]] ^ tab[1][p[6]] ^ tab[0][p[7]];
+        p += 8; n -= 8;
+    }
+    while (n--) c = tab[0][(c ^ *p++) & 255] ^ (c >> 8);
+    return c ^ 0xffffffffu;
+}
+static int fast_png_gray(const unsigned char *buf, size_t n, unsigned char **out, int *w, int *h)
+{
+    size_t pos = 8, comp = 0, cap, x, y;
+    unsigned width = 0, height = 0;
+    int have_ihdr = 0, ended = 0, closed = 0;
+    unsigned char *idat = NULL, *raw = NULL;
+    *out = NULL;
+    if (n > (size_t)256 * 1024 * 1024) return 0;
+    idat = (unsigned char *)malloc(n);
+    if (!idat) return 0;
+    while (pos + 12 <= n) {
+        size_t len = be32(buf + pos);
+        const unsigned char *tag = buf + pos + 4, *p = buf + pos + 8;
+        if (len > n - pos - 12) goto fail;
+        if (fast_crc(tag, len + 4) != be32(p + len)) goto fail;
+        if (!have_ihdr) {
+            if (memcmp(tag, "IHDR", 4) || len != 13 || p[8] != 8 || p[9] != 0 || p[10] || p[11] || p[12]) goto fail;
+            width = be32(p); height = be32(p + 4);
+            if (!width || !height || width > 65536 || height > 65536) goto fail;
+            have_ihdr = 1;
+        } else if (!memcmp(tag, "IDAT", 4)) {
+            if (closed) goto fail;
+            memcpy(idat + comp, p, len); comp += len;
+        } else if (!memcmp(tag, "IEND", 4)) {
+            if (len || !comp) goto fail;
+            ended = 1; break;
+        } else goto fail;
+        if (comp && memcmp(tag, "IDAT", 4)) closed = 1;
+        pos += len + 12;
+    }
+    if (!ended) goto fail;
+    cap = ((size_t)width + 1) * height;
+    raw = (unsigned char *)malloc(cap);
+    if (!raw || !fast_inflate(idat, comp, raw, cap)) goto fail;
+    {   /* unfilter (bpp = 1) in place into a packed width x height image */
+        unsigned char *pix = (unsigned char *)malloc((size_t)width * height);
+        if (!pix) goto fail;
+        for (y = 0; y < height; ++y) {
+            const unsigned char *src = raw + y * ((size_t)width + 1);
+            unsigned char *cur = pix + y * (size_t)width;
+            const unsigned char *prev = y ? cur - width : NULL;
+            unsigned filter = src[0];
+            src++;
+            if (filter > 4) { free(pix); goto fail; }
+            if (filter == 0 || !prev) {
+                if (filter == 0 || filter == 2) memcpy(cur, src, width);
+                else if (filter == 1 || filter == 4) { cur[0] = src[0]; for (x = 1; x < width; ++x) cur[x] = (unsigned char)(src[x] + cur[x - 1]); }
+                else { cur[0] = src[0]; for (x = 1; x < width; ++x) cur[x] = (unsigned char)(src[x] + (cur[x - 1] >> 1)); }
+            } else if (filter == 1) {
+                cur[0] = src[0]; for (x = 1; x < width; ++x) cur[x] = (unsigned char)(src[x] + cur[x - 1]);
+            } else if (filter == 2) {
+                for (x = 0; x < width; ++x) cur[x] = (unsigned char)(src[x] + prev[x]);
+            } else if (filter == 3) {
+                int a = (unsigned char)(src[0] + (prev[0] >> 1));   /* a = left pixel kept in a register */
+                cur[0] = (unsigned char)a;
+                for (x = 1; x < width; ++x) { a = (unsigned char)(src[x] + ((a + prev[x]) >> 1)); cur[x] = (unsigned char)a; }
+            } else {
+                int a = (unsigned char)(src[0] + prev[0]);   /* a = c = 0: paeth picks b */
+                cur[0] = (unsigned char)a;
+                for (x = 1; x < width; ++x) {
+                    const int b_ = prev[x], c_ = prev[x - 1], d = b_ - c_, sd = d >> 31, pa = (d ^ sd) - sd;
+                    const int t = a - c_, st = t >> 31, pb = (t ^ st) - st, u = t + d, su = u >> 31, pc = (u ^ su) - su;   /* p - a = d, p - b = t, p - c = t + d */
+                    const int m1 = -(int)((pa <= pb) & (pa <= pc)), m2 = -(int)(pb <= pc);   /* branch-free select: a, else b, else c */
+                    a = (unsigned char)(src[x] + ((a & m1) | (~m1 & ((b_ & m2) | (c_ & ~m2)))));
+                    cur[x] = (unsigned char)a;
+                }
+            }
+        }
+        free(idat); free(raw);
+        *out = pix; *w = (int)width; *h = (int)height;
+        return 1;
+    }
+fail:
+    free(idat); free(raw);
+    return 0;
+}
+
 int bs_image_decode_euroc(const unsigned char *buf, size_t n, uint16_t **out, int *w, int *h)
 {
     static const unsigned char sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
@@ -35,8 +308,10 @@ int bs_image_decode_euroc(const unsigned char *buf, size_t n, uint16_t **out, in
         pos += 12 + (size_t)len;
     }
     if (!got_ihdr) return BS_IMG_DECODE;
-    rc = ok_png_decode_gray(buf, n, &g, w, h);
-    if (rc != OK_PNG_OK) return rc == OK_PNG_NOMEM ? BS_IMG_NOMEM : BS_IMG_DECODE;
+    if (!fast_png_gray(buf, n, &g, w, h)) {
+        rc = ok_png_decode_gray(buf, n, &g, w, h);
+        if (rc != OK_PNG_OK) return rc == OK_PNG_NOMEM ? BS_IMG_NOMEM : BS_IMG_DECODE;
+    }
     o = (uint16_t *)malloc((size_t)*w * (size_t)*h * sizeof(uint16_t));
     if (!o) { free(g); *w = *h = 0; return BS_IMG_NOMEM; }
     for (y = 0; y < *h; y++)

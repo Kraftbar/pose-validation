@@ -53,6 +53,12 @@ static int is_corner(const uint8_t *ptr, const int *pixel, int threshold)
 {
     int v = ptr[0], k, c0 = 0, c1 = 0;
     int hi = v + threshold, lo = v - threshold;
+    {   /* any 9 contiguous of the 16 ring pixels contain >= 2 of the 4 pixels 0, 4, 8, 12: fewer than 2 above hi and fewer than 2 below lo
+         * cannot be a corner (pure early reject, the verdict of the full scan below is unchanged) */
+        int x0 = ptr[pixel[0]], x1 = ptr[pixel[4]], x2 = ptr[pixel[8]], x3 = ptr[pixel[12]];
+        int nb = (x0 > hi) + (x1 > hi) + (x2 > hi) + (x3 > hi), nd = (x0 < lo) + (x1 < lo) + (x2 < lo) + (x3 < lo);
+        if (nb < 2 && nd < 2) return 0;
+    }
     for (k = 0; k < 25; k++) {
         int x = ptr[pixel[k]];
         if (x > hi) { if (++c0 > 8) return 1; } else c0 = 0;

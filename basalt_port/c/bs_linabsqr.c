@@ -883,5 +883,9 @@ void bs_la_t_householder_qr(float* st, int num_rows, int num_cols, int padding_i
     lb_perform_qr(&b);
 }
 
-void bs_la_t_gemm(int m, int n, int k, const float* a, int ars, int acs, const float* b, int brs, int bcs, float* c, int ldc) { la_gemm(m, n, k, a, ars, acs, b, brs, bcs, c, ldc); }
+void bs_la_t_gemm(int m, int n, int k, const float* a, int ars, int acs, const float* b, int brs, int bcs, float* c, int ldc) {
+    la_skip_enable = 0;   /* the oracle feeds arbitrary C (including -0): no zero skipping */
+    la_gemm(m, n, k, a, ars, acs, b, brs, bcs, c, ldc);
+    la_skip_enable = 1;
+}
 void bs_la_t_gemv(int m, int n, const float* a, int ars, int acs, const float* x, int xinc, float* y) { la_gemv(m, n, a, ars, acs, x, xinc, y, 1.0f); }
