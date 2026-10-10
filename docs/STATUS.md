@@ -68,7 +68,7 @@ Learned methods are out of scope. GPL code may be read for understanding, but ne
 
 ## Open decisions and next steps
 
-1. **Push blocked:** local commit `a2dc6c8` (OKVIS2 M7c–M7d) contains `okvis_port/c/ok_dbow.*`, a DBoW2 source port. DBoW2's licence requires notifying the author on redistribution, and the repo is public. Choose one: notify the author and then push, push without `ok_dbow`, or push and notify afterwards.
+1. **DBoW2 notice done (2026-10-10):** `okvis_port/c/ok_dbow.*` is a DBoW2 source port; the author was notified by email on 2026-10-10 (DBoW2 clause 3), which lifted the push hold on `a2dc6c8`+.
 2. **OKVIS2:** done for EuRoC (BRISK hooked up, system driver M8; full suite with `--data` all PASS on 2026-10-05, committed 08a6b38). The app also reads EuRoC PNGs directly (`ok_png`, bit-exact with cv::imread). Open: runtime 2–3x the reference, parameter blocks never freed, other sequences.
 3. **RD-VIO:**
    - M7 (OpenCV CLAHE / LK / GFTT): **done 2026-10-06**. Codex wrote it and Claude verified it: 70 fixture cases and a full MH_01 stream of 12.15 G bytes, 0 mismatches. The bit-exactness holds for this machine's OpenCV CPU dispatch.

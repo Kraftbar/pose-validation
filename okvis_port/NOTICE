@@ -66,8 +66,8 @@ source text). Files are dual-licensed BSD-3-Clause AND MPL-2.0 where Eigen model
 Module 7d (place recognition): ok_dbow.{h,c} (the DBoW2 vocabulary-tree transform, the L1 scoring database, queryL1 with the libstdc++
 introsort order, Frontend::getFilteredDBoWResult) are derived from DBoW2 (Copyright (c) 2015, Dorian Galvez-Lopez, modified BSD licence, full
 text okvis_port/LICENSES/dbow2-LICENSE.txt) and OKVIS2 (BSD-3-Clause). DBoW2 clause 3 ("The original author of the work must be notified of
-any redistribution of source code or in binary form") is NOT discharged: ok_dbow.* is an internal source-level port that has not been
-redistributed; Dorian Galvez-Lopez must be notified before any redistribution of okvis_port (source or binary), see HANDOVER.md. The BRISK
+any redistribution of source code or in binary form") is discharged: Dorian Galvez-Lopez was notified by email on 2026-10-10 of the
+redistribution of ok_dbow.* in the public repository (github.com/Kraftbar/pose-validation). The BRISK
 vocabulary itself (resources/small_voc.yml.gz of OKVIS2, provenance undocumented, docs/okvis2_license_audit.md) is converted at run time
 by tools/convert_okvis_vocabulary.py into the gitignored runs/ tree and never copied into okvis_port. ok_place.{h,c} / ok_place_dist.c
 (verifyRecognisedPlace refinement with the Ceres quickSolver reproduced through the module-4 solver, Levenberg-Marquardt strategy added to

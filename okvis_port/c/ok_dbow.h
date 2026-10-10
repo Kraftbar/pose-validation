@@ -8,8 +8,8 @@
  * distance) and OKVIS2 (BSD-3-Clause, Copyright (c) 2015 Autonomous Systems Lab / ETH Zurich, 2020 Smart Robotics Lab /
  * Imperial College London, 2024 Smart Robotics Lab / Technical University of Munich; Frontend.cpp, FBrisk.cpp).
  * DBoW2 clause 3: "The original author of the work must be notified of any redistribution of source code or in binary form."
- * This file is a source-level port that is NOT redistributed so far; before any redistribution of okvis_port (source or binary)
- * Dorian Galvez-Lopez must be notified (okvis_port/NOTICE, HANDOVER.md). Redistribution requires retaining these notices.
+ * Dorian Galvez-Lopez was notified by email on 2026-10-10 of the redistribution of this source-level port in the public
+ * repository (okvis_port/NOTICE). Redistribution requires retaining these notices.
  *
  * C99, <stdint.h> <math.h> <stdlib.h> <string.h> only.
  *

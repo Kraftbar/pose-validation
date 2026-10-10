@@ -172,7 +172,7 @@ Facts found (cheap, Eigen / libstdc++ / Ceres)
 
 Not yet exact / next
 - Undefined behaviour upstream (above): runs with a degenerate GP3P sample cannot be reproduced bit for bit in any C port; they are isolated and reported by the harness.
-- DBoW2 clause 3 (the original author must be notified of any redistribution of source or binary): `ok_dbow.*` is a source-level port; nothing has been redistributed, NOTICE / `LICENSES/dbow2-LICENSE.txt` / `docs/okvis2_license_audit.md` record it. The vocabulary stays a reference-run input (provenance undocumented): a product needs its own.
+- DBoW2 clause 3 (the original author must be notified of any redistribution of source or binary): `ok_dbow.*` is a source-level port; the author was notified by email on 2026-10-10 of its redistribution in the public repo, NOTICE / `LICENSES/dbow2-LICENSE.txt` / `docs/okvis2_license_audit.md` record it. The vocabulary stays a reference-run input (provenance undocumented): a product needs its own.
 - Not exercised / not ported: the multi-session `componentDBows_` branch, RadialTangential8 in `verifyRecognisedPlace`, the CNN sky / person filters, `FrameRelativeAdapter` with a failed back-projection of frame B (upstream leaves the vector uninitialised).
 - Next: BRISK (Codex's `ok_brisk*`) feeds `ok_fe_add_frame`; then the system driver (ThreadedSlam::processFrame glue: IMU propagation, `addStates`, `setKeyframe`, publish) and the vocabulary loader call (`ok_fe_set_vocabulary`).
 
